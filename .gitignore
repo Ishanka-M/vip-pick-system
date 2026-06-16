@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Streamlit secrets (NEVER commit credentials)
+.streamlit/secrets.toml
+
+# Outputs / temp
+*.xlsx
+!sample_data/*.xlsx
+outputs/
+*.log
+.DS_Store
