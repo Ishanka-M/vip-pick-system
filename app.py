@@ -93,15 +93,47 @@ tab_gen, tab_sku, tab_hist = st.tabs(
 # TAB: SKU_MASTER (CRUD)
 # =========================================================================== #
 with tab_sku:
-    st.subheader("🗂️ SKU_MASTER — add / edit / delete")
+    st.subheader("🗂️ SKU_MASTER — upload / add / edit / delete")
     st.caption(
-        "Google Sheet එකේ SKU_MASTER data එක load කරලා, rows add/edit/delete කරලා, "
-        "ආපහු save කරන්න. LOOSE → SAP = HJ · SET → SAP, HJ වෙනස්."
+        "SKU_MASTER Excel එකක් upload කරලා හරි, Google Sheet එකෙන් load කරලා හරි — "
+        "rows add/edit/delete කරලා Google Sheet එකට save කරන්න. "
+        "LOOSE → SAP = HJ · SET → SAP, HJ වෙනස්."
     )
+
+    # ---- 1) Upload SKU_MASTER from Excel (separate, always available) ----
+    with st.container(border=True):
+        st.markdown("**1️⃣ SKU_MASTER Excel upload කරන්න**")
+        up = st.file_uploader("SKU_MASTER (.xlsx / .xls / .csv)",
+                              type=["xlsx", "xls", "csv"], key="sku_upload")
+        uc1, uc2 = st.columns([1, 2])
+        if up is not None and uc1.button("⬆️ Editor එකට load කරන්න"):
+            try:
+                raw = pd.read_csv(up) if up.name.lower().endswith(".csv") else pd.read_excel(up)
+                cols = {c.strip().lower(): c for c in raw.columns}
+                want = ["Material code", "Material Desc", "Catergory", "HJ", "SAP"]
+                alias = {
+                    "Material code": ["material code", "material", "code", "sku"],
+                    "Material Desc": ["material desc", "description", "material description", "desc"],
+                    "Catergory": ["catergory", "category", "type"],
+                    "HJ": ["hj"], "SAP": ["sap"],
+                }
+                out = pd.DataFrame()
+                for w in want:
+                    found = next((cols[a] for a in alias[w] if a in cols), None)
+                    out[w] = raw[found] if found else ""
+                st.session_state["sku_edit"] = out
+                st.success(f"Editor එකට load වුණා ✅  ({len(out)} rows). පහළ edit කරලා save කරන්න.")
+            except Exception as ex:
+                st.error(f"Upload error: {ex}")
+        uc2.caption("Columns auto-map වෙනවා: Material code · Material Desc · Catergory · HJ · SAP")
+
+    # ---- 2) Google Sheet load / save ----
+    st.markdown("**2️⃣ Google Sheet (load / save)**")
     if not sa_info:
-        st.warning("Google Sheets credentials නෑ — `st.secrets['gcp_service_account']` දාන්න (README බලන්න).")
+        st.warning("Google Sheets credentials නෑ — upload කරපු data edit කරන්න පුළුවන්, "
+                   "save කරන්න `st.secrets['gcp_service_account']` ඕන (README බලන්න).")
     elif not save_key:
-        st.info("Sidebar එකේ **Data Sheet URL/Key** එක දාන්න (SKU_MASTER worksheet එක එතන තියෙන්න ඕන).")
+        st.info("Sidebar එකේ **Data Sheet URL/Key** එක දාන්න (save/load කරන්න).")
     else:
         import gsheet
         cinit, cload, csave = st.columns([1.2, 1, 1])
@@ -121,26 +153,32 @@ with tab_sku:
             except Exception as ex:
                 st.error(f"Load error: {ex}")
 
-        if "sku_edit" in st.session_state:
-            edited = st.data_editor(
-                st.session_state["sku_edit"],
-                num_rows="dynamic", use_container_width=True, height=460,
-                key="sku_editor",
-                column_config={
-                    "Catergory": st.column_config.SelectboxColumn(
-                        "Catergory", options=["LOOSE", "SET"]),
-                    "HJ": st.column_config.NumberColumn("HJ", min_value=0, step=1),
-                    "SAP": st.column_config.NumberColumn("SAP", min_value=0, step=1),
-                },
-            )
-            if csave.button("💾 SKU_MASTER save කරන්න", type="primary"):
+    # ---- 3) Editor + save ----
+    if "sku_edit" in st.session_state:
+        st.markdown("**3️⃣ Edit (add / change / delete rows)**")
+        edited = st.data_editor(
+            st.session_state["sku_edit"],
+            num_rows="dynamic", use_container_width=True, height=460,
+            key="sku_editor",
+            column_config={
+                "Catergory": st.column_config.SelectboxColumn(
+                    "Catergory", options=["LOOSE", "SET"]),
+                "HJ": st.column_config.NumberColumn("HJ", min_value=0, step=1),
+                "SAP": st.column_config.NumberColumn("SAP", min_value=0, step=1),
+            },
+        )
+        st.caption(f"{len(edited)} rows · row delete කරන්න row එක select කරලා 🗑️ icon එක.")
+        if sa_info and save_key:
+            if st.button("💾 SKU_MASTER Google Sheet එකට save කරන්න", type="primary"):
                 try:
+                    import gsheet
                     gsheet.save_sku_master(sa_info, save_key, edited, sku_ws)
                     st.session_state["sku_edit"] = edited
                     st.success(f"Save වුණා ✅  ({len(edited)} rows)")
                 except Exception as ex:
                     st.error(f"Save error: {ex}")
-            st.caption(f"{len(edited)} rows · row එකක් delete කරන්න row එක select කරලා 🗑️ icon එක.")
+        else:
+            st.info("Google Sheet එකට save කරන්න credentials + Data Sheet key එක ඕන.")
 
 # =========================================================================== #
 # TAB: History
@@ -238,7 +276,13 @@ with tab_gen:
                 existing = None
                 if use_registry and sa_info and save_key:
                     import gsheet
-                    existing = gsheet.read_load_id_registry(sa_info, save_key)
+                    if hasattr(gsheet, "read_load_id_registry"):
+                        try:
+                            existing = gsheet.read_load_id_registry(sa_info, save_key)
+                        except Exception as ex:
+                            st.warning(f"LOAD_ID registry කියවන්න බැරි වුණා ({ex}) — duplicate check skip කළා.")
+                    else:
+                        st.warning("gsheet.py පරණ version එකක් — latest zip එක re-download කරන්න (registry check skip කළා).")
                 with st.spinner("Processing..."):
                     res = E.run_pipeline(req_df, sku_df, inv_df, cfg, existing_load_ids=existing)
                 st.session_state["result"] = res
