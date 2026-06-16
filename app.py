@@ -36,7 +36,7 @@ def get_sa():
 # --------------------------------------------------------------------------- #
 with st.sidebar:
     st.header("⚙️ Settings")
-    source = st.radio("Data source", ["Excel Upload", "Google Sheets"], index=0)
+    source = "Excel Upload"
 
     st.divider()
     st.subheader("Pick options")
@@ -215,61 +215,60 @@ with tab_hist:
 # =========================================================================== #
 with tab_gen:
     st.caption(
-        "Requirement → SKU_MASTER + Inventory check → **VIP PICK** + **INDIA SO Pick**. "
+        "**Requirement + Inventory_Report** upload කරන්න — SKU_MASTER Google Sheet "
+        "එකෙන් ගන්නවා → **VIP PICK** + **INDIA SO Pick**. "
         "Pick = Req Qty × HJ ÷ SAP, carton (Actual Qty) නොබෙදා."
     )
-    req_df = sku_df = inv_df = None
+    req_df = inv_df = sku_df = None
 
-    if source == "Excel Upload":
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            f_req = st.file_uploader("1️⃣ Requirement (Requament)", type=["xlsx", "xls"])
-        with c2:
-            f_sku = st.file_uploader("2️⃣ SKU_MASTER (optional — Google Sheet එකෙනුත් ගන්න පුළුවන්)",
-                                     type=["xlsx", "xls"])
-        with c3:
-            f_inv = st.file_uploader("3️⃣ Inventory_Report", type=["xlsx", "xls"])
-        if f_req:
-            req_df = pd.read_excel(f_req)
-        if f_inv:
-            inv_df = pd.read_excel(f_inv)
-        if f_sku:
-            sku_df = pd.read_excel(f_sku)
-        elif sa_info and save_key:
-            try:
-                import gsheet
-                sku_df = gsheet.read_sku_master(sa_info, save_key, sku_ws)
-                st.caption("ℹ️ SKU_MASTER, Google Sheet එකෙන් ගත්තා.")
-            except Exception:
-                pass
-    else:  # Google Sheets
-        if not sa_info:
-            st.warning("Google Sheets credentials නෑ — Excel Upload mode එක පාවිච්චි කරන්න.")
-        else:
+    c1, c2 = st.columns(2)
+    with c1:
+        f_req = st.file_uploader("1️⃣ Requirement (Requament)", type=["xlsx", "xls"])
+    with c2:
+        f_inv = st.file_uploader("2️⃣ Inventory_Report", type=["xlsx", "xls"])
+    if f_req:
+        req_df = pd.read_excel(f_req)
+    if f_inv:
+        inv_df = pd.read_excel(f_inv)
+
+    # SKU_MASTER always comes from the Google Sheet (managed in the 🗂️ SKU_MASTER tab)
+    sku_ready = False
+    if sa_info and save_key:
+        try:
             import gsheet
-            gc1, gc2 = st.columns(2)
-            with gc1:
-                req_key = st.text_input("Requirement Sheet URL/Key")
-                req_ws = st.text_input("Requirement worksheet", value="Sheet1")
-            with gc2:
-                inv_key = st.text_input("Inventory Sheet URL/Key")
-                inv_ws = st.text_input("Inventory worksheet", value="Sheet1")
-            st.caption(f"SKU_MASTER, Data Sheet එකේ '{sku_ws}' worksheet එකෙන් ගන්නවා.")
-            if st.button("📥 Google Sheets වලින් load කරන්න"):
-                try:
-                    req_df = gsheet.read_sheet(sa_info, req_key, req_ws)
-                    inv_df = gsheet.read_sheet(sa_info, inv_key, inv_ws)
-                    sku_df = gsheet.read_sku_master(sa_info, save_key, sku_ws)
-                    st.session_state["gs_loaded"] = (req_df, sku_df, inv_df)
-                    st.success("Load වුණා ✅")
-                except Exception as ex:
-                    st.error(f"Google Sheets error: {ex}")
-            if "gs_loaded" in st.session_state and req_df is None:
-                req_df, sku_df, inv_df = st.session_state["gs_loaded"]
+            sku_df = gsheet.read_sku_master(sa_info, save_key, sku_ws)
+            if sku_df is not None and len(sku_df):
+                sku_ready = True
+                st.caption(f"ℹ️ SKU_MASTER — Google Sheet එකෙන් ({len(sku_df)} rows).")
+            else:
+                st.warning("SKU_MASTER හිස් — **🗂️ SKU_MASTER** tab එකෙන් upload කරලා save කරන්න.")
+        except Exception as ex:
+            st.warning(f"SKU_MASTER load කරගන්න බැරි වුණා: {ex}")
+    else:
+        st.warning("Sidebar එකේ **Data Sheet key** + credentials දාලා, "
+                   "**🗂️ SKU_MASTER** tab එකෙන් SKU_MASTER save කරන්න.")
 
-    ready = req_df is not None and sku_df is not None and inv_df is not None
+    # ---- missing-material pre-check (notify before creating pick) ----
+    blocking = False
+    if req_df is not None and sku_ready:
+        try:
+            miss = E.missing_materials(req_df, sku_df)
+        except Exception:
+            miss = []
+        if miss:
+            blocking = True
+            st.error(
+                f"⛔ Requirement එකේ Material **{len(miss)}**ක් SKU_MASTER එකේ නෑ. "
+                "Pick create කරන්න කලින් මේවා **🗂️ SKU_MASTER** tab එකෙන් add කරන්න:"
+            )
+            st.dataframe(pd.DataFrame({"Missing Material (SKU_MASTER එකට add කරන්න)": miss}),
+                         hide_index=True, use_container_width=True,
+                         height=min(340, 60 + 30 * len(miss)))
+
+    ready = (req_df is not None and inv_df is not None and sku_ready and not blocking)
     if not ready:
-        st.info("ⓘ Requirement + SKU_MASTER + Inventory දුන්නම Generate කරන්න පුළුවන්.")
+        if not blocking:
+            st.info("ⓘ Requirement + Inventory upload කරන්න · SKU_MASTER, Google Sheet එකේ තියෙන්න ඕන.")
     else:
         if st.button("🚀 Generate Pick Files", type="primary", use_container_width=True):
             try:

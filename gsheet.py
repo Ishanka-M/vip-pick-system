@@ -219,7 +219,8 @@ def save_all(service_account_info: dict, sheet_url_or_key: str, res: dict,
 
     # --- run history (append) ---
     pick = res["pick"]
-    n_exc = len(res.get("exceptions", []) or [])
+    _exc = res.get("exceptions")
+    n_exc = len(_exc) if _exc is not None else 0
     log_row = {
         "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "Source": source_label,

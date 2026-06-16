@@ -320,6 +320,15 @@ def split_reports(pick: pd.DataFrame):
     return ok, exc
 
 
+def missing_materials(req_df, sku_df) -> list:
+    """Requirement එකේ තියෙන, SKU_MASTER එකේ නැති Material codes ලැයිස්තුව
+    (order of first appearance). Pick create කරන්න කලින් notify කරන්න."""
+    req = parse_requirement(req_df)
+    sku = build_sku_lookup(sku_df)
+    req_mats = list(dict.fromkeys(req["Material"].astype(str).str.strip().tolist()))
+    return [m for m in req_mats if m and m not in sku]
+
+
 def dedup_load_ids(load_ids: list, existing=None):
     """Make LOAD IDs globally unique against an existing registry.
 

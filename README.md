@@ -7,8 +7,12 @@ file into two warehouse pick deliverables for the VIP Industries / EFL 3PL flow:
 - **VIP_PICK.xlsx** — pick summary sheet with CBM / time estimate block
 
 The whole pipeline is driven by one validated engine (`pick_engine.py`) and
-exposed through a Streamlit UI (`app.py`). Input can come from uploaded Excel
-files **or** directly from Google Sheets.
+exposed through a Streamlit UI (`app.py`).
+
+**Flow:** upload **Requirement** + **Inventory_Report** Excel files →
+**SKU_MASTER** is read from a Google Sheet (managed/uploaded in the app's
+🗂️ SKU_MASTER tab) → before generating, any Requirement material missing from
+SKU_MASTER is flagged so it can be added first → generate the two deliverables.
 
 ---
 
