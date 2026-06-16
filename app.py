@@ -1,12 +1,18 @@
 """
 app.py — VIP / EFL Pick Generation System (Streamlit)
 =====================================================
-Requament -> SKU_MASTER + Inventory check -> VIP PICK + INDIA SO Pick Excel generate.
+Requirement -> SKU_MASTER + Inventory check -> VIP PICK + INDIA SO Pick.
+
+Features
+  - Pick formula: target = Req Qty * HJ / SAP, picked only in whole cartons.
+  - Cannot-Pick report: carton-split + insufficient-stock lines.
+  - SKU_MASTER stored in Google Sheet with add / edit / delete (CRUD).
+  - LOAD ID global uniqueness via a Google Sheet registry (-A/-B suffix).
+  - Auto-save every output + monthly pick history to Google Sheet.
 
 Run:    streamlit run app.py
 Deploy: GitHub -> Streamlit Cloud (README බලන්න)
 """
-
 from __future__ import annotations
 from datetime import datetime
 
@@ -17,17 +23,16 @@ import pick_engine as E
 
 st.set_page_config(page_title="VIP Pick Generator", page_icon="📦", layout="wide")
 
-# --------------------------------------------------------------------------- #
-# Header
-# --------------------------------------------------------------------------- #
-st.title("📦 VIP / EFL Pick Generation System")
-st.caption(
-    "Requirement එක → SKU_MASTER + Inventory check → **VIP PICK** සහ "
-    "**INDIA SO Pick** Excel files generate කරගන්න."
-)
+
+def get_sa():
+    try:
+        return st.secrets.get("gcp_service_account", None)
+    except Exception:
+        return None
+
 
 # --------------------------------------------------------------------------- #
-# Sidebar — data source + settings
+# Sidebar — settings
 # --------------------------------------------------------------------------- #
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -35,11 +40,6 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Pick options")
-    rounding = st.selectbox(
-        "Carton rounding", ["floor", "round", "ceil"], index=0,
-        help="Req Qty / divisor → carton ගණන round කරන විදිය. "
-             "Reference file එකට ගැළපෙන්නේ floor (98.2%).",
-    )
     per_min_cbm = st.number_input(
         "Per Minute CBM", min_value=0.0001, value=0.333333, step=0.01, format="%.6f",
         help="Productivity assumption — pick time එක estimate කරන්න.",
@@ -59,181 +59,282 @@ with st.sidebar:
             help="VIP PICK 'LOAD ID QR' sheet එකේ උඩින් පෙන්නන fixed QR codes.",
         )
 
-header_qr_codes = [c.strip() for c in header_codes_raw.split(",") if c.strip()]
+    st.divider()
+    st.subheader("💾 Google Sheet (save + registry + history)")
+    save_key = st.text_input(
+        "Data Sheet URL / Key",
+        help="හැම output එකක්ම, LOAD_ID registry, monthly history මෙතන save වෙනවා. "
+             "Service-account email එකට Editor විදිහට share කරන්න.",
+    )
+    autosave = st.checkbox("Generate කළාම auto-save", value=bool(save_key))
+    use_registry = st.checkbox(
+        "LOAD_ID duplicate check (registry)", value=bool(save_key),
+        help="මේ Sheet එකේ registry එකට බලලා duplicate LOAD ID එකකට -A/-B වගේ "
+             "suffix එකක් දානවා.",
+    )
+    sku_ws = st.text_input("SKU_MASTER worksheet name", value="SKU_MASTER")
 
+header_qr_codes = [c.strip() for c in header_codes_raw.split(",") if c.strip()]
 cfg = E.EngineConfig(
-    rounding=rounding, per_minute_cbm=per_min_cbm,
+    per_minute_cbm=per_min_cbm,
     wh_id=wh_id, client_code=client_code, order_type=order_type,
     pick_date=datetime.combine(pick_date, datetime.min.time()),
     header_qr_codes=header_qr_codes,
 )
+sa_info = get_sa()
 
-# --------------------------------------------------------------------------- #
-# Inputs
-# --------------------------------------------------------------------------- #
-req_df = sku_df = inv_df = None
+st.title("📦 VIP / EFL Pick Generation System")
 
-if source == "Excel Upload":
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        f_req = st.file_uploader("1️⃣ Requirement (Requament)", type=["xlsx", "xls"])
-    with c2:
-        f_sku = st.file_uploader("2️⃣ SKU_MASTER", type=["xlsx", "xls"])
-    with c3:
-        f_inv = st.file_uploader("3️⃣ Inventory_Report", type=["xlsx", "xls"])
+tab_gen, tab_sku, tab_hist = st.tabs(
+    ["🚀 Generate Pick", "🗂️ SKU_MASTER", "📅 History"]
+)
 
-    if f_req:
-        req_df = pd.read_excel(f_req)
-    if f_sku:
-        sku_df = pd.read_excel(f_sku)
-    if f_inv:
-        inv_df = pd.read_excel(f_inv)
-
-else:  # Google Sheets
-    try:
-        import gsheet
-        sa_info = st.secrets.get("gcp_service_account", None)
-    except Exception:
-        sa_info = None
-
+# =========================================================================== #
+# TAB: SKU_MASTER (CRUD)
+# =========================================================================== #
+with tab_sku:
+    st.subheader("🗂️ SKU_MASTER — add / edit / delete")
+    st.caption(
+        "Google Sheet එකේ SKU_MASTER data එක load කරලා, rows add/edit/delete කරලා, "
+        "ආපහු save කරන්න. LOOSE → SAP = HJ · SET → SAP, HJ වෙනස්."
+    )
     if not sa_info:
-        st.warning(
-            "Google Sheets මට වැඩ කරන්න `st.secrets['gcp_service_account']` ඕනේ. "
-            "`.streamlit/secrets.toml.example` සහ README බලන්න. "
-            "දැනට Excel Upload mode එක පාවිච්චි කරන්න පුළුවන්."
-        )
+        st.warning("Google Sheets credentials නෑ — `st.secrets['gcp_service_account']` දාන්න (README බලන්න).")
+    elif not save_key:
+        st.info("Sidebar එකේ **Data Sheet URL/Key** එක දාන්න (SKU_MASTER worksheet එක එතන තියෙන්න ඕන).")
     else:
-        st.info("Google Sheet URL/Key එක සහ worksheet නම් දෙන්න.")
-        gc1, gc2 = st.columns(2)
-        with gc1:
-            req_key = st.text_input("Requirement Sheet URL/Key")
-            req_ws = st.text_input("Requirement worksheet", value="Sheet1")
-            sku_key = st.text_input("SKU_MASTER Sheet URL/Key")
-            sku_ws = st.text_input("SKU_MASTER worksheet", value="Sheet1")
-        with gc2:
-            inv_key = st.text_input("Inventory Sheet URL/Key")
-            inv_ws = st.text_input("Inventory worksheet", value="Sheet1")
-            write_back = st.checkbox("Output Google Sheet එකට ආපහු ලියන්න", value=False)
-            out_key = st.text_input("Output Sheet URL/Key (write-back)") if write_back else ""
-
-        if st.button("📥 Google Sheets වලින් load කරන්න"):
+        import gsheet
+        cinit, cload, csave = st.columns([1.2, 1, 1])
+        if cinit.button("🆕 Initialize sheet (worksheets + headers)"):
             try:
-                req_df = gsheet.read_sheet(sa_info, req_key, req_ws)
-                sku_df = gsheet.read_sheet(sa_info, sku_key, sku_ws)
-                inv_df = gsheet.read_sheet(sa_info, inv_key, inv_ws)
-                st.session_state["gs_loaded"] = (req_df, sku_df, inv_df, out_key if write_back else "")
+                r = gsheet.init_sheet(sa_info, save_key)
+                created = [k for k, v in r.items() if v is True]
+                st.success("Initialize වුණා ✅ — " +
+                           (f"created: {', '.join(created)}" if created else "ඔක්කොම දැනටමත් තිබුණා"))
+                st.markdown(f"🔗 [Google Sheet එක open කරන්න]({r.get('url','')})")
+            except Exception as ex:
+                st.error(f"Init error: {ex}")
+        if cload.button("📥 SKU_MASTER load කරන්න"):
+            try:
+                st.session_state["sku_edit"] = gsheet.read_sku_master(sa_info, save_key, sku_ws)
                 st.success("Load වුණා ✅")
             except Exception as ex:
-                st.error(f"Google Sheets error: {ex}")
+                st.error(f"Load error: {ex}")
 
-        if "gs_loaded" in st.session_state and req_df is None:
-            req_df, sku_df, inv_df, _ = st.session_state["gs_loaded"]
+        if "sku_edit" in st.session_state:
+            edited = st.data_editor(
+                st.session_state["sku_edit"],
+                num_rows="dynamic", use_container_width=True, height=460,
+                key="sku_editor",
+                column_config={
+                    "Catergory": st.column_config.SelectboxColumn(
+                        "Catergory", options=["LOOSE", "SET"]),
+                    "HJ": st.column_config.NumberColumn("HJ", min_value=0, step=1),
+                    "SAP": st.column_config.NumberColumn("SAP", min_value=0, step=1),
+                },
+            )
+            if csave.button("💾 SKU_MASTER save කරන්න", type="primary"):
+                try:
+                    gsheet.save_sku_master(sa_info, save_key, edited, sku_ws)
+                    st.session_state["sku_edit"] = edited
+                    st.success(f"Save වුණා ✅  ({len(edited)} rows)")
+                except Exception as ex:
+                    st.error(f"Save error: {ex}")
+            st.caption(f"{len(edited)} rows · row එකක් delete කරන්න row එක select කරලා 🗑️ icon එක.")
 
-# --------------------------------------------------------------------------- #
-# Generate
-# --------------------------------------------------------------------------- #
-ready = req_df is not None and sku_df is not None and inv_df is not None
+# =========================================================================== #
+# TAB: History
+# =========================================================================== #
+with tab_hist:
+    st.subheader("📅 Monthly Pick History")
+    st.caption("හැම pick run එකක්ම මාසෙට අදාල tab එකකට save වෙනවා — මෙතන බලන්න පුළුවන්.")
+    if not sa_info:
+        st.warning("Google Sheets credentials නෑ.")
+    elif not save_key:
+        st.info("Sidebar එකේ **Data Sheet URL/Key** එක දාන්න.")
+    else:
+        import gsheet
+        if st.button("🔄 History months refresh"):
+            try:
+                st.session_state["hist_months"] = gsheet.list_history_months(sa_info, save_key)
+            except Exception as ex:
+                st.error(f"Error: {ex}")
+        months = st.session_state.get("hist_months", [])
+        if months:
+            sel = st.selectbox("Month", months)
+            if st.button("📄 මේ මාසේ data පෙන්නන්න"):
+                try:
+                    hdf = gsheet.read_history(sa_info, save_key, sel)
+                    st.dataframe(hdf, hide_index=True, use_container_width=True, height=460)
+                    st.metric("Rows", len(hdf))
+                except Exception as ex:
+                    st.error(f"Error: {ex}")
+        else:
+            st.info("History months බලන්න 'refresh' click කරන්න (අඩුම තරමේ එක pick එකක් save කරලා තියෙන්න ඕන).")
 
-if not ready:
-    st.info("ⓘ files 3ම (Requirement, SKU_MASTER, Inventory) දුන්නම generate කරන්න පුළුවන්.")
-    st.stop()
-
-if st.button("🚀 Generate Pick Files", type="primary", use_container_width=True):
-    try:
-        with st.spinner("Processing..."):
-            res = E.run_pipeline(req_df, sku_df, inv_df, cfg)
-        st.session_state["result"] = res
-        st.success("Generate වුණා ✅")
-    except Exception as ex:
-        st.error(f"Error: {ex}")
-        st.stop()
-
-res = st.session_state.get("result")
-if not res:
-    st.stop()
-
-# --------------------------------------------------------------------------- #
-# Results
-# --------------------------------------------------------------------------- #
-pick = res["pick"]
-summary = res["summary"]
-n_short = int(pick["REMARKS"].str.startswith("Shortage").sum())
-n_flag = int((pick["REMARKS"] != "").sum())
-
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Pick lines", len(pick))
-m2.metric("Deliveries", pick["OBD"].nunique())
-m3.metric("Total Boxes", int(pick["HJ Box Qty"].sum()))
-m4.metric("Total CBM", summary["Total CBM Of Pick"])
-m5.metric("Shortage rows", n_short, delta=None)
-
-st.subheader("⏱️ CBM / Pick-Time Summary")
-st.dataframe(pd.DataFrame([summary]), hide_index=True, use_container_width=True)
-
-if n_flag:
-    with st.expander(f"⚠️ Flagged rows ({n_flag}) — Shortage / SKU/Inventory නැති ඒවා", expanded=n_short > 0):
-        st.dataframe(
-            pick[pick["REMARKS"] != ""][
-                ["Material", "Qty", "OBD", "HJ Box Qty", "HJ Pcs Qty", "Pcs/Box", "_avail", "REMARKS"]
-            ].rename(columns={"_avail": "Avail Inv"}),
-            hide_index=True, use_container_width=True,
-        )
-
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["📋 VIP PICK", "🧾 INDIA SO — MASTER", "🧾 INDIA SO — Detail", "🏷️ LOAD ID QR"]
-)
-with tab1:
-    st.dataframe(res["vip_table"], hide_index=True, use_container_width=True, height=420)
-with tab2:
-    st.dataframe(res["india_master"], hide_index=True, use_container_width=True, height=420)
-with tab3:
-    st.dataframe(res["india_detail"], hide_index=True, use_container_width=True, height=420)
-with tab4:
+# =========================================================================== #
+# TAB: Generate
+# =========================================================================== #
+with tab_gen:
     st.caption(
-        f"{len(res['load_ids'])} unique LOAD IDs — VIP PICK Excel එකේ 'LOAD ID QR' "
-        "sheet එකේ scannable QR code එකක් සමඟ generate වෙනවා. "
-        f"Fixed header QR codes: {', '.join(cfg.header_qr_codes)}."
+        "Requirement → SKU_MASTER + Inventory check → **VIP PICK** + **INDIA SO Pick**. "
+        "Pick = Req Qty × HJ ÷ SAP, carton (Actual Qty) නොබෙදා."
     )
-    st.dataframe(
-        pd.DataFrame({"LOAD ID": res["load_ids"]}),
-        hide_index=True, use_container_width=True, height=420,
-    )
+    req_df = sku_df = inv_df = None
 
-st.divider()
-st.subheader("⬇️ Downloads")
-d1, d2 = st.columns(2)
-stamp = cfg.pick_date.strftime("%Y%m%d")
-with d1:
-    st.download_button(
-        "📦 VIP PICK download", data=res["vip_pick_bytes"],
-        file_name=f"VIP_PICK_{stamp}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
-with d2:
-    st.download_button(
-        "🧾 INDIA SO Pick download", data=res["india_so_bytes"],
-        file_name=f"INDIA_SO_Pick_{stamp}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
-
-# Optional Google Sheets write-back
-if source == "Google Sheets" and "gs_loaded" in st.session_state:
-    out_key = st.session_state["gs_loaded"][3]
-    if out_key and st.button("📝 Output Google Sheet එකට ලියන්න"):
-        try:
+    if source == "Excel Upload":
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            f_req = st.file_uploader("1️⃣ Requirement (Requament)", type=["xlsx", "xls"])
+        with c2:
+            f_sku = st.file_uploader("2️⃣ SKU_MASTER (optional — Google Sheet එකෙනුත් ගන්න පුළුවන්)",
+                                     type=["xlsx", "xls"])
+        with c3:
+            f_inv = st.file_uploader("3️⃣ Inventory_Report", type=["xlsx", "xls"])
+        if f_req:
+            req_df = pd.read_excel(f_req)
+        if f_inv:
+            inv_df = pd.read_excel(f_inv)
+        if f_sku:
+            sku_df = pd.read_excel(f_sku)
+        elif sa_info and save_key:
+            try:
+                import gsheet
+                sku_df = gsheet.read_sku_master(sa_info, save_key, sku_ws)
+                st.caption("ℹ️ SKU_MASTER, Google Sheet එකෙන් ගත්තා.")
+            except Exception:
+                pass
+    else:  # Google Sheets
+        if not sa_info:
+            st.warning("Google Sheets credentials නෑ — Excel Upload mode එක පාවිච්චි කරන්න.")
+        else:
             import gsheet
-            sa_info = st.secrets["gcp_service_account"]
-            gsheet.write_sheet(sa_info, out_key, "VIP PICK", res["vip_table"])
-            gsheet.write_sheet(sa_info, out_key, "OutBound MASTER", res["india_master"])
-            gsheet.write_sheet(sa_info, out_key, "OutBound Detail", res["india_detail"])
-            st.success("Google Sheet එකට ලිව්වා ✅")
-        except Exception as ex:
-            st.error(f"Write error: {ex}")
+            gc1, gc2 = st.columns(2)
+            with gc1:
+                req_key = st.text_input("Requirement Sheet URL/Key")
+                req_ws = st.text_input("Requirement worksheet", value="Sheet1")
+            with gc2:
+                inv_key = st.text_input("Inventory Sheet URL/Key")
+                inv_ws = st.text_input("Inventory worksheet", value="Sheet1")
+            st.caption(f"SKU_MASTER, Data Sheet එකේ '{sku_ws}' worksheet එකෙන් ගන්නවා.")
+            if st.button("📥 Google Sheets වලින් load කරන්න"):
+                try:
+                    req_df = gsheet.read_sheet(sa_info, req_key, req_ws)
+                    inv_df = gsheet.read_sheet(sa_info, inv_key, inv_ws)
+                    sku_df = gsheet.read_sku_master(sa_info, save_key, sku_ws)
+                    st.session_state["gs_loaded"] = (req_df, sku_df, inv_df)
+                    st.success("Load වුණා ✅")
+                except Exception as ex:
+                    st.error(f"Google Sheets error: {ex}")
+            if "gs_loaded" in st.session_state and req_df is None:
+                req_df, sku_df, inv_df = st.session_state["gs_loaded"]
+
+    ready = req_df is not None and sku_df is not None and inv_df is not None
+    if not ready:
+        st.info("ⓘ Requirement + SKU_MASTER + Inventory දුන්නම Generate කරන්න පුළුවන්.")
+    else:
+        if st.button("🚀 Generate Pick Files", type="primary", use_container_width=True):
+            try:
+                existing = None
+                if use_registry and sa_info and save_key:
+                    import gsheet
+                    existing = gsheet.read_load_id_registry(sa_info, save_key)
+                with st.spinner("Processing..."):
+                    res = E.run_pipeline(req_df, sku_df, inv_df, cfg, existing_load_ids=existing)
+                st.session_state["result"] = res
+                st.success("Generate වුණා ✅")
+            except Exception as ex:
+                st.error(f"Error: {ex}")
+                res = None
+
+            if st.session_state.get("result") and autosave and sa_info and save_key:
+                try:
+                    import gsheet
+                    with st.spinner("Google Sheet එකට save කරනවා..."):
+                        url = gsheet.save_all(sa_info, save_key,
+                                              st.session_state["result"], cfg,
+                                              source_label=source)
+                    st.success("Auto-save + history + registry update වුණා ✅")
+                    st.markdown(f"🔗 [Google Sheet එක open කරන්න]({url})")
+                except Exception as ex:
+                    st.error(f"Auto-save error: {ex}")
+            elif autosave and not (sa_info and save_key):
+                st.info("Auto-save on — හැබැයි credentials/Sheet key එක නෑ.")
+
+        res = st.session_state.get("result")
+        if res:
+            pick = res["pick"]
+            summary = res["summary"]
+            exc = res["exceptions"]
+
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Pickable lines", len(pick))
+            m2.metric("Deliveries", pick["OBD"].nunique() if len(pick) else 0)
+            m3.metric("Total Boxes", int(pick["HJ Box Qty"].sum()) if len(pick) else 0)
+            m4.metric("Total CBM", summary["Total CBM Of Pick"])
+            m5.metric("Cannot Pick", len(exc), delta=None,
+                      delta_color="inverse" if len(exc) else "off")
+
+            st.subheader("⏱️ CBM / Pick-Time Summary")
+            st.dataframe(pd.DataFrame([summary]), hide_index=True, use_container_width=True)
+
+            if len(exc):
+                short = exc[exc["Issue Type"].astype(str).str.contains("Inventory")]
+                split = exc[exc["Issue Type"].astype(str).str.contains("Carton")]
+                tot_var = int(exc["Variance"].astype(int).sum()) if "Variance" in exc.columns else 0
+                with st.expander(f"⚠️ Cannot Pick report ({len(exc)}) — "
+                                 f"carton-split {len(split)} · stock-short {len(short)} · "
+                                 f"total variance {tot_var} pcs", expanded=True):
+                    st.caption("Picked Pcs = whole cartons පිකියද · Variance = pick කරන්න බැරි ඉතුරු pcs.")
+                    st.dataframe(exc, hide_index=True, use_container_width=True)
+
+            t1, t2, t3, t4 = st.tabs(
+                ["📋 VIP PICK", "🧾 INDIA SO — MASTER", "🧾 INDIA SO — Detail", "🏷️ LOAD ID QR"]
+            )
+            with t1:
+                st.dataframe(res["vip_table"], hide_index=True, use_container_width=True, height=420)
+            with t2:
+                st.dataframe(res["india_master"], hide_index=True, use_container_width=True, height=420)
+            with t3:
+                st.dataframe(res["india_detail"], hide_index=True, use_container_width=True, height=420)
+            with t4:
+                suffixed = [str(x) for x in res["load_ids"] if "-" in str(x)]
+                st.caption(
+                    f"{len(res['load_ids'])} unique LOAD IDs · suffixed (duplicate-fixed): "
+                    f"{len(suffixed)} · header QR: {', '.join(cfg.header_qr_codes)}."
+                )
+                st.dataframe(pd.DataFrame({"LOAD ID": res["load_ids"]}),
+                             hide_index=True, use_container_width=True, height=420)
+
+            st.divider()
+            st.subheader("⬇️ Downloads")
+            stamp = cfg.pick_date.strftime("%Y%m%d")
+            d1, d2 = st.columns(2)
+            with d1:
+                st.download_button(
+                    "📦 VIP PICK download", data=res["vip_pick_bytes"],
+                    file_name=f"VIP_PICK_{stamp}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True)
+            with d2:
+                st.download_button(
+                    "🧾 INDIA SO Pick download", data=res["india_so_bytes"],
+                    file_name=f"INDIA_SO_Pick_{stamp}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True)
+
+            if sa_info and save_key and not autosave:
+                if st.button("📝 හැම data එකම Google Sheet එකට save කරන්න (+history +registry)"):
+                    try:
+                        import gsheet
+                        url = gsheet.save_all(sa_info, save_key, res, cfg, source_label=source)
+                        st.success("Save වුණා ✅")
+                        st.markdown(f"🔗 [Google Sheet එක open කරන්න]({url})")
+                    except Exception as ex:
+                        st.error(f"Save error: {ex}")
 
 st.caption(
-    "Logic: boxsize = inventory carton mode · divisor = boxsize(LOOSE)/SAP(SET) · "
-    "HJ Box = floor(Qty/divisor) · HJ Pcs = Box×boxsize · "
-    "INDIA SO Detail QTY = HJ Pcs Qty."
+    "Logic: pick = Req Qty × HJ ÷ SAP · carton (Actual Qty) නොබෙදා · "
+    "බෙදෙන්නේ නැති / stock මදි lines → Cannot Pick report · "
+    "LOAD ID duplicate → -A/-B suffix."
 )

@@ -26,41 +26,67 @@ Output Excel දෙක download කරගන්න පුළුවන්, ඕන
 
 ---
 
-## Validated pick logic
+## Pick logic (authoritative)
 
-Reverse-engineered from the reference files and validated at **166 / 169
-(98.2%) exact match** on `HJ Pcs Qty`:
+For every requirement line the target pick quantity in **pieces** is:
 
-| Field | Rule |
-|---|---|
-| `boxsize` | mode of inventory **Actual Qty** for that material (physical carton pack size) |
-| `cbm_per_box` | inventory **Cbm** value for that material |
-| `avail` | sum of inventory Actual Qty for that material |
-| `divisor` | `boxsize` if Category == **LOOSE**, else **SAP** (from SKU_MASTER) for **SET** items |
-| `HJ Box Qty` | `floor(Req Qty / divisor)` |
-| `HJ Pcs Qty` | `HJ Box Qty × boxsize` |
-| `Pcs/Box` | `boxsize` |
-| `REMARKS` | `"Shortage"` when `HJ Pcs Qty < Req Qty` (carton-rounding shortfall) |
+```
+target_pcs = Req Qty × HJ ÷ SAP
+```
 
-**SKU_MASTER dedup** (546 duplicate material codes): Category = first, SAP = max, HJ = max.
+| Case | Rule | Example |
+|---|---|---|
+| Worked example | Req=2, SAP=1, HJ=2 → pick **4** | 2 × 2 ÷ 1 = 4 |
+| **LOOSE** | SAP = HJ → multiplier 1 → pick = **Req Qty** | Req 6 → 6 pcs |
+| **SET** | HJ/SAP is the set multiplier | SAP=5, HJ=15 → ×3 |
 
-**INDIA SO `OutBound Detail` QTY == `HJ Pcs Qty`** (confirmed 169/169).
+**Cartons are never split.** A carton holds `Actual Qty` pieces (from the
+Inventory_Report). We pick only **whole cartons**, limited by available stock:
 
-### The 3 mismatches
-The 3 non-matching lines are all **Qty == 1 partial-carton manual loose
-picks** — cases a human picked a single piece that no deterministic
-carton-rounding rule reproduces. They are left to the validated rule; review
-the flagged-rows panel in the app if a single-piece line matters for a run.
+```
+pick_cartons = min(target_pcs // carton, available // carton)
+picked_pcs   = pick_cartons × carton
+variance     = target_pcs − picked_pcs    (the part we cannot pick)
+```
+
+`HJ Box Qty = pick_cartons`, `HJ Pcs Qty = picked_pcs`. The picked whole-carton
+portion goes to the main VIP PICK / INDIA SO outputs.
+
+### Cannot-Pick report (separate)
+Any line with `variance > 0` is **also** listed in the **Cannot Pick** report
+(a sheet in VIP PICK, a tab in the app, and a Google Sheet worksheet), showing
+**Picked Pcs** and **Variance** so you can see how much was picked and how much
+couldn't be:
+
+- **Carton split — partial pick** — e.g. Req 23, carton 2 → pick **22** (11
+  cartons), **variance 1**.
+- **Insufficient stock** — `target_pcs` exceeds available inventory; pick the
+  whole cartons that fit, variance = the shortfall.
+- **Missing SKU / inventory data** — material not in SKU_MASTER and/or inventory.
+
+### LOAD ID uniqueness
+LOAD IDs (= Delivery No) must be globally unique. A **LOAD_ID Registry**
+worksheet in the Google Sheet records every LOAD ID ever used; if a new run
+produces one that already exists, a suffix is appended — `-A`, `-B`, … `-Z`,
+`-AA` — so it never duplicates.
+
+### SKU_MASTER in Google Sheet (CRUD)
+SKU_MASTER lives in a Google Sheet worksheet. The app's **🗂️ SKU_MASTER** tab
+loads it into an editable grid where rows can be **added, edited, and deleted**,
+then saved back to the sheet. Duplicate material codes are reconciled as
+Category = first, SAP = max, HJ = max.
+
+### Monthly history
+Every generated pick is appended to a monthly worksheet named
+`History YYYY-MM` (date-stamped, with the deduped LOAD ID per line). The app's
+**📅 History** tab lists the months and displays any month's data. A **Run Log**
+worksheet records one summary row per run.
 
 ### CBM note
 The reference VIP_PICK total CBM (125.64) is **not reproducible** from the
-supplied inventory snapshot (the engine computes 162.31 = Σ(boxes × cbm) from
-the given `Cbm` column — likely a different inventory snapshot/CBM table was
-used originally). The engine therefore computes CBM **transparently** from the
-inventory `Cbm` column and exposes **Per Minute CBM** (default `1/3 ≈ 0.333333`)
-as an **editable assumption** in the sidebar so you can match your own pick-rate.
-
----
+supplied inventory snapshot (the engine computes Σ(boxes × Cbm) from the given
+`Cbm` column). CBM is therefore computed transparently and **Per Minute CBM**
+(default `1/3 ≈ 0.333333`) is an **editable** sidebar assumption.
 
 ## Project layout
 
@@ -109,8 +135,22 @@ python test_engine.py
    your JSON values under `[gcp_service_account]`.
 4. **Share** the target Google Sheet with the service-account `client_email`
    (Editor access).
-5. In the app sidebar pick **Google Sheets** as the source and paste the sheet
-   URL or key.
+5. In the app sidebar paste the **Data Sheet URL/Key** (one sheet holds
+   everything). The SKU_MASTER worksheet name defaults to `SKU_MASTER`.
+6. Open the **🗂️ SKU_MASTER** tab and click **🆕 Initialize sheet** once — this
+   auto-creates every required worksheet with headers (works on a brand-new
+   empty sheet). Auto-save also ensures the worksheets exist on each run.
+
+The app reads/creates these worksheets in that one Data Sheet:
+
+| Worksheet | Purpose | Updated |
+|---|---|---|
+| `SKU_MASTER` | SKU master data (CRUD source) | on Save |
+| `VIP PICK`, `CBM Summary`, `OutBound MASTER`, `OutBound Detail`, `LOAD ID QR` | latest run outputs | overwrite each run |
+| `Cannot Pick` | carton-split / stock-short lines | overwrite each run |
+| `LOAD_ID Registry` | every LOAD ID ever used (uniqueness) | append |
+| `History YYYY-MM` | monthly pick history | append |
+| `Run Log` | one summary row per run | append |
 
 ---
 

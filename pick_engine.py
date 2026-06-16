@@ -177,7 +177,29 @@ def _carton_count(qty: int, divisor: int, mode: str) -> int:
 
 def compute_pick(requirement: pd.DataFrame, sku: dict, inv: dict,
                  cfg: EngineConfig) -> pd.DataFrame:
-    """Requirement -> enriched pick rows (one per requirement line)."""
+    """Requirement -> enriched pick rows (one per requirement line).
+
+    Pick formula (authoritative):
+        target_pcs = Req Qty * HJ / SAP
+          - LOOSE :  SAP == HJ  ->  target = Req Qty
+          - SET   :  HJ/SAP is the set multiplier (e.g. 3)
+
+    A carton (inventory Actual Qty = `boxsize`) can never be split, so we pick
+    only WHOLE cartons, limited by available stock:
+        pick_cartons = min(target // carton, available // carton)
+        picked_pcs   = pick_cartons * carton
+        variance     = target - picked_pcs   (the part we cannot pick)
+
+    The picked whole-carton portion goes to the main outputs (VIP PICK / INDIA
+    SO). Any line with variance > 0 (carton remainder or short stock) is ALSO
+    listed in the Cannot Pick report with picked qty + variance.
+
+    `_status`:
+        OK            -> picked == target (no variance)
+        CARTON_SPLIT  -> variance from a non-divisible carton remainder
+        SHORT_STOCK   -> variance because target exceeds available stock
+        NO_DATA       -> material missing from SKU master and/or inventory
+    """
     rows = []
     for _, r in requirement.iterrows():
         mat = r["Material"]
@@ -186,47 +208,147 @@ def compute_pick(requirement: pd.DataFrame, sku: dict, inv: dict,
         i = inv.get(mat, {})
 
         category = (s.get("Category") or "LOOSE")
-        sap = int(s.get("SAP") or 1)
+        sap = int(s.get("SAP") or 0)
+        hj = int(s.get("HJ") or 0)
         boxsize = i.get("boxsize")
         cbm = float(i.get("cbm") or 0.0)
         avail = int(i.get("avail") or 0)
 
-        notes = []
+        target_exact = (qty * hj / sap) if sap else 0.0
+        target = int(round(target_exact))
+        unit_split = bool(sap) and abs(target_exact - target) > 1e-9
+
+        box = int(boxsize) if boxsize else 0
+        no_data = (mat not in sku) or (not box)
+
+        if no_data:
+            status = "NO_DATA"
+            pick_cartons = 0
+        else:
+            desired_cartons = target // box
+            stock_cartons = avail // box
+            pick_cartons = min(desired_cartons, stock_cartons)
+
+        picked_pcs = pick_cartons * box if box else 0
+        variance = target - picked_pcs
+
+        issues = []
         if mat not in sku:
-            notes.append("SKU master එකේ නෑ")
-        if not boxsize:
-            notes.append("Inventory එකේ නෑ")
-            boxsize = sap if category != "LOOSE" else 1  # safe fallback
+            issues.append("Not in SKU master")
+        if not box:
+            issues.append("Not in inventory")
+        if unit_split:
+            issues.append(f"Req*HJ not divisible by SAP({sap})")
 
-        divisor = boxsize if category == "LOOSE" else sap
-        box_qty = _carton_count(qty, divisor, cfg.rounding)
-        pcs_qty = box_qty * boxsize
-        pcs_per_box = boxsize
+        if no_data:
+            status = "NO_DATA"
+        elif variance <= 0:
+            status = "OK"
+        elif target > avail:
+            status = "SHORT_STOCK"
+            issues.append(f"Req {target} > stock {avail}; picked {picked_pcs}, variance {variance}")
+        else:
+            status = "CARTON_SPLIT"
+            issues.append(f"{target} pcs not whole cartons of {box}; picked {picked_pcs}, variance {variance}")
 
-        remark = ""
-        if pcs_qty < qty:
-            remark = "Shortage"
-        elif avail and pcs_qty > avail:
-            remark = "Stock Short"
-        if notes:
-            remark = (remark + " | " if remark else "") + "; ".join(notes)
+        remark = "" if status == "OK" else (
+            f"Variance {variance}" if status in ("CARTON_SPLIT", "SHORT_STOCK") else "; ".join(issues))
 
         rows.append({
             "Material": mat,
             "Material des": r.get("Description", ""),
             "Qty": qty,
             "OBD": r["DeliveryNo"],
-            "HJ Box Qty": box_qty,
-            "HJ Pcs Qty": pcs_qty,
-            "Pcs/Box": pcs_per_box,
+            "HJ Box Qty": int(pick_cartons),
+            "HJ Pcs Qty": int(picked_pcs),
+            "Pcs/Box": box,
             "REMARKS": remark,
             "Date": cfg.pick_date,
+            "_status": status,
             "_category": category,
+            "_sap": sap,
+            "_hj": hj,
+            "_target": int(target),
+            "_picked": int(picked_pcs),
+            "_variance": int(variance),
             "_avail": avail,
+            "_issue": "; ".join(issues),
             "_cbm_per_box": cbm,
-            "_line_cbm": round(box_qty * cbm, 4),
+            "_line_cbm": round(pick_cartons * cbm, 4),
         })
     return pd.DataFrame(rows)
+
+
+def split_reports(pick: pd.DataFrame):
+    """Split into (pickable, exceptions).
+
+    pickable   -> lines where we pick at least one whole carton (HJ Pcs Qty > 0),
+                  including partial-carton lines (picked portion only).
+    exceptions -> lines with variance > 0 (carton remainder / short stock) or
+                  no data, showing picked qty + variance.
+    """
+    ok = pick[pick["HJ Pcs Qty"] > 0].reset_index(drop=True)
+    bad = pick[(pick["_variance"] > 0) | (pick["_status"] == "NO_DATA")].reset_index(drop=True)
+
+    issue_label = {
+        "CARTON_SPLIT": "Carton split — partial pick",
+        "SHORT_STOCK": "Insufficient stock (Req > Inventory)",
+        "NO_DATA": "Missing SKU / inventory data",
+    }
+    if len(bad):
+        exc = pd.DataFrame({
+            "Material": bad["Material"],
+            "Material des": bad["Material des"],
+            "OBD": bad["OBD"],
+            "Category": bad["_category"],
+            "Req Qty": bad["Qty"],
+            "SAP": bad["_sap"],
+            "HJ": bad["_hj"],
+            "Target Pcs": bad["_target"],
+            "Pcs/Carton": bad["Pcs/Box"],
+            "Picked Pcs": bad["_picked"],
+            "Variance": bad["_variance"],
+            "Available": bad["_avail"],
+            "Issue Type": bad["_status"].map(issue_label).fillna(bad["_status"]),
+            "Detail": bad["_issue"],
+        })
+    else:
+        exc = pd.DataFrame(columns=[
+            "Material", "Material des", "OBD", "Category", "Req Qty", "SAP", "HJ",
+            "Target Pcs", "Pcs/Carton", "Picked Pcs", "Variance", "Available",
+            "Issue Type", "Detail"])
+    return ok, exc
+
+
+def dedup_load_ids(load_ids: list, existing=None):
+    """Make LOAD IDs globally unique against an existing registry.
+
+    Returns (mapping original->unique, list of newly-used unique ids).
+    Duplicates get -A, -B, ... -Z, -AA ... appended.
+    """
+    existing = set(str(x) for x in (existing or set()))
+    mapping, new_used = {}, []
+
+    def suffix(n):
+        s = ""
+        n += 1
+        while n:
+            n, rem = divmod(n - 1, 26)
+            s = chr(65 + rem) + s
+        return s
+
+    used = set(existing)
+    for lid in load_ids:
+        base = str(lid)
+        cand = base
+        k = 0
+        while cand in used:
+            cand = f"{base}-{suffix(k)}"
+            k += 1
+        used.add(cand)
+        new_used.append(cand)
+        mapping[lid] = cand
+    return mapping, new_used
 
 
 def cbm_summary(pick: pd.DataFrame, cfg: EngineConfig) -> dict:
@@ -248,9 +370,17 @@ def cbm_summary(pick: pd.DataFrame, cfg: EngineConfig) -> dict:
 # --------------------------------------------------------------------------- #
 # Output builders
 # --------------------------------------------------------------------------- #
-def build_india_so(pick: pd.DataFrame, cfg: EngineConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """INDIA SO OutBound MASTER + Detail."""
+def build_india_so(pick: pd.DataFrame, cfg: EngineConfig,
+                   load_id_map: dict | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """INDIA SO OutBound MASTER + Detail.
+
+    `load_id_map` (original delivery -> globally-unique LOAD ID) is applied to the
+    LOAD_ID column only; DISPLAY/STORE/CUSTOMER order numbers keep the real
+    delivery number.
+    """
+    load_id_map = load_id_map or {}
     deliveries = list(dict.fromkeys(pick["OBD"].tolist()))  # preserve order, unique
+    load_ids = [load_id_map.get(d, d) for d in deliveries]
 
     # ---- MASTER : one row per delivery ----
     m = pd.DataFrame(index=range(len(deliveries)), columns=MASTER_COLS)
@@ -262,7 +392,7 @@ def build_india_so(pick: pd.DataFrame, cfg: EngineConfig) -> tuple[pd.DataFrame,
     m["DISPLAY_ORDER_NUMBER"] = deliveries
     m["STORE_ORDER_NUMBER"] = deliveries
     m["CUSTOMER_PO_NUMBER"] = deliveries
-    m["LOAD_ID"] = deliveries
+    m["LOAD_ID"] = load_ids
 
     # ---- DETAIL : one row per requirement line ----
     d = pd.DataFrame(index=range(len(pick)), columns=DETAIL_COLS)
@@ -451,7 +581,7 @@ def _write_load_id_qr_sheet(wb, load_ids: list, gap: int = 5, embed_qr: bool = T
 
 
 def write_vip_pick_xlsx(summary: dict, table: pd.DataFrame, load_ids=None,
-                        header_qr_codes=None) -> bytes:
+                        header_qr_codes=None, exceptions=None) -> bytes:
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
@@ -502,7 +632,7 @@ def write_vip_pick_xlsx(summary: dict, table: pd.DataFrame, load_ids=None,
             vals.append("" if pd.isna(v) else v)
         ws.append(vals)
         rr = ws.max_row
-        is_short = str(row["REMARKS"]).strip().lower().startswith("shortage")
+        is_short = str(row["REMARKS"]).strip() != ""
         for j in range(1, len(table.columns) + 1):
             cell = ws.cell(row=rr, column=j)
             cell.border = border
@@ -513,6 +643,25 @@ def write_vip_pick_xlsx(summary: dict, table: pd.DataFrame, load_ids=None,
 
     ws.freeze_panes = "A5"
     _autosize(ws, table, start_row=hdr_row)
+
+    # --- Exceptions / Cannot-Pick sheet ---
+    if exceptions is not None and len(exceptions):
+        ex = wb.create_sheet("Cannot Pick")
+        ehdr_fill = PatternFill("solid", fgColor="C00000")
+        ews_cols = list(exceptions.columns)
+        ex.append(ews_cols)
+        for c in ex[1]:
+            c.font = hdr_font
+            c.fill = ehdr_fill
+            c.alignment = center
+            c.border = border
+        for _, row in exceptions.iterrows():
+            ex.append(["" if pd.isna(v) else v for v in row.tolist()])
+            for j in range(1, len(ews_cols) + 1):
+                ex.cell(row=ex.max_row, column=j).border = border
+                ex.cell(row=ex.max_row, column=j).fill = short_fill
+        ex.freeze_panes = "A2"
+        _autosize(ex, exceptions, start_row=1)
 
     # --- LOAD ID QR sheet ---
     if load_ids:
@@ -526,26 +675,36 @@ def write_vip_pick_xlsx(summary: dict, table: pd.DataFrame, load_ids=None,
 # --------------------------------------------------------------------------- #
 # One-shot pipeline
 # --------------------------------------------------------------------------- #
-def run_pipeline(req_df, sku_df, inv_df, cfg: EngineConfig | None = None) -> dict:
+def run_pipeline(req_df, sku_df, inv_df, cfg: EngineConfig | None = None,
+                 existing_load_ids=None) -> dict:
     cfg = cfg or EngineConfig()
     requirement = parse_requirement(req_df)
     sku = build_sku_lookup(sku_df)
     inv = build_inventory_lookup(inv_df)
 
-    pick = compute_pick(requirement, sku, inv, cfg)
-    master, detail = build_india_so(pick, cfg)
+    full_pick = compute_pick(requirement, sku, inv, cfg)
+    pick, exceptions = split_reports(full_pick)        # OK lines vs cannot-pick
+
+    # Globally-unique LOAD IDs (against existing registry, suffix -A/-B/...)
+    base_ids = build_load_id_qr(pick)
+    load_id_map, load_ids = dedup_load_ids(base_ids, existing_load_ids)
+
+    master, detail = build_india_so(pick, cfg, load_id_map)
     summary, vip_table = build_vip_pick_sheet(pick, cfg)
-    load_ids = build_load_id_qr(pick)
 
     return {
         "requirement": requirement,
+        "full_pick": full_pick,
         "pick": pick,
+        "exceptions": exceptions,
         "summary": summary,
         "vip_table": vip_table,
         "india_master": master,
         "india_detail": detail,
         "load_ids": load_ids,
-        "vip_pick_bytes": write_vip_pick_xlsx(summary, vip_table, load_ids,
-                                              header_qr_codes=cfg.header_qr_codes),
+        "load_id_map": load_id_map,
+        "vip_pick_bytes": write_vip_pick_xlsx(
+            summary, vip_table, load_ids,
+            header_qr_codes=cfg.header_qr_codes, exceptions=exceptions),
         "india_so_bytes": write_india_so_xlsx(master, detail),
     }
