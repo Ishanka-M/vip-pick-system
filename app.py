@@ -114,9 +114,15 @@ with st.sidebar:
             else:
                 try:
                     import gsheet
-                    aff = gsheet.reset_data(sa_info, save_key, reset_scope)
-                    st.session_state.pop("result", None)
-                    st.success(f"Reset වුණා ✅ ({len(aff)} worksheets)")
+                    if not hasattr(gsheet, "reset_data"):
+                        st.error("gsheet.py පරණ version එකක් load වෙලා. latest zip එකේ "
+                                 "**gsheet.py** එක replace කරලා, terminal එකේ Ctrl+C කරලා "
+                                 "ආයෙ `streamlit run app.py` කරන්න (`__pycache__` folder එක "
+                                 "delete කරන්නත් පුළුවන්).")
+                    else:
+                        aff = gsheet.reset_data(sa_info, save_key, reset_scope)
+                        st.session_state.pop("result", None)
+                        st.success(f"Reset වුණා ✅ ({len(aff)} worksheets)")
                 except Exception as ex:
                     st.error(f"Reset error: {ex}")
 
