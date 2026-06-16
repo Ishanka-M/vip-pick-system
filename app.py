@@ -34,6 +34,7 @@ def get_sa():
 # --------------------------------------------------------------------------- #
 # Sidebar — settings
 # --------------------------------------------------------------------------- #
+sa_info = get_sa()
 with st.sidebar:
     st.header("⚙️ Settings")
     source = "Excel Upload"
@@ -60,19 +61,64 @@ with st.sidebar:
         )
 
     st.divider()
-    st.subheader("💾 Google Sheet (save + registry + history)")
-    save_key = st.text_input(
-        "Data Sheet URL / Key",
-        help="හැම output එකක්ම, LOAD_ID registry, monthly history මෙතන save වෙනවා. "
-             "Service-account email එකට Editor විදිහට share කරන්න.",
-    )
-    autosave = st.checkbox("Generate කළාම auto-save", value=bool(save_key))
-    use_registry = st.checkbox(
-        "LOAD_ID duplicate check (registry)", value=bool(save_key),
-        help="මේ Sheet එකේ registry එකට බලලා duplicate LOAD ID එකකට -A/-B වගේ "
-             "suffix එකක් දානවා.",
-    )
-    sku_ws = st.text_input("SKU_MASTER worksheet name", value="SKU_MASTER")
+    st.subheader("💾 Google Sheet")
+    # Connection comes from .streamlit/secrets.toml  [google_sheet]  (not the UI)
+    gs_conf = {}
+    try:
+        gs_conf = dict(st.secrets.get("google_sheet", {}))
+    except Exception:
+        gs_conf = {}
+    save_key = str(gs_conf.get("data_sheet", "")).strip()
+    sku_ws = str(gs_conf.get("sku_worksheet", "SKU_MASTER")).strip() or "SKU_MASTER"
+    autosave = bool(gs_conf.get("auto_save", True))
+    use_registry = bool(gs_conf.get("load_id_registry", True))
+
+    if sa_info and save_key:
+        st.success("✅ Google Sheet — secrets වලින් connected")
+        st.caption(f"Worksheet: `{sku_ws}` · auto-save: {'on' if autosave else 'off'} · "
+                   f"registry: {'on' if use_registry else 'off'}")
+    elif not sa_info:
+        st.warning("`[gcp_service_account]` secret නෑ — secrets.toml බලන්න.")
+    else:
+        st.warning("`[google_sheet] data_sheet` secret නෑ — secrets.toml එකට Sheet "
+                   "URL/Key එක දාන්න (README බලන්න).")
+
+    st.divider()
+    with st.expander("🧹 Reset data"):
+        if st.button("↩️ Current result clear (session)"):
+            for k in ("result", "gs_loaded"):
+                st.session_state.pop(k, None)
+            st.success("Session result clear කළා ✅")
+        st.markdown("---")
+        st.caption("Google Sheet එකේ data reset (SKU_MASTER default safe):")
+        reset_scope = st.multiselect(
+            "මොනවද clear කරන්නේ",
+            options=["outputs", "history", "registry", "runlog", "sku"],
+            default=["outputs", "history", "registry", "runlog"],
+            format_func=lambda s: {
+                "outputs": "Outputs (VIP PICK, INDIA SO, Cannot Pick...)",
+                "history": "Monthly history tabs",
+                "registry": "LOAD_ID Registry",
+                "runlog": "Run Log",
+                "sku": "⚠️ SKU_MASTER (master data!)",
+            }[s],
+        )
+        confirm_reset = st.checkbox("මට විශ්වාසයි — reset කරන්න (back ගන්න බෑ)")
+        if st.button("🗑️ Google Sheet data reset", type="secondary"):
+            if not (sa_info and save_key):
+                st.error("Credentials + Data Sheet key එක ඕන.")
+            elif not reset_scope:
+                st.warning("Clear කරන්න ඕන දේවල් select කරන්න.")
+            elif not confirm_reset:
+                st.warning("Confirm checkbox එක tick කරන්න.")
+            else:
+                try:
+                    import gsheet
+                    aff = gsheet.reset_data(sa_info, save_key, reset_scope)
+                    st.session_state.pop("result", None)
+                    st.success(f"Reset වුණා ✅ ({len(aff)} worksheets)")
+                except Exception as ex:
+                    st.error(f"Reset error: {ex}")
 
 header_qr_codes = [c.strip() for c in header_codes_raw.split(",") if c.strip()]
 cfg = E.EngineConfig(
@@ -81,7 +127,6 @@ cfg = E.EngineConfig(
     pick_date=datetime.combine(pick_date, datetime.min.time()),
     header_qr_codes=header_qr_codes,
 )
-sa_info = get_sa()
 
 st.title("📦 VIP / EFL Pick Generation System")
 

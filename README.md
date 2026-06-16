@@ -135,12 +135,15 @@ python test_engine.py
 
 1. Google Cloud Console → create a **service account** → create a **JSON key**.
 2. Enable **Google Sheets API** and **Google Drive API** for the project.
-3. Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and paste
-   your JSON values under `[gcp_service_account]`.
+3. Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`, paste
+   your JSON values under `[gcp_service_account]`, and set the `[google_sheet]`
+   section — `data_sheet` (the Sheet URL or key), `sku_worksheet`, `auto_save`,
+   `load_id_registry`. The app reads the sheet connection from here, **not** the UI.
 4. **Share** the target Google Sheet with the service-account `client_email`
    (Editor access).
-5. In the app sidebar paste the **Data Sheet URL/Key** (one sheet holds
-   everything). The SKU_MASTER worksheet name defaults to `SKU_MASTER`.
+5. The sidebar shows **✅ Google Sheet — secrets වලින් connected** when both the
+   credentials and `[google_sheet] data_sheet` are set. SKU_MASTER worksheet
+   defaults to `SKU_MASTER`.
 6. Open the **🗂️ SKU_MASTER** tab and click **🆕 Initialize sheet** once — this
    auto-creates every required worksheet with headers (works on a brand-new
    empty sheet). Auto-save also ensures the worksheets exist on each run.
@@ -179,7 +182,9 @@ The app reads/creates these worksheets in that one Data Sheet:
 ---
 
 ## Notes
-- Rounding mode is configurable in the sidebar (default **floor**, which gave the
-  best match). `round` / `ceil` are available if a future client wants over-pick.
 - All WMS constants (WH_ID `LPGL`, CLIENT_CODE `INM0VIP`, ORDER_TYPE
   `Sales Orders`, etc.) are editable in the sidebar "WMS constants" expander.
+- **Reset data** (sidebar 🧹): clear the current session result, or reset the
+  Google Sheet data by scope — outputs, monthly history tabs, LOAD_ID Registry,
+  Run Log, and optionally SKU_MASTER. Needs an explicit confirm tick; SKU_MASTER
+  is left out by default so master data isn't wiped accidentally.

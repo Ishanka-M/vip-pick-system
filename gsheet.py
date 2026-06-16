@@ -360,3 +360,68 @@ def read_history(service_account_info: dict, sheet_url_or_key: str,
                  ws_name: str) -> pd.DataFrame:
     """Monthly history tab එකක data කියවනවා."""
     return read_sheet(service_account_info, sheet_url_or_key, ws_name)
+
+
+# --------------------------------------------------------------------------- #
+# Data reset
+# --------------------------------------------------------------------------- #
+OUTPUT_WS = ["VIP PICK", "CBM Summary", "OutBound MASTER", "OutBound Detail",
+             "LOAD ID QR", CANNOTPICK_WS]
+_HEADER_MAP = {LOADID_WS: LOADID_COLS, RUNLOG_WS: RUNLOG_COLS,
+               SKU_WS: SKU_COLS, CANNOTPICK_WS: CANNOTPICK_COLS}
+
+
+def reset_data(service_account_info: dict, sheet_url_or_key: str, scope) -> list:
+    """Reset Google Sheet data. `scope` is an iterable of group names:
+
+        "outputs"  -> clear VIP PICK / CBM Summary / OutBound MASTER+Detail /
+                      LOAD ID QR / Cannot Pick
+        "history"  -> delete every 'History YYYY-MM' worksheet
+        "registry" -> clear LOAD_ID Registry (header kept)
+        "runlog"   -> clear Run Log (header kept)
+        "sku"      -> clear SKU_MASTER (header kept)  ** destructive **
+
+    Structural sheets are cleared but keep their header row; monthly history
+    tabs are deleted. Returns the list of affected worksheet titles.
+    """
+    import gspread
+    scope = set(scope)
+    gc = _client(service_account_info)
+    sh = _open(gc, sheet_url_or_key)
+
+    clear_titles, delete_titles = [], []
+    if "outputs" in scope:
+        clear_titles += OUTPUT_WS
+    if "registry" in scope:
+        clear_titles.append(LOADID_WS)
+    if "runlog" in scope:
+        clear_titles.append(RUNLOG_WS)
+    if "sku" in scope:
+        clear_titles.append(SKU_WS)
+    if "history" in scope:
+        delete_titles += [ws.title for ws in sh.worksheets()
+                          if ws.title.startswith("History ")]
+
+    affected = []
+    for t in clear_titles:
+        try:
+            ws = sh.worksheet(t)
+            ws.clear()
+            if t in _HEADER_MAP:
+                ws.update([_HEADER_MAP[t]], value_input_option="USER_ENTERED")
+            affected.append(t)
+        except gspread.WorksheetNotFound:
+            pass
+
+    # never delete the last remaining worksheet
+    for t in delete_titles:
+        try:
+            if len(sh.worksheets()) <= 1:
+                ws = sh.worksheet(t)
+                ws.clear()
+            else:
+                sh.del_worksheet(sh.worksheet(t))
+            affected.append(t)
+        except gspread.WorksheetNotFound:
+            pass
+    return affected
