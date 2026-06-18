@@ -425,3 +425,45 @@ def reset_data(service_account_info: dict, sheet_url_or_key: str, scope) -> list
         except gspread.WorksheetNotFound:
             pass
     return affected
+
+
+def merge_sku_master(service_account_info: dict, sheet_url_or_key: str,
+                     new_df: pd.DataFrame, worksheet: str = SKU_WS) -> dict:
+    """Merge (upsert) uploaded SKU rows INTO the existing Google Sheet data.
+
+    - Material code එකක් දැනටමත් තියෙනවා නම් -> update (අලුත් row එකෙන්).
+    - අලුත් Material code එකක් නම් -> add.
+    - Upload එකේ නැති, දැනට තියෙන rows -> **delete වෙන්නේ නෑ** (එලෙසම තියෙනවා).
+
+    Returns {"added": n, "updated": n, "total": n}.
+    """
+    import gspread
+    # existing
+    try:
+        existing = read_sheet(service_account_info, sheet_url_or_key, worksheet)
+    except gspread.WorksheetNotFound:
+        existing = pd.DataFrame(columns=SKU_COLS)
+    for c in SKU_COLS:
+        if c not in existing.columns:
+            existing[c] = ""
+    existing = existing[SKU_COLS].copy()
+
+    # incoming
+    inc = new_df.copy()
+    for c in SKU_COLS:
+        if c not in inc.columns:
+            inc[c] = ""
+    inc = inc[SKU_COLS].copy()
+    inc = inc[inc["Material code"].astype(str).str.strip() != ""]
+
+    ex_codes = set(existing["Material code"].astype(str).str.strip())
+    inc_codes = set(inc["Material code"].astype(str).str.strip())
+    added = len(inc_codes - ex_codes)
+    updated = len(inc_codes & ex_codes)
+
+    # drop existing rows whose code is being updated, keep the rest, append incoming
+    keep = existing[~existing["Material code"].astype(str).str.strip().isin(inc_codes)]
+    merged = pd.concat([keep, inc], ignore_index=True)
+
+    write_sheet(service_account_info, sheet_url_or_key, worksheet, merged)
+    return {"added": added, "updated": updated, "total": len(merged)}

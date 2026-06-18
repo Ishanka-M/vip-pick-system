@@ -220,12 +220,28 @@ with tab_sku:
         )
         st.caption(f"{len(edited)} rows · row delete කරන්න row එක select කරලා 🗑️ icon එක.")
         if sa_info and save_key:
-            if st.button("💾 SKU_MASTER Google Sheet එකට save කරන්න", type="primary"):
+            mc1, mc2 = st.columns(2)
+            if mc1.button("➕ Merge (තියෙන data එකට add/update)", type="primary",
+                          help="Material code එක තියෙනවා නම් update · අලුත් නම් add · "
+                               "තියෙන වෙන data delete වෙන්නේ නෑ."):
+                try:
+                    import gsheet
+                    if not hasattr(gsheet, "merge_sku_master"):
+                        st.error("gsheet.py පරණයි — latest zip එක replace කරලා restart කරන්න.")
+                    else:
+                        r = gsheet.merge_sku_master(sa_info, save_key, edited, sku_ws)
+                        st.session_state["sku_edit"] = gsheet.read_sku_master(sa_info, save_key, sku_ws)
+                        st.success(f"Merge වුණා ✅  added {r['added']} · updated {r['updated']} · "
+                                   f"total {r['total']} rows")
+                except Exception as ex:
+                    st.error(f"Merge error: {ex}")
+            if mc2.button("💾 Replace (මුළු sheet එකම overwrite)",
+                          help="⚠️ Sheet එකේ දැන් තියෙන SKU_MASTER ඔක්කොම මේකෙන් replace වෙනවා."):
                 try:
                     import gsheet
                     gsheet.save_sku_master(sa_info, save_key, edited, sku_ws)
                     st.session_state["sku_edit"] = edited
-                    st.success(f"Save වුණා ✅  ({len(edited)} rows)")
+                    st.success(f"Replace වුණා ✅  ({len(edited)} rows)")
                 except Exception as ex:
                     st.error(f"Save error: {ex}")
         else:

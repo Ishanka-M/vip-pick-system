@@ -76,9 +76,14 @@ produces one that already exists, a suffix is appended — `-A`, `-B`, … `-Z`,
 
 ### SKU_MASTER in Google Sheet (CRUD)
 SKU_MASTER lives in a Google Sheet worksheet. The app's **🗂️ SKU_MASTER** tab
-loads it into an editable grid where rows can be **added, edited, and deleted**,
-then saved back to the sheet. Duplicate material codes are reconciled as
-Category = first, SAP = max, HJ = max.
+loads it into an editable grid where rows can be **added, edited, and deleted**.
+Two save modes:
+- **➕ Merge** — upsert by Material code: existing codes are updated, new codes
+  added, and other existing rows are **kept (never deleted)**. Use this when
+  uploading a partial/corrected SKU_MASTER.
+- **💾 Replace** — overwrite the whole worksheet with the current grid.
+
+Duplicate material codes are reconciled as Category = first, SAP = max, HJ = max.
 
 ### Monthly history
 Every generated pick is appended to a monthly worksheet named
