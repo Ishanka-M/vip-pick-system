@@ -189,11 +189,13 @@ def save_all(service_account_info: dict, sheet_url_or_key: str, res: dict,
     write_sheet(service_account_info, sheet_url_or_key, "CBM Summary", summary_df)
 
     header_codes = list(getattr(cfg, "header_qr_codes", []) or [])
-    load_df = pd.DataFrame({"LOAD ID": res.get("load_ids", [])})
-    load_df["QR Code"] = ""                       # QR images Excel export එකේ විතරයි
-    if header_codes:
-        load_df["Header QR Codes"] = (header_codes + [""] * len(load_df))[:len(load_df)] \
-            if len(load_df) >= len(header_codes) else header_codes
+    load_ids = list(res.get("load_ids", []))
+    n = max(len(load_ids), len(header_codes), 1)
+    load_df = pd.DataFrame({
+        "LOAD ID": load_ids + [""] * (n - len(load_ids)),
+        "QR Code": [""] * n,                          # QR images Excel export එකේ විතරයි
+        "Header QR Codes": header_codes + [""] * (n - len(header_codes)),
+    })
     write_sheet(service_account_info, sheet_url_or_key, "LOAD ID QR", load_df)
 
     write_sheet(service_account_info, sheet_url_or_key, "OutBound MASTER", res["india_master"])

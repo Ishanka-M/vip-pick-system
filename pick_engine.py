@@ -450,6 +450,22 @@ def _autosize(ws, df, start_row=1):
         ws.column_dimensions[get_column_letter(j)].width = min(width + 2, 45)
 
 
+def _blank_to_none(v):
+    """Blank values -> None so openpyxl writes a truly empty cell (type 'n'),
+    not an empty inline-string. HighJump rejects empty-string cells in
+    validated fields like CARTON_LABEL ('Valid values are 000-999')."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return None if v.strip() == "" else v
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return v
+
+
 def write_india_so_xlsx(master: pd.DataFrame, detail: pd.DataFrame) -> bytes:
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
@@ -465,7 +481,7 @@ def write_india_so_xlsx(master: pd.DataFrame, detail: pd.DataFrame) -> bytes:
             ws.title = name
         ws.append(list(df.columns))
         for _, row in df.iterrows():
-            ws.append(["" if (pd.isna(v)) else v for v in row.tolist()])
+            ws.append([_blank_to_none(v) for v in row.tolist()])
         for c in ws[1]:
             c.font = hdr_font
             c.fill = hdr_fill
