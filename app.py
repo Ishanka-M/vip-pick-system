@@ -23,6 +23,115 @@ import pick_engine as E
 
 st.set_page_config(page_title="VIP Pick Generator", page_icon="📦", layout="wide")
 
+_THEME_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap');
+
+:root{
+  --ink:#122740; --slate:#3D5573; --mist:#F5F7FA; --line:#E4E9F0;
+  --accent:#C8102E; --accent-soft:#FDECEE; --ok:#1B7F5E; --warn:#B9770A;
+}
+
+/* base */
+html, body, [class*="css"]{ font-family:'Inter',system-ui,sans-serif; }
+.stApp{ background:
+   radial-gradient(1200px 500px at 100% -10%, #eef2f8 0%, rgba(238,242,248,0) 60%),
+   var(--mist); color:var(--ink); }
+.block-container{ padding-top:1.1rem; max-width:1280px; }
+
+/* headings */
+h1,h2,h3,h4{ font-family:'Space Grotesk','Inter',sans-serif; color:var(--ink);
+  letter-spacing:-.01em; font-weight:700; }
+h2{ font-size:1.25rem; } h3{ font-size:1.05rem; }
+
+/* command-bar header */
+.appbar{ display:flex; align-items:center; justify-content:space-between;
+  gap:1rem; padding:18px 22px; border-radius:16px; margin-bottom:6px;
+  background:linear-gradient(120deg,#0E2138 0%,#15304F 55%,#1B3A60 100%);
+  box-shadow:0 10px 30px -12px rgba(18,39,64,.45); color:#fff; }
+.appbar .brand{ display:flex; align-items:center; gap:14px; }
+.appbar .mark{ width:42px; height:42px; border-radius:11px; display:grid;
+  place-items:center; background:var(--accent); color:#fff; font-size:20px;
+  box-shadow:0 6px 16px -6px rgba(200,16,46,.7); }
+.appbar .title{ font-family:'Space Grotesk',sans-serif; font-weight:700;
+  font-size:1.32rem; line-height:1.1; color:#fff; letter-spacing:-.01em; }
+.appbar .sub{ font-size:.78rem; color:#A8BBD2; margin-top:3px;
+  font-family:'IBM Plex Mono',monospace; letter-spacing:.02em; }
+.appbar .pill{ font-family:'IBM Plex Mono',monospace; font-size:.72rem;
+  font-weight:600; padding:7px 13px; border-radius:999px;
+  border:1px solid rgba(255,255,255,.16); background:rgba(255,255,255,.07);
+  color:#dbe6f3; display:inline-flex; align-items:center; gap:7px; white-space:nowrap;}
+.appbar .dot{ width:8px; height:8px; border-radius:50%; }
+.dot-on{ background:#43D39E; box-shadow:0 0 0 3px rgba(67,211,158,.22);}
+.dot-off{ background:#E8B23A; box-shadow:0 0 0 3px rgba(232,178,58,.20);}
+
+/* tabs as a segmented control */
+[data-testid="stTabs"] [role="tablist"]{ gap:6px; border-bottom:1px solid var(--line);}
+[data-testid="stTabs"] [role="tab"]{ font-family:'Space Grotesk',sans-serif;
+  font-weight:600; font-size:.92rem; color:var(--slate); padding:8px 16px;
+  border-radius:9px 9px 0 0; }
+[data-testid="stTabs"] [role="tab"][aria-selected="true"]{ color:var(--accent);
+  background:var(--accent-soft); }
+[data-testid="stTabs"] [role="tab"][aria-selected="true"]::after{ content:"";
+  display:block; height:2px; background:var(--accent); margin-top:6px;
+  border-radius:2px; }
+
+/* metric cards */
+[data-testid="stMetric"]{ background:#fff; border:1px solid var(--line);
+  border-radius:14px; padding:14px 16px; box-shadow:0 1px 2px rgba(18,39,64,.04);}
+[data-testid="stMetricLabel"]{ color:var(--slate); font-weight:600;
+  font-size:.74rem; text-transform:uppercase; letter-spacing:.06em; }
+[data-testid="stMetricValue"]{ font-family:'IBM Plex Mono',monospace;
+  color:var(--ink); font-weight:600; }
+
+/* buttons */
+.stButton>button, .stDownloadButton>button{ font-family:'Space Grotesk',sans-serif;
+  font-weight:600; border-radius:10px; border:1px solid var(--line);
+  padding:.5rem 1rem; transition:transform .04s ease, box-shadow .15s ease; }
+.stButton>button:hover, .stDownloadButton>button:hover{ transform:translateY(-1px);
+  box-shadow:0 6px 16px -8px rgba(18,39,64,.4); }
+.stButton>button[kind="primary"], .stDownloadButton>button{
+  background:var(--accent); border-color:var(--accent); color:#fff; }
+.stButton>button[kind="primary"]:hover, .stDownloadButton>button:hover{
+  background:#a50e26; }
+
+/* sidebar */
+[data-testid="stSidebar"]{ background:#fff; border-right:1px solid var(--line); }
+[data-testid="stSidebar"] h2{ font-size:1.05rem; }
+[data-testid="stSidebar"] .stMarkdown, [data-testid="stSidebar"] label{ color:var(--slate);}
+
+/* dataframes / inputs */
+[data-testid="stDataFrame"]{ border:1px solid var(--line); border-radius:12px; }
+.stTextInput input, .stNumberInput input, .stDateInput input{ border-radius:9px; }
+
+/* alerts a touch softer */
+[data-testid="stAlert"]{ border-radius:11px; }
+
+/* caption / footer */
+.footnote{ color:var(--slate); font-size:.78rem; font-family:'IBM Plex Mono',monospace;
+  border-top:1px solid var(--line); padding-top:12px; margin-top:18px; }
+</style>
+"""
+st.markdown(_THEME_CSS, unsafe_allow_html=True)
+
+
+def render_appbar(connected: bool, detail: str = ""):
+    dot = "dot-on" if connected else "dot-off"
+    status = "Sheet connected" if connected else "Sheet not set"
+    st.markdown(f"""
+<div class="appbar">
+  <div class="brand">
+    <div class="mark">📦</div>
+    <div>
+      <div class="title">VIP &middot; EFL Pick Generation</div>
+      <div class="sub">HJ WMS · INDIA SO · {detail or 'warehouse pick automation'}</div>
+    </div>
+  </div>
+  <div class="pill"><span class="dot {dot}"></span>{status}</div>
+</div>
+""", unsafe_allow_html=True)
+
+
 
 def get_sa():
     try:
@@ -134,7 +243,8 @@ cfg = E.EngineConfig(
     header_qr_codes=header_qr_codes,
 )
 
-st.title("📦 VIP / EFL Pick Generation System")
+render_appbar(connected=bool(sa_info and save_key),
+              detail=(f"worksheet {sku_ws}" if (sa_info and save_key) else "configure secrets"))
 
 tab_gen, tab_sku, tab_hist = st.tabs(
     ["🚀 Generate Pick", "🗂️ SKU_MASTER", "📅 History"]
@@ -284,7 +394,7 @@ with tab_gen:
     st.caption(
         "**Requirement + Inventory_Report** upload කරන්න — SKU_MASTER Google Sheet "
         "එකෙන් ගන්නවා → **VIP PICK** + **INDIA SO Pick**. "
-        "Pick = Req Qty × HJ ÷ SAP, carton (Actual Qty) නොබෙදා."
+        "Pick = Req Qty × HJ ÷ SAP (whole units), Actual Qty sum එකට වඩා නෑ."
     )
     req_df = inv_df = sku_df = None
 
@@ -443,8 +553,9 @@ with tab_gen:
                     except Exception as ex:
                         st.error(f"Save error: {ex}")
 
-st.caption(
-    "Logic: pick = Req Qty × HJ ÷ SAP · carton (Actual Qty) නොබෙදා · "
-    "බෙදෙන්නේ නැති / stock මදි lines → Cannot Pick report · "
-    "LOAD ID duplicate → -A/-B suffix."
+st.markdown(
+    "<div class='footnote'>pick = Req Qty × HJ ÷ SAP (whole units) · "
+    "Actual Qty sum එකට වඩා නෑ · stock මදි → Cannot Pick · "
+    "LOAD ID duplicate → -A/-B · INDIA SO empty cells truly-empty (HighJump)</div>",
+    unsafe_allow_html=True,
 )
