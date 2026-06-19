@@ -401,13 +401,14 @@ def build_india_so(pick: pd.DataFrame, cfg: EngineConfig,
                    load_id_map: dict | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """INDIA SO OutBound MASTER + Detail.
 
-    `load_id_map` (original delivery -> globally-unique LOAD ID) is applied to the
-    LOAD_ID column only; DISPLAY/STORE/CUSTOMER order numbers keep the real
-    delivery number.
+    The globally-unique LOAD ID (delivery + any -A/-B suffix) is used for
+    LOAD_ID, DISPLAY_ORDER_NUMBER, STORE_ORDER_NUMBER and CUSTOMER_PO_NUMBER in
+    the MASTER, and for DISPLAY_ORDER_NUMBER in the Detail.
+    LINE_NUMBER runs sequentially 1, 2, 3, ... down the whole Detail sheet.
     """
     load_id_map = load_id_map or {}
     deliveries = list(dict.fromkeys(pick["OBD"].tolist()))  # preserve order, unique
-    load_ids = [load_id_map.get(d, d) for d in deliveries]
+    load_ids = [str(load_id_map.get(d, d)) for d in deliveries]
 
     # ---- MASTER : one row per delivery ----
     m = pd.DataFrame(index=range(len(deliveries)), columns=MASTER_COLS)
@@ -416,9 +417,9 @@ def build_india_so(pick: pd.DataFrame, cfg: EngineConfig,
     m["WH_ID"] = cfg.wh_id
     m["CLIENT_CODE"] = cfg.client_code
     m["ORDER_TYPE"] = cfg.order_type
-    m["DISPLAY_ORDER_NUMBER"] = deliveries
-    m["STORE_ORDER_NUMBER"] = deliveries
-    m["CUSTOMER_PO_NUMBER"] = deliveries
+    m["DISPLAY_ORDER_NUMBER"] = load_ids
+    m["STORE_ORDER_NUMBER"] = load_ids
+    m["CUSTOMER_PO_NUMBER"] = load_ids
     m["LOAD_ID"] = load_ids
 
     # ---- DETAIL : one row per requirement line ----
@@ -427,16 +428,11 @@ def build_india_so(pick: pd.DataFrame, cfg: EngineConfig,
         d[k] = v
     d["WH_ID"] = cfg.wh_id
     d["CLIENT_CODE"] = cfg.client_code
-    d["DISPLAY_ORDER_NUMBER"] = pick["OBD"].values
+    d["DISPLAY_ORDER_NUMBER"] = [str(load_id_map.get(o, o)) for o in pick["OBD"].values]
     d["DISPLAY_ITEM_NUMBER"] = pick["Material"].values
-    d["QTY"] = pick["HJ Pcs Qty"].values            # pieces (validated 169/169)
-    # LINE_NUMBER : sequential within each delivery
-    line_no = []
-    counter: dict = {}
-    for obd in pick["OBD"].values:
-        counter[obd] = counter.get(obd, 0) + 1
-        line_no.append(counter[obd])
-    d["LINE_NUMBER"] = line_no
+    d["QTY"] = pick["HJ Pcs Qty"].values
+    # LINE_NUMBER : continuous 1, 2, 3, ... down the whole Detail sheet
+    d["LINE_NUMBER"] = list(range(1, len(pick) + 1))
 
     # GEN_ATTRIBUTE_VALUE1..11 from Inventory_Report (matched per item)
     attrs_series = pick["_attrs"].tolist() if "_attrs" in pick.columns else [{}] * len(pick)
