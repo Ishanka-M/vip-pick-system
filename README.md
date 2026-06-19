@@ -32,70 +32,58 @@ Output Excel දෙක download කරගන්න පුළුවන්, ඕන
 
 ## Pick logic (authoritative)
 
-For every requirement line the target pick quantity in **pieces** is:
+For every requirement line:
 
 ```
-target_pcs = Req Qty × HJ ÷ SAP
+mult        = HJ / SAP            (pieces per requirement / order unit)
+                LOOSE : SAP == HJ  -> mult = 1     -> pick = Req Qty pieces
+                SET   : SAP divides HJ -> mult = set size (e.g. 3)
+target_pcs  = Req Qty * mult
+available   = sum of Inventory_Report "Actual Qty" for that Item Number
 ```
 
-| Case | Rule | Example |
-|---|---|---|
-| Worked example | Req=2, SAP=1, HJ=2 → pick **4** | 2 × 2 ÷ 1 = 4 |
-| **LOOSE** | SAP = HJ → multiplier 1 → pick = **Req Qty** | Req 6 → 6 pcs |
-| **SET** | HJ/SAP is the set multiplier | SAP=5, HJ=15 → ×3 |
-
-**Cartons are never split.** A carton holds `Actual Qty` pieces (from the
-Inventory_Report). We pick only **whole cartons**, limited by available stock:
+We pick **whole order-units**, never exceeding available stock:
 
 ```
-pick_cartons = min(target_pcs // carton, available // carton)
-picked_pcs   = pick_cartons × carton
-variance     = target_pcs − picked_pcs    (the part we cannot pick)
+units_available = available // mult
+units_picked    = min(Req Qty, units_available)
+HJ Pcs Qty      = units_picked * mult       (pieces -> INDIA SO Detail QTY)
+HJ Box Qty      = units_picked
+Pcs/Box         = mult
+Short Variance  = target_pcs - HJ Pcs Qty   (only if stock is short)
 ```
 
-`HJ Box Qty = pick_cartons`, `HJ Pcs Qty = picked_pcs`. The picked whole-carton
-portion goes to the main VIP PICK / INDIA SO outputs.
+| Example | Req | Cat | SAP | HJ | mult | Available | Pick |
+|---|---|---|---|---|---|---|---|
+| LOOSE | 4 | LOOSE | 1 | 1 | 1 | 4 | **4** |
+| SET   | 2 | SET | 1 | 3 | 3 | 186 | **6** (2×3) |
+| SET   | 2 | SET | 1 | 2 | 2 | 4 | **4** (2×2) |
+| LOOSE | 2 | LOOSE | 1 | 1 | 1 | 28 | **2** |
+
+The match is done by **Requirement Material -> Inventory Item Number**, summing
+that item's Actual Qty across all pallets. **Nothing is ever picked beyond the
+sum of Actual Qty** (whole order-units only).
 
 ### Cannot-Pick report (separate)
-Any line with `variance > 0` is **also** listed in the **Cannot Pick** report
-(a sheet in VIP PICK, a tab in the app, and a Google Sheet worksheet), showing
-**Picked Pcs** and **Variance** so you can see how much was picked and how much
-couldn't be:
+A line is reported in **Cannot Pick** (a sheet in VIP PICK, a tab in the app,
+and a Google Sheet worksheet) when:
 
-- **Carton split — partial pick** — e.g. Req 23, carton 2 → pick **22** (11
-  cartons), **variance 1**.
-- **Insufficient stock** — `target_pcs` exceeds available inventory; pick the
-  whole cartons that fit, variance = the shortfall.
+- **Insufficient stock** — `target_pcs` exceeds available; the whole units that
+  fit are still picked, and the short part is shown as **Short Variance** with
+  **Picked Pcs**.
 - **Missing SKU / inventory data** — material not in SKU_MASTER and/or inventory.
+  (The app also pre-checks the Requirement and asks you to add missing materials
+  to SKU_MASTER before generating.)
 
-### LOAD ID uniqueness
-LOAD IDs (= Delivery No) must be globally unique. A **LOAD_ID Registry**
-worksheet in the Google Sheet records every LOAD ID ever used; if a new run
-produces one that already exists, a suffix is appended — `-A`, `-B`, … `-Z`,
-`-AA` — so it never duplicates.
+### INDIA SO attributes
+`GEN_ATTRIBUTE_VALUE1..11` in the OutBound Detail are filled from the
+Inventory_Report, matched per item:
+Color, Size, Style, Supplier, Plant, Client So, Client So Line, Po Cust Dec,
+Customer Ref Number, Item Id, Invoice Number1.
 
-### SKU_MASTER in Google Sheet (CRUD)
-SKU_MASTER lives in a Google Sheet worksheet. The app's **🗂️ SKU_MASTER** tab
-loads it into an editable grid where rows can be **added, edited, and deleted**.
-Two save modes:
-- **➕ Merge** — upsert by Material code: existing codes are updated, new codes
-  added, and other existing rows are **kept (never deleted)**. Use this when
-  uploading a partial/corrected SKU_MASTER.
-- **💾 Replace** — overwrite the whole worksheet with the current grid.
-
-Duplicate material codes are reconciled as Category = first, SAP = max, HJ = max.
-
-### Monthly history
-Every generated pick is appended to a monthly worksheet named
-`History YYYY-MM` (date-stamped, with the deduped LOAD ID per line). The app's
-**📅 History** tab lists the months and displays any month's data. A **Run Log**
-worksheet records one summary row per run.
-
-### CBM note
-The reference VIP_PICK total CBM (125.64) is **not reproducible** from the
-supplied inventory snapshot (the engine computes Σ(boxes × Cbm) from the given
-`Cbm` column). CBM is therefore computed transparently and **Per Minute CBM**
-(default `1/3 ≈ 0.333333`) is an **editable** sidebar assumption.
+### HighJump-compatible empty cells
+Blank cells in the INDIA SO file are written as **truly empty** cells (not empty
+strings), so HighJump validations such as `cartonLabel` (000-999) accept them.
 
 ## Project layout
 

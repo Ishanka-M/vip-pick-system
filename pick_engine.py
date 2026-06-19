@@ -49,8 +49,7 @@ MASTER_CONST = {
 }
 DETAIL_CONST = {
     "PROCESSING_CODE": "NEW", "WH_ID": "LPGL", "CLIENT_CODE": "INM0VIP",
-    "ORDER_UOM": "PCS", "GEN_ATTRIBUTE_VALUE1": "TBC",
-    "GEN_ATTRIBUTE_VALUE5": "TBC", "GEN_ATTRIBUTE_VALUE9": "TBC",
+    "ORDER_UOM": "PCS",
 }
 
 
@@ -139,11 +138,22 @@ def build_inventory_lookup(df: pd.DataFrame) -> dict:
     if not (c_item and c_qty):
         raise ValueError("Inventory_Report එකේ Item Number / Actual Qty columns හොයාගන්න බැරි වුණා.")
 
-    work = pd.DataFrame({
+    # GEN_ATTRIBUTE_VALUE{n} -> Inventory Report column (matched per item)
+    attr_map = {
+        1: "Color", 2: "Size", 3: "Style", 4: "Supplier", 5: "Plant",
+        6: "Client So", 7: "Client So Line", 8: "Po Cust Dec",
+        9: "Customer Ref Number", 10: "Item Id", 11: "Invoice Number1",
+    }
+    attr_cols = {n: _find_col(df, name) for n, name in attr_map.items()}
+
+    base = {
         "Item": df[c_item].astype(str).str.strip(),
         "Qty": pd.to_numeric(df[c_qty], errors="coerce"),
         "Cbm": (pd.to_numeric(df[c_cbm], errors="coerce") if c_cbm else 0.0),
-    })
+    }
+    for n, col in attr_cols.items():
+        base[f"attr{n}"] = (df[col].astype(str).str.strip() if col else "")
+    work = pd.DataFrame(base)
 
     def carton_mode(s: pd.Series):
         s = s[s > 0]
@@ -151,13 +161,22 @@ def build_inventory_lookup(df: pd.DataFrame) -> dict:
             return None
         return int(s.mode().iloc[0])
 
+    def first_value(s: pd.Series):
+        for v in s:
+            sv = str(v).strip()
+            if sv and sv.lower() not in ("nan", "none"):
+                return sv
+        return ""
+
     out = {}
     for item, sub in work.groupby("Item"):
-        out[item] = {
+        rec = {
             "boxsize": carton_mode(sub["Qty"]),
             "avail": int(sub["Qty"].sum(skipna=True)),
             "cbm": float(sub["Cbm"].dropna().iloc[0]) if sub["Cbm"].notna().any() else 0.0,
         }
+        rec["attrs"] = {n: first_value(sub[f"attr{n}"]) for n in attr_map}
+        out[item] = rec
     return out
 
 
@@ -179,26 +198,23 @@ def compute_pick(requirement: pd.DataFrame, sku: dict, inv: dict,
                  cfg: EngineConfig) -> pd.DataFrame:
     """Requirement -> enriched pick rows (one per requirement line).
 
-    Pick formula (authoritative):
-        target_pcs = Req Qty * HJ / SAP
-          - LOOSE :  SAP == HJ  ->  target = Req Qty
-          - SET   :  HJ/SAP is the set multiplier (e.g. 3)
+    Pick logic (authoritative):
+        mult        = HJ / SAP          (pieces per requirement/order unit)
+                       - LOOSE : SAP == HJ -> mult = 1  -> pick = Req Qty
+                       - SET   : SAP divides HJ -> mult = set size (e.g. 3)
+        target_pcs  = Req Qty * mult
+        available   = sum of Inventory Actual Qty for that Item Number
 
-    A carton (inventory Actual Qty = `boxsize`) can never be split, so we pick
-    only WHOLE cartons, limited by available stock:
-        pick_cartons = min(target // carton, available // carton)
-        picked_pcs   = pick_cartons * carton
-        variance     = target - picked_pcs   (the part we cannot pick)
-
-    The picked whole-carton portion goes to the main outputs (VIP PICK / INDIA
-    SO). Any line with variance > 0 (carton remainder or short stock) is ALSO
-    listed in the Cannot Pick report with picked qty + variance.
+    We pick whole order-units, never exceeding available stock:
+        units_avail = available // mult
+        units_pick  = min(Req Qty, units_avail)
+        picked_pcs  = units_pick * mult
+        variance    = target_pcs - picked_pcs   (short part, if any)
 
     `_status`:
-        OK            -> picked == target (no variance)
-        CARTON_SPLIT  -> variance from a non-divisible carton remainder
-        SHORT_STOCK   -> variance because target exceeds available stock
-        NO_DATA       -> material missing from SKU master and/or inventory
+        OK           -> picked_pcs == target_pcs (full pick)
+        SHORT_STOCK  -> not enough Actual Qty to cover the requirement
+        NO_DATA      -> material missing from SKU master and/or inventory
     """
     rows = []
     for _, r in requirement.iterrows():
@@ -214,67 +230,71 @@ def compute_pick(requirement: pd.DataFrame, sku: dict, inv: dict,
         cbm = float(i.get("cbm") or 0.0)
         avail = int(i.get("avail") or 0)
 
-        target_exact = (qty * hj / sap) if sap else 0.0
-        target = int(round(target_exact))
-        unit_split = bool(sap) and abs(target_exact - target) > 1e-9
+        in_sku = mat in sku and sap > 0 and hj > 0
+        in_inv = mat in inv
+        no_data = (not in_sku) or (not in_inv)
 
-        box = int(boxsize) if boxsize else 0
-        no_data = (mat not in sku) or (not box)
+        mult = (hj / sap) if sap else 0          # pieces per order unit
+        mult_disp = int(mult) if float(mult).is_integer() else round(mult, 4)
+        target_pcs = int(round(qty * mult))
 
         if no_data:
             status = "NO_DATA"
-            pick_cartons = 0
+            units_pick = 0
+            picked_pcs = 0
         else:
-            desired_cartons = target // box
-            stock_cartons = avail // box
-            pick_cartons = min(desired_cartons, stock_cartons)
+            units_avail = int(avail // mult) if mult else 0
+            units_pick = min(qty, units_avail)
+            picked_pcs = int(round(units_pick * mult))
 
-        picked_pcs = pick_cartons * box if box else 0
-        variance = target - picked_pcs
+        variance = target_pcs - picked_pcs
 
         issues = []
         if mat not in sku:
             issues.append("Not in SKU master")
-        if not box:
+        elif sap <= 0 or hj <= 0:
+            issues.append("SKU HJ/SAP missing or zero")
+        if not in_inv:
             issues.append("Not in inventory")
-        if unit_split:
-            issues.append(f"Req*HJ not divisible by SAP({sap})")
 
         if no_data:
             status = "NO_DATA"
         elif variance <= 0:
             status = "OK"
-        elif target > avail:
-            status = "SHORT_STOCK"
-            issues.append(f"Req {target} > stock {avail}; picked {picked_pcs}, variance {variance}")
         else:
-            status = "CARTON_SPLIT"
-            issues.append(f"{target} pcs not whole cartons of {box}; picked {picked_pcs}, variance {variance}")
+            status = "SHORT_STOCK"
+            issues.append(f"Req {target_pcs} pcs > stock {avail}; picked {picked_pcs}, short {variance}")
 
         remark = "" if status == "OK" else (
-            f"Variance {variance}" if status in ("CARTON_SPLIT", "SHORT_STOCK") else "; ".join(issues))
+            f"Short {variance}" if status == "SHORT_STOCK" else "; ".join(issues))
+
+        # CBM: per-piece from the inventory box, times pieces picked
+        cbm_per_piece = (cbm / boxsize) if (cbm and boxsize) else 0.0
+        line_cbm = round(picked_pcs * cbm_per_piece, 4)
 
         rows.append({
             "Material": mat,
             "Material des": r.get("Description", ""),
             "Qty": qty,
             "OBD": r["DeliveryNo"],
-            "HJ Box Qty": int(pick_cartons),
+            "HJ Box Qty": int(units_pick),
             "HJ Pcs Qty": int(picked_pcs),
-            "Pcs/Box": box,
+            "Pcs/Box": mult_disp,
             "REMARKS": remark,
             "Date": cfg.pick_date,
             "_status": status,
             "_category": category,
             "_sap": sap,
             "_hj": hj,
-            "_target": int(target),
+            "_mult": mult_disp,
+            "_target": int(target_pcs),
             "_picked": int(picked_pcs),
             "_variance": int(variance),
             "_avail": avail,
             "_issue": "; ".join(issues),
             "_cbm_per_box": cbm,
-            "_line_cbm": round(pick_cartons * cbm, 4),
+            "_line_cbm": line_cbm,
+            "_attrs": i.get("attrs", {}),
         })
     return pd.DataFrame(rows)
 
@@ -282,16 +302,14 @@ def compute_pick(requirement: pd.DataFrame, sku: dict, inv: dict,
 def split_reports(pick: pd.DataFrame):
     """Split into (pickable, exceptions).
 
-    pickable   -> lines where we pick at least one whole carton (HJ Pcs Qty > 0),
-                  including partial-carton lines (picked portion only).
-    exceptions -> lines with variance > 0 (carton remainder / short stock) or
-                  no data, showing picked qty + variance.
+    pickable   -> lines where we pick at least one unit (HJ Pcs Qty > 0).
+    exceptions -> lines with variance > 0 (insufficient stock) or no data,
+                  showing picked qty + short variance.
     """
     ok = pick[pick["HJ Pcs Qty"] > 0].reset_index(drop=True)
     bad = pick[(pick["_variance"] > 0) | (pick["_status"] == "NO_DATA")].reset_index(drop=True)
 
     issue_label = {
-        "CARTON_SPLIT": "Carton split — partial pick",
         "SHORT_STOCK": "Insufficient stock (Req > Inventory)",
         "NO_DATA": "Missing SKU / inventory data",
     }
@@ -304,10 +322,10 @@ def split_reports(pick: pd.DataFrame):
             "Req Qty": bad["Qty"],
             "SAP": bad["_sap"],
             "HJ": bad["_hj"],
+            "Pcs/Unit (HJ/SAP)": bad["_mult"],
             "Target Pcs": bad["_target"],
-            "Pcs/Carton": bad["Pcs/Box"],
             "Picked Pcs": bad["_picked"],
-            "Variance": bad["_variance"],
+            "Short Variance": bad["_variance"],
             "Available": bad["_avail"],
             "Issue Type": bad["_status"].map(issue_label).fillna(bad["_status"]),
             "Detail": bad["_issue"],
@@ -315,8 +333,8 @@ def split_reports(pick: pd.DataFrame):
     else:
         exc = pd.DataFrame(columns=[
             "Material", "Material des", "OBD", "Category", "Req Qty", "SAP", "HJ",
-            "Target Pcs", "Pcs/Carton", "Picked Pcs", "Variance", "Available",
-            "Issue Type", "Detail"])
+            "Pcs/Unit (HJ/SAP)", "Target Pcs", "Picked Pcs", "Short Variance",
+            "Available", "Issue Type", "Detail"])
     return ok, exc
 
 
@@ -419,6 +437,12 @@ def build_india_so(pick: pd.DataFrame, cfg: EngineConfig,
         counter[obd] = counter.get(obd, 0) + 1
         line_no.append(counter[obd])
     d["LINE_NUMBER"] = line_no
+
+    # GEN_ATTRIBUTE_VALUE1..11 from Inventory_Report (matched per item)
+    attrs_series = pick["_attrs"].tolist() if "_attrs" in pick.columns else [{}] * len(pick)
+    for n in range(1, 12):
+        col = f"GEN_ATTRIBUTE_VALUE{n}"
+        d[col] = [(a or {}).get(n, "") for a in attrs_series]
 
     return m, d
 
