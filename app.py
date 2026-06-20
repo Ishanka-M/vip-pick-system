@@ -28,87 +28,117 @@ _THEME_CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap');
 
 :root{
-  --ink:#122740; --slate:#3D5573; --mist:#F5F7FA; --line:#E4E9F0;
-  --accent:#C8102E; --accent-soft:#FDECEE; --ok:#1B7F5E; --warn:#B9770A;
+  --bg:#070F1A; --bg2:#0B1626; --panel:#0F1F33; --panel2:#13253B;
+  --line:#22374F; --text:#EAF1F9; --muted:#9DB0C9; --faint:#7C90AB;
+  --accent:#FF365B; --accent-soft:rgba(255,54,91,.14);
+  --ok:#34D399; --warn:#F2B33D;
 }
 
 /* base */
 html, body, [class*="css"]{ font-family:'Inter',system-ui,sans-serif; }
-.stApp{ background:
-   radial-gradient(1200px 500px at 100% -10%, #eef2f8 0%, rgba(238,242,248,0) 60%),
-   var(--mist); color:var(--ink); }
+.stApp{
+  background:
+   radial-gradient(1100px 480px at 100% -8%, #11223a 0%, rgba(17,34,58,0) 62%),
+   radial-gradient(900px 420px at -5% 0%, #0c1a2c 0%, rgba(12,26,44,0) 55%),
+   var(--bg);
+  color:var(--text);
+}
 .block-container{ padding-top:1.1rem; max-width:1280px; }
 
+/* all common text -> light */
+.stApp, .stMarkdown, p, span, label, li, .stCaption,
+[data-testid="stWidgetLabel"] label, [data-testid="stWidgetLabel"] p{ color:var(--text); }
+small, .stCaption, [data-testid="stCaptionContainer"]{ color:var(--muted) !important; }
+
 /* headings */
-h1,h2,h3,h4{ font-family:'Space Grotesk','Inter',sans-serif; color:var(--ink);
+h1,h2,h3,h4{ font-family:'Space Grotesk','Inter',sans-serif; color:var(--text);
   letter-spacing:-.01em; font-weight:700; }
 h2{ font-size:1.25rem; } h3{ font-size:1.05rem; }
 
 /* command-bar header */
 .appbar{ display:flex; align-items:center; justify-content:space-between;
-  gap:1rem; padding:18px 22px; border-radius:16px; margin-bottom:6px;
-  background:linear-gradient(120deg,#0E2138 0%,#15304F 55%,#1B3A60 100%);
-  box-shadow:0 10px 30px -12px rgba(18,39,64,.45); color:#fff; }
+  gap:1rem; padding:18px 22px; border-radius:16px; margin-bottom:8px;
+  background:linear-gradient(120deg,#0A1730 0%,#10243E 55%,#15304F 100%);
+  border:1px solid #1C3450;
+  box-shadow:0 16px 40px -18px rgba(0,0,0,.7); color:#fff; }
 .appbar .brand{ display:flex; align-items:center; gap:14px; }
 .appbar .mark{ width:42px; height:42px; border-radius:11px; display:grid;
   place-items:center; background:var(--accent); color:#fff; font-size:20px;
-  box-shadow:0 6px 16px -6px rgba(200,16,46,.7); }
+  box-shadow:0 8px 20px -7px rgba(255,54,91,.65); }
 .appbar .title{ font-family:'Space Grotesk',sans-serif; font-weight:700;
   font-size:1.32rem; line-height:1.1; color:#fff; letter-spacing:-.01em; }
-.appbar .sub{ font-size:.78rem; color:#A8BBD2; margin-top:3px;
+.appbar .sub{ font-size:.78rem; color:#9FB4D0; margin-top:3px;
   font-family:'IBM Plex Mono',monospace; letter-spacing:.02em; }
 .appbar .pill{ font-family:'IBM Plex Mono',monospace; font-size:.72rem;
   font-weight:600; padding:7px 13px; border-radius:999px;
-  border:1px solid rgba(255,255,255,.16); background:rgba(255,255,255,.07);
+  border:1px solid rgba(255,255,255,.14); background:rgba(255,255,255,.06);
   color:#dbe6f3; display:inline-flex; align-items:center; gap:7px; white-space:nowrap;}
 .appbar .dot{ width:8px; height:8px; border-radius:50%; }
 .dot-on{ background:#43D39E; box-shadow:0 0 0 3px rgba(67,211,158,.22);}
-.dot-off{ background:#E8B23A; box-shadow:0 0 0 3px rgba(232,178,58,.20);}
+.dot-off{ background:#F2B33D; box-shadow:0 0 0 3px rgba(242,179,61,.20);}
 
-/* tabs as a segmented control */
+/* tabs */
 [data-testid="stTabs"] [role="tablist"]{ gap:6px; border-bottom:1px solid var(--line);}
 [data-testid="stTabs"] [role="tab"]{ font-family:'Space Grotesk',sans-serif;
-  font-weight:600; font-size:.92rem; color:var(--slate); padding:8px 16px;
+  font-weight:600; font-size:.92rem; color:var(--muted); padding:8px 16px;
   border-radius:9px 9px 0 0; }
-[data-testid="stTabs"] [role="tab"][aria-selected="true"]{ color:var(--accent);
-  background:var(--accent-soft); }
+[data-testid="stTabs"] [role="tab"] p{ color:var(--muted); font-weight:600; }
+[data-testid="stTabs"] [role="tab"][aria-selected="true"],
+[data-testid="stTabs"] [role="tab"][aria-selected="true"] p{ color:#fff; }
+[data-testid="stTabs"] [role="tab"][aria-selected="true"]{ background:var(--accent-soft); }
 [data-testid="stTabs"] [role="tab"][aria-selected="true"]::after{ content:"";
-  display:block; height:2px; background:var(--accent); margin-top:6px;
-  border-radius:2px; }
+  display:block; height:2px; background:var(--accent); margin-top:6px; border-radius:2px; }
 
 /* metric cards */
-[data-testid="stMetric"]{ background:#fff; border:1px solid var(--line);
-  border-radius:14px; padding:14px 16px; box-shadow:0 1px 2px rgba(18,39,64,.04);}
-[data-testid="stMetricLabel"]{ color:var(--slate); font-weight:600;
-  font-size:.74rem; text-transform:uppercase; letter-spacing:.06em; }
+[data-testid="stMetric"]{ background:var(--panel); border:1px solid var(--line);
+  border-radius:14px; padding:14px 16px; box-shadow:0 2px 10px rgba(0,0,0,.25);}
+[data-testid="stMetricLabel"], [data-testid="stMetricLabel"] p{ color:var(--muted);
+  font-weight:600; font-size:.74rem; text-transform:uppercase; letter-spacing:.06em; }
 [data-testid="stMetricValue"]{ font-family:'IBM Plex Mono',monospace;
-  color:var(--ink); font-weight:600; }
+  color:var(--text); font-weight:600; }
 
 /* buttons */
 .stButton>button, .stDownloadButton>button{ font-family:'Space Grotesk',sans-serif;
   font-weight:600; border-radius:10px; border:1px solid var(--line);
-  padding:.5rem 1rem; transition:transform .04s ease, box-shadow .15s ease; }
+  background:var(--panel2); color:var(--text);
+  padding:.5rem 1rem; transition:transform .04s ease, box-shadow .15s ease, background .15s; }
 .stButton>button:hover, .stDownloadButton>button:hover{ transform:translateY(-1px);
-  box-shadow:0 6px 16px -8px rgba(18,39,64,.4); }
+  border-color:#33506f; box-shadow:0 8px 20px -10px rgba(0,0,0,.7); }
 .stButton>button[kind="primary"], .stDownloadButton>button{
   background:var(--accent); border-color:var(--accent); color:#fff; }
-.stButton>button[kind="primary"]:hover, .stDownloadButton>button:hover{
-  background:#a50e26; }
+.stButton>button[kind="primary"]:hover, .stDownloadButton>button:hover{ background:#e62a4d; }
 
 /* sidebar */
-[data-testid="stSidebar"]{ background:#fff; border-right:1px solid var(--line); }
-[data-testid="stSidebar"] h2{ font-size:1.05rem; }
-[data-testid="stSidebar"] .stMarkdown, [data-testid="stSidebar"] label{ color:var(--slate);}
+[data-testid="stSidebar"]{ background:var(--bg2); border-right:1px solid var(--line); }
+[data-testid="stSidebar"] *{ color:var(--text); }
+[data-testid="stSidebar"] h1,[data-testid="stSidebar"] h2,[data-testid="stSidebar"] h3{ color:#fff;}
+[data-testid="stSidebar"] label, [data-testid="stSidebar"] .stCaption{ color:var(--muted) !important;}
 
-/* dataframes / inputs */
+/* inputs */
+.stTextInput input, .stNumberInput input, .stDateInput input, .stTextArea textarea{
+  background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:9px;}
+.stTextInput input::placeholder{ color:var(--faint); }
+[data-baseweb="select"]>div{ background:var(--panel); border-color:var(--line); color:var(--text);}
+
+/* file uploader */
+[data-testid="stFileUploaderDropzone"]{ background:var(--panel);
+  border:1px dashed #2C466A; border-radius:12px; }
+[data-testid="stFileUploaderDropzone"] *{ color:var(--muted); }
+
+/* expanders / containers */
+[data-testid="stExpander"]{ border:1px solid var(--line); border-radius:12px;
+  background:var(--panel); }
+[data-testid="stExpander"] summary{ color:var(--text); }
+div[data-testid="stVerticalBlockBorderWrapper"]{ border-radius:14px; }
+
+/* dataframes */
 [data-testid="stDataFrame"]{ border:1px solid var(--line); border-radius:12px; }
-.stTextInput input, .stNumberInput input, .stDateInput input{ border-radius:9px; }
 
-/* alerts a touch softer */
+/* alerts */
 [data-testid="stAlert"]{ border-radius:11px; }
 
-/* caption / footer */
-.footnote{ color:var(--slate); font-size:.78rem; font-family:'IBM Plex Mono',monospace;
+/* footnote */
+.footnote{ color:var(--faint); font-size:.78rem; font-family:'IBM Plex Mono',monospace;
   border-top:1px solid var(--line); padding-top:12px; margin-top:18px; }
 </style>
 """
