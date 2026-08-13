@@ -77,7 +77,13 @@ _CSS = f"""
 /* type only — the page background stays Streamlit's */
 html, body, .stMarkdown, p, li, label,
 [data-testid="stWidgetLabel"] p{{ font-family:var(--body); }}
-.block-container{{ padding-top:.9rem; padding-bottom:3rem; max-width:1440px; }}
+/* Streamlit's header is FIXED at 3.75rem and content scrolls under it. Its own
+   default top padding is 6rem; anything below ~3.75rem clips the app bar. */
+.block-container, [data-testid="stMainBlockContainer"]{{
+  padding-top:4.6rem; padding-bottom:3rem; max-width:1440px; }}
+@media (max-width:640px){{
+  .block-container, [data-testid="stMainBlockContainer"]{{ padding-top:4.2rem; }}
+}}
 h1,h2,h3,h4,h5{{ font-family:var(--display); letter-spacing:.01em; font-weight:700; }}
 h2{{ font-size:1.28rem; }} h3{{ font-size:1.08rem; }}
 code, kbd{{ font-family:var(--mono); font-size:.86em; color:inherit;
