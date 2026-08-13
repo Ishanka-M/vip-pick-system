@@ -75,7 +75,7 @@ _CSS = f"""
 }}
 
 /* type only — the page background stays Streamlit's */
-html, body, [class*="css"], .stMarkdown, p, li, label,
+html, body, .stMarkdown, p, li, label,
 [data-testid="stWidgetLabel"] p{{ font-family:var(--body); }}
 .block-container{{ padding-top:.9rem; padding-bottom:3rem; max-width:1440px; }}
 h1,h2,h3,h4,h5{{ font-family:var(--display); letter-spacing:.01em; font-weight:700; }}
@@ -238,7 +238,8 @@ code, kbd{{ font-family:var(--mono); font-size:.86em; color:inherit;
 .stTextInput input:focus, .stTextArea textarea:focus{{ border-color:var(--info);
   box-shadow:0 0 0 3px color-mix(in srgb, {INFO} 22%, transparent); }}
 [data-baseweb="select"]>div{{ border-radius:7px; border-color:var(--line-2); }}
-[data-baseweb="tag"] span{{ font-family:var(--mono); font-size:.76rem; }}
+[data-baseweb="tag"] span:not([data-testid]):not([translate="no"]){{
+  font-family:var(--mono); font-size:.76rem; }}
 
 [data-testid="stFileUploaderDropzone"]{{ background:var(--fill-1);
   border:1.5px dashed var(--line-2); border-radius:9px; }}
@@ -248,7 +249,8 @@ code, kbd{{ font-family:var(--mono); font-size:.86em; color:inherit;
   background:var(--fill-1); }}
 [data-testid="stExpander"] summary{{ font-family:var(--display); font-weight:600;
   letter-spacing:.03em; color:inherit; }}
-[data-testid="stExpander"] summary p, [data-testid="stExpander"] summary span{{
+[data-testid="stExpander"] summary p,
+[data-testid="stExpander"] summary [data-testid="stMarkdownContainer"]{{
   font-family:var(--display); font-weight:600; color:inherit; }}
 [data-testid="stExpander"] summary svg{{ fill:currentColor; }}
 
@@ -263,6 +265,20 @@ hr{{ border-color:var(--line); margin:1.1rem 0; }}
 [data-testid="stProgress"] div[role="progressbar"]>div{{ background:var(--accent); }}
 .footnote{{ font-family:var(--mono); font-size:.72rem; color:var(--t-mute);
   border-top:1px solid var(--line); padding-top:11px; margin-top:24px; }}
+
+/* Material icons are LIGATURES — the element literally contains the text
+   "arrow_right". Any font-family / letter-spacing / text-transform change stops
+   the ligature forming and the raw word prints over the label. Keep them out. */
+[data-testid="stIconMaterial"], [data-testid^="stExpanderIcon"],
+span[translate="no"], .material-icons, .material-symbols-rounded,
+.material-symbols-outlined{{
+  font-family:'Material Symbols Rounded','Material Symbols Outlined',
+    'Material Icons' !important;
+  font-weight:400 !important; font-style:normal !important;
+  letter-spacing:normal !important; text-transform:none !important;
+  font-variant:normal !important; white-space:nowrap !important;
+  font-feature-settings:'liga' !important;
+  -webkit-font-feature-settings:'liga' !important; }}
 </style>
 """
 

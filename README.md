@@ -419,3 +419,29 @@ WCAG AA small text (4.50) pass ✓
 
 Chart — email සහ PDF වලට යන්නේ හැම වෙලේම white version එක (mail client සහ
 print), screen එකේ preview එකට විතරයි dark version එක.
+
+### Material icons — ligature වලට අත තියන්න එපා
+
+Streamlit එකේ expander chevron එක වගේ icon ටික **ligature** — element එකේ ඇත්තටම
+තියෙන්නේ `arrow_right` කියන **text** එක, `Material Symbols Rounded` font එකෙන් ඒක
+arrow එකක් වෙනවා.
+
+ඒ නිසා `summary span`, `button span` වගේ එකකට `font-family` · `letter-spacing` ·
+`text-transform` දැම්මොත් ligature එක හැදෙන්නේ නෑ — label එක උඩින්
+`arrow_right` කියලා raw text එකක් print වෙනවා.
+
+`ui.py` අගට guard එකක් තියෙනවා:
+
+```css
+[data-testid="stIconMaterial"], [data-testid^="stExpanderIcon"],
+span[translate="no"], .material-icons, .material-symbols-rounded {
+  font-family:'Material Symbols Rounded' !important;
+  letter-spacing:normal !important; text-transform:none !important;
+  font-feature-settings:'liga' !important;
+}
+```
+
+`text-transform` සහ `letter-spacing` **inherit** වෙන නිසා, uppercase කරපු button
+එකක් ඇතුලේ icon එකක් තිබ්බත් මේකෙන් රැකෙනවා. අලුත් CSS ලියද්දී **bare `span`
+selector වලට font එකක් දාන්න එපා** — element එකට direct කරන්න
+(`summary p`, `[data-testid="stMarkdownContainer"]` වගේ).
