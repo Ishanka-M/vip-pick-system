@@ -623,8 +623,8 @@ def _verify_doc(doc, doc_alloc: list[dict], doc_detail: list[dict]) -> tuple[lis
         if not ok:
             bad.append(f"L{ln.line_no} {ln.item_code}: doc {ln.qty:g} ≠ picked {p:g}")
         rows.append({
-            "DOC_NUMBER": doc.doc_number, "DOC_TYPE": doc.doc_type, "LINE": ln.line_no,
-            "ITEM_CODE": ln.item_code,
+            "DOC_NUMBER": doc.doc_number, "DOC_TYPE": doc.doc_type,
+            "LINE": str(ln.line_no), "ITEM_CODE": ln.item_code,
             "ITEM_NUMBER": ", ".join(sorted(items.get(ln.line_no, set()))),
             "DOC_QTY": float(ln.qty), "PICKED_QTY": p,
             "WMS_QTY": p, "DIFF": diff, "STATUS": "✅ OK" if ok else "❌ MISMATCH",

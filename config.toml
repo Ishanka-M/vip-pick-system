@@ -1,0 +1,14 @@
+# Widget internals (dropdown popovers, data editor, date picker) follow this,
+# so the theme has to be set here — CSS alone cannot reach them.
+[theme]
+base                    = "light"
+primaryColor            = "#F0A81C"
+backgroundColor         = "#F4F6F8"
+secondaryBackgroundColor = "#FFFFFF"
+textColor               = "#0B1A2B"
+
+[server]
+maxUploadSize = 200
+
+[browser]
+gatherUsageStats = false

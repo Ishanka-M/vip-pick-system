@@ -5,6 +5,8 @@ Google Sheet ledger + **`OutBound MASTER` / `OutBound Detail`** Excel (Körber O
 
 ```
 app.py          Streamlit UI (7 tabs)
+ui.py           design system — tokens, CSS, topbar / step rail / cards / stamps
+.streamlit/     theme config (widget internals follow this, not CSS)
 doc_parser.py   Donaldson Invoice + Delivery Challan PDF parser
 pick_engine.py  matching · allocation · qty verify · WMS output · Excel · search
 pick_pdf.py     Pick sheet + Shortage PDF (QR) · charts · email (.eml / mailto)
@@ -20,6 +22,9 @@ gsheet.py       Google Sheet DB + API manager (retry · cache · lock · load de
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+`.streamlit/config.toml` එකත් repo එකේ තියෙන්න ඕන — dropdown · date picker · data editor
+වගේ widget වල ඇතුලත theme එක ඒකෙන් තමයි එන්නේ, CSS එකෙන් ඒවට ළඟා වෙන්න බෑ.
 
 `.streamlit/secrets.toml`:
 
@@ -358,3 +363,28 @@ Outlook / Gmail / Apple Mail වල පේනවා):
 
 Chart එක `.eml` එකේ විතරයි (mailto: වලට image යවන්න බෑ).
 Pick email එකේ chart එක result screen එකේ preview කරන්නත් පුළුවන්.
+
+---
+
+## 18. UI
+
+**Direction — warehouse operations console, not a dashboard.**
+Ink on light paper (data-heavy screens under warehouse lighting), hi-vis amber for
+the one action that matters on each screen, **red = STOP only** (blocked / short),
+කිසිම විටක decoration එකක් විදිහට නෙවෙයි.
+
+| | |
+|---|---|
+| **Type** | *Barlow Condensed* — labels, rack-signage voice · *Barlow* — reading · *IBM Plex Mono* — **හැම code එකක්ම** (LOAD ID · pallet · location · qty). Code එකක් character by character කියවන නිසා ඒවා හැම වෙලේම mono |
+| **Signature** | **Hazard rule** — warehouse floor එකේ striped tape එක. Top bar එක යටත්, block වුණ document card වල වම් පැත්තෙත් විතරයි |
+| **Numbers** | `01 → 05` numbering තියෙන්නේ pick එක ඇත්තටම sequence එකක් නිසා — plant confirm නොකර generate කරන්න බෑ |
+
+**UX**
+
+* **Step rail** — Documents → Inventory → Plant → Pick, හැම එකකම live state
+  (done ✓ / now / todo) සහ value එක. දැන් කොහෙද ඉන්නේ කියලා එක බැල්මට
+* **Top bar chips** — DB · plant · docs · user. Save වෙන්නේ කොහෙද කියලා හැම වෙලේම පේනවා
+* **Document stamps** — `ready` · `duplicate` · `blocked` + හේතුව card එකේම
+* **Empty states** — හිස් screen එකක් වෙනුවට "ඊළඟට මොකද කරන්නේ" කියන එක
+* **Copy** — button එකේ තියෙන නම action එකට සමානයි (`Confirm plant` → toast `Plant confirmed`)
+* Focus ring · disabled state · toast · `st.status` progress · mobile දක්වා responsive
