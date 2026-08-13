@@ -137,6 +137,17 @@ def gs_conf() -> dict:
         return {}
 
 
+def _reset_pw() -> str:
+    """Password එක secrets එකේ තිබ්බොත් ඒක — නැත්නම් default."""
+    try:
+        return str(st.secrets.get("app", {}).get("reset_password", "") or "Isha@1996")
+    except Exception:
+        return "Isha@1996"
+
+
+RESET_PASSWORD = _reset_pw()
+
+
 # --------------------------------------------------------------------------- #
 # Sidebar
 # --------------------------------------------------------------------------- #
@@ -169,9 +180,10 @@ with st.sidebar:
         exact_first = st.checkbox("Exact item number එකට මුල් තැන", value=True,
                                   help="Base ID එක ගැලපුනත්, document එකේ තියෙන "
                                        "full item number එකට මුලින් priority.")
-        use_ledger = st.checkbox("කලින් pick කරපු ප්‍රමාණය අඩු කරන්න (ledger)", value=True,
-                                 help="Google Sheet ledger එකේ තියෙන commit වුණු qty, "
-                                      "inventory එකෙන් අඩු කරලා balance එකෙන් pick කරනවා.")
+        use_ledger = st.checkbox("Pallet ledger balance logic", value=True,
+                                 help="Pallet එකේ Actual Qty == ledger QTY_BEFORE නම් → "
+                                      "QTY_BALANCE එකෙන් pick. වෙනස් නම් → Inventory "
+                                      "Actual Qty එක අලුත් QTY_BEFORE එක විදිහට අරගෙන pick.")
         blank_fill = st.text_input("හිස් attribute වලට දාන value", value="TBC")
         fill_item_col = st.checkbox("ITEM_NUMBER column එකත් පුරවන්න", value=False)
         merge_lines = st.checkbox("එකම item එකේ lines merge කරන්න", value=False)
@@ -260,18 +272,67 @@ with st.sidebar:
                 st.success(f"Delete වුණා ✅ {r}")
             except Exception as ex:
                 st.error(f"Undo error: {ex}")
-        scope = st.multiselect("Clear කරන්නේ", ["outputs", "ledger", "registry",
-                                               "rejected", "runlog"])
-        sure = st.checkbox("මට විශ්වාසයි (back ගන්න බෑ)")
-        if st.button("🗑️ Reset") and gs_ready:
-            if not scope or not sure:
-                st.warning("Scope select කරලා confirm කරන්න.")
-            else:
-                try:
-                    import gsheet
-                    st.success(f"Reset වුණා ✅ {gsheet.reset_data(sa_info, sheet_key, scope)}")
-                except Exception as ex:
-                    st.error(f"Reset error: {ex}")
+
+        st.markdown("---")
+        st.markdown("**🔐 DB Reset**")
+        if not st.session_state.get("reset_ok"):
+            pw = st.text_input("Password", type="password", key="reset_pw")
+            if st.button("🔓 Unlock", use_container_width=True):
+                if pw == RESET_PASSWORD:
+                    st.session_state["reset_ok"] = True
+                    st.rerun()
+                else:
+                    st.error("Password වැරදියි.")
+        else:
+            st.success("🔓 Unlocked")
+            scope = st.multiselect(
+                "Clear කරන්නේ",
+                ["outputs", "ledger", "registry", "rejected", "runlog", "settings"],
+                default=["outputs", "ledger", "registry", "rejected", "runlog"],
+                format_func=lambda s: {
+                    "outputs": "OUTBOUND_MASTER + DETAIL",
+                    "ledger": "PALLET_LEDGER (pallet balance!)",
+                    "registry": "DOC_REGISTRY (duplicate gate!)",
+                    "rejected": "REJECTED_LOG",
+                    "runlog": "RUN_LOG",
+                    "settings": "APP_SETTINGS (email book)",
+                }[s],
+            )
+            sure = st.checkbox("මට විශ්වාසයි — back ගන්න බෑ", key="reset_sure")
+            r1, r2 = st.columns(2)
+            if r1.button("🗑️ Reset", use_container_width=True):
+                if not gs_ready:
+                    st.error("Google Sheet connect වෙලා නෑ.")
+                elif not scope or not sure:
+                    st.warning("Scope select කරලා confirm කරන්න.")
+                else:
+                    try:
+                        import gsheet
+                        done = gsheet.reset_data(sa_info, sheet_key, scope)
+                        for k in ("result", "bundles", "bundle_key", "zipfile", "hist"):
+                            st.session_state.pop(k, None)
+                        st.success(f"Reset වුණා ✅ {done}")
+                    except Exception as ex:
+                        st.error(f"Reset error: {ex}")
+            if r2.button("💣 FULL DB RESET", use_container_width=True, type="primary"):
+                if not gs_ready:
+                    st.error("Google Sheet connect වෙලා නෑ.")
+                elif not sure:
+                    st.warning("Confirm checkbox එක tick කරන්න.")
+                else:
+                    try:
+                        import gsheet
+                        r = gsheet.reset_all(sa_info, sheet_key, keep_settings=True)
+                        for k in ("result", "bundles", "bundle_key", "zipfile", "hist"):
+                            st.session_state.pop(k, None)
+                        st.success(f"FULL RESET ✅ {r['count']} worksheets — "
+                                   f"{', '.join(r['cleared'])}")
+                        st.caption("Email book (APP_SETTINGS) එක ඉතුරු කළා.")
+                    except Exception as ex:
+                        st.error(f"Reset error: {ex}")
+            if st.button("🔒 Lock ආපහු"):
+                st.session_state.pop("reset_ok", None)
+                st.rerun()
 
     if st.button("🔄 Session clear"):
         for k in list(st.session_state.keys()):
@@ -407,7 +468,7 @@ with tab_gen:
         cfg = E.EngineConfig(
             wh_id=wh_id, client_code=client_code, order_type=order_type,
             plants=st.session_state["plants_ok"], statuses=statuses, strategy=strategy,
-            exact_item_first=exact_first, blank_fill=blank_fill,
+            exact_item_first=exact_first, use_ledger=use_ledger, blank_fill=blank_fill,
             fill_item_number_col=fill_item_col, merge_same_item_lines=merge_lines,
             override_doc_check=override,
             pick_date=datetime.combine(pick_date, datetime.now().time()),
@@ -420,8 +481,7 @@ with tab_gen:
             if gs_ready:
                 try:
                     import gsheet
-                    if use_ledger:
-                        ledger = gsheet.read_ledger(sa_info, sheet_key)
+                    ledger = gsheet.read_ledger(sa_info, sheet_key)
                     done_docs = gsheet.read_processed_docs(sa_info, sheet_key)
                 except Exception as ex:
                     st.warning(f"Google Sheet read කරන්න බැරි වුණා ({ex}) — "
@@ -482,9 +542,9 @@ with tab_gen:
                     st.caption("Stock short lines:")
                     st.dataframe(res["shortage"], hide_index=True, use_container_width=True)
 
-        t1, t2, t3, t4, t5, t6 = st.tabs(["🧾 OutBound MASTER", "📋 OutBound Detail",
-                                          "🎯 Pallet Allocation", "📦 Pallet Balance",
-                                          "🔢 Qty Verify", "✅ Doc Summary"])
+        t1, t2, t3, t4, t7, t5, t6 = st.tabs(
+            ["🧾 OutBound MASTER", "📋 OutBound Detail", "🎯 Pallet Allocation",
+             "📦 Pallet Balance", "📊 Stock Basis", "🔢 Qty Verify", "✅ Doc Summary"])
         with t1:
             st.dataframe(res["master"], hide_index=True, use_container_width=True, height=280)
         with t2:
@@ -493,7 +553,26 @@ with tab_gen:
             st.caption("කොයි pallet එකෙන් කීයද ගත්තේ — balance එකත් එක්කම.")
             st.dataframe(alloc, hide_index=True, use_container_width=True, height=380)
         with t4:
+            st.caption("QTY_BEFORE → QTY_PICKED → QTY_BALANCE. **MODE** එකෙන් පේනවා "
+                       "ledger balance එකෙන්ද, අලුත් inventory qty එකෙන්ද pick කරේ කියලා.")
             st.dataframe(res["balance"], hide_index=True, use_container_width=True, height=380)
+        with t7:
+            bs = res.get("basis", pd.DataFrame())
+            st.caption("Pallet එකකට pick කරන්න පුළුවන් උපරිමය කොහොමද තීරණය වුණේ කියලා.")
+            if len(bs):
+                mc = bs["MODE"].value_counts()
+                b1, b2, b3 = st.columns(3)
+                b1.metric("NEW (ledger නෑ)", int(mc.get("NEW", 0)))
+                b2.metric("LEDGER BALANCE", int(mc.get("LEDGER BALANCE", 0)),
+                          help="Inventory එක refresh වෙලා නෑ — ledger balance එකෙන් pick")
+                b3.metric("NEW BASELINE", int(mc.get("NEW BASELINE", 0)),
+                          help="Inventory Actual Qty වෙනස් වෙලා — ඒක අලුත් QTY_BEFORE")
+                only = st.checkbox("Ledger එකේ තියෙන pallet විතරක්", value=True,
+                                   key="basis_filter")
+                view = bs[bs["MODE"] != "NEW"] if only else bs
+                st.dataframe(view, hide_index=True, use_container_width=True, height=380)
+            else:
+                st.info("Basis data නෑ.")
         with t5:
             st.caption("Invoice / DC එකේ Quantity එකට **හරියටම** ගැලපෙනවද — line by line, "
                        "document total, WMS file total.")
@@ -675,10 +754,11 @@ with tab_search:
                 led = gsheet.read_ledger(sa_info, sheet_key)
             except Exception:
                 led = None
-        frames["📦 Inventory / balance"] = E.stock_view(st.session_state["inv_raw"], led)
+        frames["📦 Inventory / balance"] = E.stock_view(st.session_state["inv_raw"], led,
+                                                       use_ledger=use_ledger)
     if "Current run" not in src:
         for k in ["🎯 Pallet Allocation", "📋 OutBound Detail", "🧾 OutBound MASTER",
-                  "🔢 Qty Verify", "⛔ Rejected", "📄 Document lines"]:
+                  "🔢 Qty Verify", "📊 Stock Basis", "⛔ Rejected", "📄 Document lines"]:
             frames.pop(k, None)
     if gs_ready:
         try:
@@ -732,11 +812,12 @@ with tab_bal:
                 ledger = gsheet.read_ledger(sa_info, sheet_key)
             except Exception as ex:
                 st.warning(f"Ledger read error: {ex}")
-        view = E.stock_view(inv_raw, ledger)
-        f1, f2, f3 = st.columns([1.4, 1, 1])
+        view = E.stock_view(inv_raw, ledger, use_ledger=use_ledger)
+        f1, f2, f3, f4 = st.columns([1.4, 1, 1, 1])
         q = f1.text_input("Item / Base ID / Pallet search", placeholder="P550945")
         plants = f2.multiselect("Plant", sorted(view["PLANT"].dropna().unique().tolist()))
-        only_bal = f3.checkbox("Balance > 0 විතරක්", value=True)
+        modes = f3.multiselect("Mode", ["NEW", "LEDGER BALANCE", "NEW BASELINE"])
+        only_bal = f4.checkbox("Balance > 0 විතරක්", value=True)
 
         v = view
         if q.strip():
@@ -746,13 +827,16 @@ with tab_bal:
                   | v["PALLET"].str.upper().str.contains(k, na=False)]
         if plants:
             v = v[v["PLANT"].isin(plants)]
+        if modes:
+            v = v[v["MODE"].isin(modes)]
         if only_bal:
             v = v[v["BALANCE"] > 0]
 
-        a, b, c = st.columns(3)
+        a, b, c, dcol = st.columns(4)
         a.metric("Rows", len(v))
         b.metric("Pallets", int(v["PALLET"].nunique()) if len(v) else 0)
-        c.metric("Balance Qty", f"{v['BALANCE'].sum():g}" if len(v) else "0")
+        c.metric("Actual Qty", f"{v['ACTUAL_QTY'].sum():g}" if len(v) else "0")
+        dcol.metric("Pickable Balance", f"{v['BALANCE'].sum():g}" if len(v) else "0")
         st.dataframe(v, hide_index=True, use_container_width=True, height=520)
 
 # =========================================================================== #

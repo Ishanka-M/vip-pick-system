@@ -72,7 +72,8 @@ Google Sheet නැතුවත් app එක වැඩ කරනවා — Exce
 | Stock මදි නම් pick නෑ | එක line එකක් මදි වුණත් **මුළු document එකම** reject (`STOCK SHORT`). Partial pick නෑ |
 | Duplicate | Batch එකේ + `DOC_REGISTRY` sheet එකේ check → එකක් විතරයි |
 | Pallet level save | `QTY_BEFORE → QTY_PICKED → QTY_BALANCE` හැම pallet එකකටම `PALLET_LEDGER` එකට |
-| Next run balance | Ledger එකේ commit වුණු qty, inventory එකෙන් අඩු කරලා pick කරනවා |
+| **Pallet cap** | Pallet එකකට **වඩා වැඩියෙන් pick වෙන්නේ නෑ** — allocate කරද්දී cap එකක් + commit කරන්න කලින් `PALLET OVER-PICK` guard එකක් |
+| **Next run balance** | පහළ **§ 6 · Stock basis rule** බලන්න |
 
 **Pick strategies**
 
@@ -148,7 +149,58 @@ Google Sheet නැතුවත් app එක වැඩ කරනවා — Exce
 
 ---
 
-## 6. ⚠️ Document check bypass
+## 6. Stock basis rule — QTY_BEFORE same ද?
+
+Upload කරන Inventory එක **fresh ද පරණද** කියලා pallet එකෙන් pallet එකට තීරණය කරනවා.
+හැම pallet + item + lot එකකටම `PALLET_LEDGER` එකේ තියෙන
+`QTY_BEFORE` (baseline) එකයි, Inventory එකේ **Actual Qty** එකයි compare කරනවා:
+
+| තත්වය | තේරුම | Pick කරන්නේ |
+|---|---|---|
+| Ledger එකේ නෑ | අලුත් pallet එකක් | `MODE = NEW` → **Actual Qty** |
+| `Actual Qty` **==** `QTY_BEFORE` | Inventory report එක තාම refresh වෙලා නෑ (pick එක WMS එකට තාම post වෙලා නෑ) | `MODE = LEDGER BALANCE` → **`QTY_BALANCE`** |
+| `Actual Qty` **≠** `QTY_BEFORE` | WMS එක update වෙලා — අලුත් baseline එකක් | `MODE = NEW BASELINE` → **Actual Qty** (ledger එක ආපහු අඩු කරන්නේ නෑ) |
+
+මේකෙන් වළක්වන දේ: එකම inventory file එකෙන් දෙපාරක් pick කරාම **double pick**,
+සහ WMS එක update වුණාට පස්සේ **දෙපාරක් අඩු වීම**.
+
+උදාහරණය — pallet `DONALDSON100826-A-108` · `P550945` · Actual 18, කලින් pick 6:
+
+```
+Run 1  ledger නෑ                 -> NEW             18 -  6 = 12   ✅
+Run 2  එකම inventory file        -> LEDGER BALANCE  12 -  6 =  6   ✅ (18 නෙවෙයි)
+Run 3  WMS update, Actual = 12   -> NEW BASELINE    12 -  6 =  6   ✅ (6 නෙවෙයි)
+```
+
+බලන්න පුළුවන් තැන් — result එකේ **📊 Stock Basis** tab · **📦 Pallet Balance** tab
+(`MODE` column) · Pick Report එකේ `Stock Basis` sheet.
+Sidebar → *Pick options* → **Pallet ledger balance logic** off කරොත් හැම වෙලේම Actual Qty.
+
+---
+
+## 7. 🔐 DB Reset
+
+Sidebar → **🧹 Reset / Undo** → **DB Reset**.
+Password එකෙන් unlock කරන්න ඕන (default: `Isha@1996`).
+
+| Button | වෙන දේ |
+|---|---|
+| 🗑️ **Reset** | තෝරගත්ත worksheets විතරක් clear |
+| 💣 **FULL DB RESET** | ledger · registry · outputs · rejected · run log ඔක්කොම clear (email book ඉතුරු වෙනවා) |
+| ↩️ **Run undo** | `RUN_ID` එකක් විතරක් අයින් කරනවා — වැරදුනු run එකකට |
+
+Header row එක විතරක් ඉතුරු වෙනවා, worksheet delete වෙන්නේ නෑ.
+
+> Password එක code එකේ hardcode වෙලා තියෙනවා. Repo එක private නැත්නම්
+> `secrets.toml` එකට දාන්න — code එකට වඩා ඒකට priority තියෙනවා:
+> ```toml
+> [app]
+> reset_password = "…"
+> ```
+
+---
+
+## 8. ⚠️ Document check bypass
 
 Parse එක හරි වුණත් total එකක් වැරදියට කියවුනොත් — sidebar එකේ
 **Document check bypass** on කරලා pick කරන්න පුළුවන්.
@@ -157,7 +209,7 @@ Parse එක හරි වුණත් total එකක් වැරදියට 
 
 ---
 
-## 7. Downloads — LOAD_ID එකෙන්
+## 9. Downloads — LOAD_ID එකෙන්
 
 හැම document එකකටම වෙන වෙනම file:
 
@@ -174,7 +226,7 @@ Parse එක හරි වුණත් total එකක් වැරදියට 
 
 ---
 
-## 8. Pick Sheet PDF (LOAD_ID QR)
+## 10. Pick Sheet PDF (LOAD_ID QR)
 
 Landscape A4 එකක්:
 
@@ -188,7 +240,7 @@ Landscape A4 එකක්:
 
 ---
 
-## 9. 🔎 Search
+## 11. 🔎 Search
 
 ඕනෑම data එකක් — item code · LOAD ID · pallet · location · GRN · lot · plant.
 Word කීපයක් දුන්නොත් **ඔක්කොම තියෙන rows විතරයි** (AND search).
@@ -199,7 +251,7 @@ inventory + balance · Google Sheet (ledger · registry · detail).
 
 ---
 
-## 10. 📧 Email
+## 12. 📧 Email
 
 Sidebar → **📧 Email settings**
 

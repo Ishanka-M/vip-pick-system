@@ -196,6 +196,107 @@ def plant_summary(inv: pd.DataFrame) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- #
+# Pallet-level stock basis
+# --------------------------------------------------------------------------- #
+QTY_TOL = 1e-6
+
+BASIS_COLS = ["PALLET", "LOCATION_ID", "ITEM_NUMBER", "BASE_ID", "LOT_NUMBER", "PLANT",
+              "UOM", "INV_ACTUAL_QTY", "LEDGER_BEFORE", "LEDGER_PICKED", "LEDGER_BALANCE",
+              "MODE", "AVAILABLE", "ROW_KEY"]
+
+
+def _soft_key(pallet: Any, item: Any, lot: Any) -> str:
+    return (f"{str(pallet or '').strip().upper()}|{clean_item(item)}|"
+            f"{str(lot or '').strip().upper()}")
+
+
+def ledger_state(ledger: pd.DataFrame | None) -> tuple[dict[str, dict], dict[str, dict]]:
+    """
+    PALLET_LEDGER -> pallet+item එකකට { before, picked, balance }.
+    before  = ledger එකේ තියෙන ලොකුම QTY_BEFORE (chain එකේ මුල් baseline එක)
+    picked  = ඒ pallet එකෙන් මුළු pick කරපු ප්‍රමාණය
+    (exact ROW_KEY dict, soft PALLET|ITEM|LOT dict) විදිහට දෙකක් return වෙනවා.
+    """
+    empty: dict[str, dict] = {}
+    if ledger is None or not len(ledger) or "ROW_KEY" not in ledger.columns:
+        return empty, empty
+
+    led = ledger.copy()
+    for c in ("QTY_BEFORE", "QTY_PICKED", "QTY_BALANCE"):
+        led[c] = pd.to_numeric(led.get(c), errors="coerce").fillna(0.0)
+    led["ROW_KEY"] = led["ROW_KEY"].astype(str)
+    led["_soft"] = [
+        _soft_key(p, i, l) for p, i, l in zip(
+            led.get("PALLET", ""), led.get("ITEM_NUMBER", ""), led.get("LOT_NUMBER", ""))
+    ]
+
+    def _pack(gcol: str) -> dict[str, dict]:
+        g = led.groupby(gcol).agg(before=("QTY_BEFORE", "max"),
+                                  picked=("QTY_PICKED", "sum"),
+                                  last=("QTY_BALANCE", "min"))
+        out: dict[str, dict] = {}
+        for k, r in g.iterrows():
+            before, picked = float(r["before"]), float(r["picked"])
+            out[str(k)] = {"before": before, "picked": picked,
+                           "balance": max(0.0, before - picked)}
+        return out
+
+    return _pack("ROW_KEY"), _pack("_soft")
+
+
+def stock_basis(inv: pd.DataFrame, ledger: pd.DataFrame | None = None,
+                use_ledger: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    හැම pallet+item එකකටම pick කරන්න පුළුවන් ප්‍රමාණය තීරණය කරනවා:
+
+      * Ledger එකේ නෑ                      -> AVAILABLE = Inventory Actual Qty
+      * Actual Qty == ledger QTY_BEFORE     -> Inventory refresh වෙලා නෑ
+                                               -> AVAILABLE = QTY_BALANCE
+      * Actual Qty != ledger QTY_BEFORE     -> WMS update වෙලා, අලුත් baseline
+                                               -> AVAILABLE = Actual Qty
+
+    Return: (inv rows + 'avail' column, basis DataFrame)
+    """
+    exact, soft = ledger_state(ledger) if use_ledger else ({}, {})
+
+    agg = (inv.groupby("row_key", as_index=False)["free_qty"].sum()
+             .rename(columns={"free_qty": "actual_total"}))
+    one = inv.drop_duplicates(subset=["row_key"], keep="first").merge(agg, on="row_key")
+
+    rows: list[dict] = []
+    for _, r in one.iterrows():
+        key = str(r["row_key"])
+        actual = float(r["actual_total"])
+        led = exact.get(key) or soft.get(
+            _soft_key(r["pallet"], r["item_number"], r["lot_number"]))
+
+        if not led:
+            mode, avail = "NEW", actual
+            lb = lp = lbal = 0.0
+        else:
+            lb, lp, lbal = led["before"], led["picked"], led["balance"]
+            if abs(actual - lb) <= QTY_TOL:
+                mode, avail = "LEDGER BALANCE", lbal      # inventory එක පරණයි
+            else:
+                mode, avail = "NEW BASELINE", actual      # inventory update වෙලා
+
+        rows.append({
+            "PALLET": r["pallet"], "LOCATION_ID": r["location_id"],
+            "ITEM_NUMBER": r["item_number_raw"] or r["item_number"],
+            "BASE_ID": r["base_id"], "LOT_NUMBER": r["lot_number"], "PLANT": r["plant"],
+            "UOM": r["uom"], "INV_ACTUAL_QTY": actual,
+            "LEDGER_BEFORE": lb, "LEDGER_PICKED": lp, "LEDGER_BALANCE": lbal,
+            "MODE": mode, "AVAILABLE": max(0.0, float(avail)), "ROW_KEY": key,
+        })
+
+    basis = pd.DataFrame(rows, columns=BASIS_COLS)
+    avail_map = dict(zip(basis["ROW_KEY"], basis["AVAILABLE"]))
+    one = one.copy()
+    one["avail"] = one["row_key"].map(avail_map).fillna(0.0)
+    return one.reset_index(drop=True), basis
+
+
+# --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -207,6 +308,7 @@ class EngineConfig:
     statuses: list[str] = field(default_factory=lambda: ["Available"])
     strategy: str = "FIFO"              # FIFO | LEAST_PALLETS | SINGLE_PALLET_FIRST
     exact_item_first: bool = True
+    use_ledger: bool = True             # pallet balance එකට ledger එක බලනවද
     blank_fill: str = "TBC"
     fill_item_number_col: bool = False
     merge_same_item_lines: bool = False
@@ -256,21 +358,10 @@ def run_pick(
     if cfg.plants:
         inv = inv[inv["plant"].isin(cfg.plants)]
 
-    # ---- remaining qty per inventory row (previous commitments subtracted) ---
-    remaining: dict[str, float] = {}
-    for _, r in inv.iterrows():
-        remaining[r["row_key"]] = remaining.get(r["row_key"], 0.0) + float(r["free_qty"])
-
-    if ledger is not None and len(ledger):
-        led = ledger.copy()
-        if "ROW_KEY" in led.columns and "QTY_PICKED" in led.columns:
-            led["QTY_PICKED"] = pd.to_numeric(led["QTY_PICKED"], errors="coerce").fillna(0)
-            for k, v in led.groupby("ROW_KEY")["QTY_PICKED"].sum().items():
-                if k in remaining:
-                    remaining[k] = max(0.0, remaining[k] - float(v))
-
-    inv = inv.drop_duplicates(subset=["row_key"], keep="first").reset_index(drop=True)
-    inv["avail"] = inv["row_key"].map(remaining).fillna(0.0)
+    # ---- pallet level stock basis (QTY_BEFORE same ද කියලා බලලා) ----
+    inv, basis = stock_basis(inv, ledger, use_ledger=cfg.use_ledger)
+    remaining: dict[str, float] = dict(zip(basis["ROW_KEY"], basis["AVAILABLE"].astype(float)))
+    cap: dict[str, float] = dict(remaining)          # pallet එකට වඩා pick වෙන්න බෑ
     inv = inv[inv["avail"] > 0].reset_index(drop=True)
 
     allocations: list[dict] = []
@@ -405,6 +496,21 @@ def run_pick(
                 row[gcol] = val if str(val).strip() else cfg.blank_fill
             doc_detail.append(row)
 
+        # ---------- PALLET CAP — pallet එකට වඩා වැඩියෙන් pick වෙන්න බෑ ----------
+        per_key: dict[str, float] = {}
+        for a in doc_alloc:
+            per_key[a["ROW_KEY"]] = per_key.get(a["ROW_KEY"], 0.0) + float(a["QTY_PICKED"])
+        over = [
+            f"{k.split('|')[0]} {k.split('|')[2] if len(k.split('|')) > 2 else ''}: "
+            f"pick {q:g} > balance {remaining.get(k, 0.0):g}"
+            for k, q in per_key.items() if q > remaining.get(k, 0.0) + QTY_TOL
+        ]
+        if over:
+            rejected.append({"DOC_NUMBER": num, "DOC_TYPE": doc.doc_type,
+                             "REASON": "PALLET OVER-PICK",
+                             "DETAIL": " · ".join(over), "SOURCE_FILE": doc.source_file})
+            continue
+
         # ---------- QUANTITY VERIFY — Invoice / DC qty එකට හරියටම ----------
         v_rows, v_bad = _verify_doc(doc, doc_alloc, doc_detail)
         verify_rows.extend(v_rows)
@@ -461,8 +567,9 @@ def run_pick(
                                                     "DETAIL", "SOURCE_FILE"]),
         "shortage": pd.DataFrame(shortages),
         "verify": pd.DataFrame(verify_rows, columns=VERIFY_COLS),
+        "basis": basis,
         "accepted": pd.DataFrame(accepted),
-        "balance": pallet_balance(inv, alloc_df),
+        "balance": pallet_balance(basis, alloc_df, cap),
         "cfg": cfg,
     }
 
@@ -632,42 +739,52 @@ def search_frames(query: str, frames: dict[str, pd.DataFrame],
     return out
 
 
-def pallet_balance(inv: pd.DataFrame, alloc_df: pd.DataFrame) -> pd.DataFrame:
-    """Pick කරපු හැම pallet එකකම before / picked / balance."""
+def pallet_balance(basis: pd.DataFrame, alloc_df: pd.DataFrame,
+                   cap: dict[str, float] | None = None) -> pd.DataFrame:
+    """මේ run එකේ pick කරපු හැම pallet එකකම — before · picked · balance."""
+    cols = ["PALLET", "LOCATION_ID", "ITEM_NUMBER", "LOT_NUMBER", "PLANT", "UOM",
+            "MODE", "INV_ACTUAL_QTY", "QTY_BEFORE", "QTY_PICKED", "QTY_BALANCE", "ROW_KEY"]
     if alloc_df is None or not len(alloc_df):
-        return pd.DataFrame(columns=["PALLET", "LOCATION_ID", "ITEM_NUMBER", "LOT_NUMBER",
-                                     "PLANT", "UOM", "QTY_BEFORE", "QTY_PICKED",
-                                     "QTY_BALANCE", "ROW_KEY"])
-    g = (alloc_df.groupby(["ROW_KEY", "PALLET", "LOCATION_ID", "ITEM_NUMBER",
-                           "LOT_NUMBER", "PLANT", "UOM"], dropna=False)
-         .agg(QTY_PICKED=("QTY_PICKED", "sum"), QTY_BEFORE=("QTY_BEFORE", "max"))
-         .reset_index())
-    g["QTY_BALANCE"] = g["QTY_BEFORE"] - g["QTY_PICKED"]
-    return g[["PALLET", "LOCATION_ID", "ITEM_NUMBER", "LOT_NUMBER", "PLANT", "UOM",
-              "QTY_BEFORE", "QTY_PICKED", "QTY_BALANCE", "ROW_KEY"]]
+        return pd.DataFrame(columns=cols)
+
+    g = (alloc_df.groupby("ROW_KEY", dropna=False)
+         .agg(QTY_PICKED=("QTY_PICKED", "sum")).reset_index())
+    b = basis.set_index("ROW_KEY") if (basis is not None and len(basis)) else None
+    out: list[dict] = []
+    for _, r in g.iterrows():
+        key = str(r["ROW_KEY"])
+        info = b.loc[key].to_dict() if (b is not None and key in b.index) else {}
+        before = float((cap or {}).get(key, info.get("AVAILABLE", 0.0) or 0.0))
+        picked = float(r["QTY_PICKED"])
+        out.append({
+            "PALLET": info.get("PALLET", key.split("|")[0]),
+            "LOCATION_ID": info.get("LOCATION_ID", ""),
+            "ITEM_NUMBER": info.get("ITEM_NUMBER", ""),
+            "LOT_NUMBER": info.get("LOT_NUMBER", ""), "PLANT": info.get("PLANT", ""),
+            "UOM": info.get("UOM", ""), "MODE": info.get("MODE", ""),
+            "INV_ACTUAL_QTY": info.get("INV_ACTUAL_QTY", ""),
+            "QTY_BEFORE": before, "QTY_PICKED": picked,
+            "QTY_BALANCE": before - picked, "ROW_KEY": key,
+        })
+    return pd.DataFrame(out, columns=cols).sort_values("PALLET").reset_index(drop=True)
 
 
-def stock_view(inv_raw: pd.DataFrame, ledger: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Pallet-level live view — Actual, කලින් pick කරපු ප්‍රමාණය, ඉතුරු balance."""
+def stock_view(inv_raw: pd.DataFrame, ledger: pd.DataFrame | None = None,
+               use_ledger: bool = True) -> pd.DataFrame:
+    """
+    Pallet-level live view — Inventory Actual · ledger before/picked ·
+    pick කරන්න පුළුවන් BALANCE (QTY_BEFORE same ද කියන rule එකට).
+    """
     inv = normalize_inventory(inv_raw)
-    picked: dict[str, float] = {}
-    if ledger is not None and len(ledger) and "ROW_KEY" in ledger.columns:
-        led = ledger.copy()
-        led["QTY_PICKED"] = pd.to_numeric(led["QTY_PICKED"], errors="coerce").fillna(0)
-        picked = led.groupby("ROW_KEY")["QTY_PICKED"].sum().to_dict()
-    inv["PICKED_BEFORE"] = inv["row_key"].map(picked).fillna(0.0)
-    inv["BALANCE"] = (inv["free_qty"] - inv["PICKED_BEFORE"]).clip(lower=0)
-    inv["item_number"] = inv["item_number_raw"].where(
-        inv["item_number_raw"].astype(bool), inv["item_number"])
-    out = inv.rename(columns={
-        "pallet": "PALLET", "location_id": "LOCATION_ID", "item_number": "ITEM_NUMBER",
-        "base_id": "BASE_ID", "description": "DESCRIPTION", "lot_number": "LOT_NUMBER",
-        "plant": "PLANT", "uom": "UOM", "free_qty": "ACTUAL_QTY", "status": "STATUS",
-        "fifo_date": "FIFO_DATE", "grn_number": "GRN_NUMBER", "row_key": "ROW_KEY",
-    })
-    return out[["PALLET", "LOCATION_ID", "ITEM_NUMBER", "BASE_ID", "DESCRIPTION",
-                "LOT_NUMBER", "PLANT", "UOM", "STATUS", "ACTUAL_QTY", "PICKED_BEFORE",
-                "BALANCE", "FIFO_DATE", "GRN_NUMBER", "ROW_KEY"]]
+    _, basis = stock_basis(inv, ledger, use_ledger=use_ledger)
+    desc = inv.drop_duplicates("row_key").set_index("row_key")["description"].to_dict()
+    b = basis.copy()
+    b["DESCRIPTION"] = b["ROW_KEY"].map(desc).fillna("")
+    b = b.rename(columns={"INV_ACTUAL_QTY": "ACTUAL_QTY", "LEDGER_PICKED": "PICKED_BEFORE",
+                          "AVAILABLE": "BALANCE"})
+    return b[["PALLET", "LOCATION_ID", "ITEM_NUMBER", "BASE_ID", "DESCRIPTION",
+              "LOT_NUMBER", "PLANT", "UOM", "ACTUAL_QTY", "LEDGER_BEFORE",
+              "PICKED_BEFORE", "LEDGER_BALANCE", "MODE", "BALANCE", "ROW_KEY"]]
 
 
 # --------------------------------------------------------------------------- #
@@ -703,9 +820,11 @@ def build_report_excel(res: dict[str, Any]) -> bytes:
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
         for name, key in [("Doc Summary", "accepted"), ("Qty Verification", "verify"),
                           ("Pallet Allocation", "allocations"),
-                          ("Pallet Balance", "balance"), ("Shortage", "shortage"),
-                          ("Rejected Docs", "rejected")]:
+                          ("Pallet Balance", "balance"), ("Stock Basis", "basis"),
+                          ("Shortage", "shortage"), ("Rejected Docs", "rejected")]:
             df = res.get(key)
+            if key == "basis" and df is not None and len(df):
+                df = df[df["MODE"] != "NEW"]          # ledger history තියෙන ඒවා විතරයි
             if df is None or not len(df):
                 df = pd.DataFrame({"info": ["— කිසිවක් නෑ —"]})
             df.to_excel(xw, sheet_name=name[:31], index=False)

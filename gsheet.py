@@ -229,15 +229,19 @@ def delete_run(sa_info: dict, sheet_key: str, run_id: str) -> dict[str, int]:
     return removed
 
 
+RESET_SCOPES = {
+    "outputs": [WS_MASTER, WS_DETAIL],
+    "ledger": [WS_LEDGER],
+    "registry": [WS_REGISTRY],
+    "rejected": [WS_REJECT],
+    "runlog": [WS_RUNLOG],
+    "settings": [WS_SETTINGS],
+}
+
+
 def reset_data(sa_info: dict, sheet_key: str, scope: list[str]) -> list[str]:
     book = open_book(sa_info, sheet_key)
-    pick = {
-        "outputs": [WS_MASTER, WS_DETAIL],
-        "ledger": [WS_LEDGER],
-        "registry": [WS_REGISTRY],
-        "rejected": [WS_REJECT],
-        "runlog": [WS_RUNLOG],
-    }
+    pick = RESET_SCOPES
     done: list[str] = []
     for s in scope:
         for title in pick.get(s, []):
@@ -249,3 +253,14 @@ def reset_data(sa_info: dict, sheet_key: str, scope: list[str]) -> list[str]:
             ws.update(values=[_SHEETS[title]], range_name="A1", value_input_option="RAW")
             done.append(title)
     return done
+
+
+def reset_all(sa_info: dict, sheet_key: str, keep_settings: bool = True) -> dict[str, Any]:
+    """
+    ⚠️ FULL DB RESET — ledger · registry · outputs · rejected · run log ඔක්කොම clear.
+    Header row එක විතරක් ඉතුරු වෙනවා (worksheet delete වෙන්නේ නෑ).
+    """
+    scope = [k for k in RESET_SCOPES if not (keep_settings and k == "settings")]
+    done = reset_data(sa_info, sheet_key, scope)
+    return {"cleared": done, "count": len(done), "at":
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
