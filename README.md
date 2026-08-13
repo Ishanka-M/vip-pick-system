@@ -4,10 +4,11 @@ Invoice / Delivery Challan **PDF** + **Inventory Report** → pallet-level pick 
 Google Sheet ledger + **`OutBound MASTER` / `OutBound Detail`** Excel (Körber One upload).
 
 ```
-app.py          Streamlit UI (4 tabs)
+app.py          Streamlit UI (5 tabs)
 doc_parser.py   Donaldson Invoice + Delivery Challan PDF parser
-pick_engine.py  matching · allocation · WMS output · Excel writers
-gsheet.py       Google Sheet ledger / registry / history
+pick_engine.py  matching · allocation · qty verify · WMS output · Excel · search
+pick_pdf.py     Pick sheet PDF (LOAD_ID QR) + document merge + email (.eml / mailto)
+gsheet.py       Google Sheet ledger / registry / settings / history
 ```
 
 ---
@@ -54,7 +55,9 @@ Google Sheet නැතුවත් app එක වැඩ කරනවා — Exce
 3. **Plant confirm** — inventory එකේ තියෙන plant ටික පෙන්නලා confirm ගන්නවා.
    Confirm කරන කල් generate button එක enable වෙන්නේ නෑ.
 4. **Pick** — pallet level, FIFO (හෝ තෝරගත්ත strategy එකට).
-5. **Save + download** — Google Sheet එකට append + Excel 2ක් download.
+5. **Qty verify** — Invoice / DC qty එකට **හරියටම** ගැලපෙනවද කියලා check (line · doc total ·
+   WMS file total). Fail වුණොත් ඒ document එක reject.
+6. **Save + download** — Google Sheet append · **LOAD_ID එකෙන් Excel + PDF** · email.
 
 ---
 
@@ -151,3 +154,67 @@ Parse එක හරි වුණත් total එකක් වැරදියට 
 **Document check bypass** on කරලා pick කරන්න පුළුවන්.
 `DOC_REGISTRY` එකේ `DOC_CHECK = MANUAL OVERRIDE — …` කියලා log වෙනවා.
 **Stock check එක bypass වෙන්නේ නෑ** — stock මදි නම් හැම වෙලේම reject.
+
+---
+
+## 7. Downloads — LOAD_ID එකෙන්
+
+හැම document එකකටම වෙන වෙනම file:
+
+| File | Content |
+|---|---|
+| `<LOAD_ID>.xlsx` | ඒ LOAD_ID එකේ `OutBound MASTER` + `OutBound Detail` විතරයි |
+| `<LOAD_ID>.pdf` | **Pick sheet (LOAD_ID QR)** + upload කරපු Invoice / DC pages |
+| `OutBound_<stamp>.zip` | ඔක්කොම LOAD_ID වල Excel + PDF |
+| `OutBound_Upload_<stamp>.xlsx` | ඔක්කොම docs එකම file එකක (කලින් විදිහට) |
+| `Pick_Report_<stamp>.xlsx` | Doc Summary · Qty Verification · Allocation · Balance · Shortage · Rejected |
+
+> DC number එකේ `/` තියෙනවා නම් filename එකට `-` දානවා:
+> `333/26-27/62` → **`333-26-27-62.pdf`**. Sheet එකේ / QR එකේ තියෙන්නේ ඇත්ත LOAD_ID එකමයි.
+
+---
+
+## 8. Pick Sheet PDF (LOAD_ID QR)
+
+Landscape A4 එකක්:
+
+* **LOAD_ID QR code** එක උඩ දකුණේ (scan කරාම LOAD_ID එක එනවා — HJ/Körber gun එකට)
+* Document info — doc no · date · ref · plant · pick date · strategy · qty check
+* **PICK DETAILS** — line · item number · description · lot · **pallet · location** ·
+  stock · pick qty · balance · `Picked [ ]` tick box
+* **QUANTITY VERIFICATION** — doc qty vs picked qty vs diff
+* Picked by / Checked by / Loaded by / Remarks sign-off
+* ඊට පස්සේ **upload කරපු Invoice / DC PDF එකේ pages ඔක්කොම** (checkbox එකෙන් off කරන්නත් පුළුවන්)
+
+---
+
+## 9. 🔎 Search
+
+ඕනෑම data එකක් — item code · LOAD ID · pallet · location · GRN · lot · plant.
+Word කීපයක් දුන්නොත් **ඔක්කොම තියෙන rows විතරයි** (AND search).
+
+හොයන තැන් — current run (document lines · allocation · detail · master · verify · rejected) ·
+inventory + balance · Google Sheet (ledger · registry · detail).
+හම්බුණ ඒවා CSV එකක් විදිහට download කරන්නත් පුළුවන්.
+
+---
+
+## 10. 📧 Email
+
+Sidebar → **📧 Email settings**
+
+* **To** — save කරපු address book එකෙන් තෝරන්න, නැත්නම් type කරන්න
+* **➕ Add** — address එක book එකට. Google Sheet එකේ `APP_SETTINGS` worksheet එකේ
+  save වෙනවා, ඒ නිසා next time එකෙත් තියෙනවා
+* Cc · From · Signature
+
+Result එකේ **📧 Email** section එකෙන්:
+
+| Button | වෙන දේ |
+|---|---|
+| ✉️ **Default mail app එකෙන් open** | `mailto:` — default mail app එක subject + body එක්ක open වෙනවා (attachment යන්නේ නෑ) |
+| 📎 **Draft (.eml) download** | Double-click කරාම Outlook / Mail එකේ **draft** එකක් විදිහට open වෙනවා — **Excel + PDF attach වෙලාම** (`X-Unsent: 1`) |
+
+Body එකේ තියෙන්නේ LOAD ID · document · plant · lines/qty · pallets · qty check +
+pallet-by-pallet pick table එක (plain text + HTML දෙකම).
+Subject / body edit කරන්නත් පුළුවන්.

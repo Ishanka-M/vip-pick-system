@@ -30,6 +30,7 @@ WS_LEDGER = "PALLET_LEDGER"
 WS_REGISTRY = "DOC_REGISTRY"
 WS_REJECT = "REJECTED_LOG"
 WS_RUNLOG = "RUN_LOG"
+WS_SETTINGS = "APP_SETTINGS"
 
 LEDGER_COLS = E.ALLOC_COLS
 REGISTRY_COLS = ["DOC_NUMBER", "DOC_TYPE", "DOC_DATE", "REF_NUMBER", "DOC_CHECK",
@@ -48,6 +49,7 @@ _SHEETS = {
     WS_REGISTRY: REGISTRY_COLS,
     WS_REJECT: REJECT_COLS,
     WS_RUNLOG: RUNLOG_COLS,
+    WS_SETTINGS: ["KEY", "VALUE", "UPDATED_AT"],
 }
 
 
@@ -118,6 +120,27 @@ def read_processed_docs(sa_info: dict, sheet_key: str) -> set[str]:
     if df is None or not len(df) or "DOC_NUMBER" not in df.columns:
         return set()
     return {str(x).strip() for x in df["DOC_NUMBER"] if str(x).strip()}
+
+
+def read_setting(sa_info: dict, sheet_key: str, key: str, default: str = "") -> str:
+    """APP_SETTINGS worksheet එකෙන් එක value එකක් (email book වගේ)."""
+    df = read_ws(sa_info, sheet_key, WS_SETTINGS)
+    if df is None or not len(df) or "KEY" not in df.columns:
+        return default
+    hit = df[df["KEY"].astype(str) == str(key)]
+    return str(hit.iloc[-1]["VALUE"]) if len(hit) else default
+
+
+def save_setting(sa_info: dict, sheet_key: str, key: str, value: str) -> None:
+    book = open_book(sa_info, sheet_key)
+    ws = _ensure(book, WS_SETTINGS, _SHEETS[WS_SETTINGS])
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = ws.get_all_values()
+    head = rows[0] if rows else _SHEETS[WS_SETTINGS]
+    body = [r for r in rows[1:] if (r[0] if r else "") != str(key)]
+    body.append([str(key), str(value), now])
+    ws.clear()
+    ws.update(values=[head] + body, range_name="A1", value_input_option="RAW")
 
 
 # --------------------------------------------------------------------------- #

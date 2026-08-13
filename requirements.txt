@@ -4,3 +4,7 @@ openpyxl>=3.1
 pdfplumber>=0.11
 gspread>=6.0
 google-auth>=2.30
+reportlab>=4.0
+qrcode>=7.4
+pillow>=10.0
+pypdf>=4.0

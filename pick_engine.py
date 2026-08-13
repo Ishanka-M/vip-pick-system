@@ -274,6 +274,7 @@ def run_pick(
     inv = inv[inv["avail"] > 0].reset_index(drop=True)
 
     allocations: list[dict] = []
+    verify_rows: list[dict] = []
     rejected: list[dict] = []
     shortages: list[dict] = []
     accepted: list[dict] = []
@@ -371,10 +372,6 @@ def run_pick(
                              "DETAIL": miss, "SOURCE_FILE": doc.source_file})
             continue
 
-        # ---------- commit ----------
-        remaining = trial
-        allocations.extend(doc_alloc)
-
         # ---------- WMS Detail (pallet allocations -> order lines) ----------
         groups: dict[tuple, dict] = {}
         order: list[tuple] = []
@@ -385,6 +382,7 @@ def run_pick(
                 order.append(key)
             groups[key]["qty"] += a["QTY_PICKED"]
 
+        doc_detail: list[dict] = []
         line_no = 0
         for key in order:
             g = groups[key]
@@ -405,7 +403,21 @@ def run_pick(
             for i, (gcol, invcol) in enumerate(GEN_MAP.items()):
                 val = a["_attrs"][i]
                 row[gcol] = val if str(val).strip() else cfg.blank_fill
-            detail_rows.append(row)
+            doc_detail.append(row)
+
+        # ---------- QUANTITY VERIFY — Invoice / DC qty එකට හරියටම ----------
+        v_rows, v_bad = _verify_doc(doc, doc_alloc, doc_detail)
+        verify_rows.extend(v_rows)
+        if v_bad:
+            rejected.append({"DOC_NUMBER": num, "DOC_TYPE": doc.doc_type,
+                             "REASON": "QTY VERIFY FAILED",
+                             "DETAIL": " · ".join(v_bad), "SOURCE_FILE": doc.source_file})
+            continue
+
+        # ---------- commit ----------
+        remaining = trial
+        allocations.extend(doc_alloc)
+        detail_rows.extend(doc_detail)
 
         # ---------- WMS Master ----------
         m = {c: "" for c in MASTER_COLS}
@@ -420,10 +432,13 @@ def run_pick(
         master_rows.append(m)
 
         accepted.append({
-            "DOC_NUMBER": num, "DOC_TYPE": doc.doc_type, "DOC_DATE": doc.doc_date,
+            "DOC_NUMBER": num, "LOAD_ID": num, "DOC_TYPE": doc.doc_type,
+            "DOC_DATE": doc.doc_date,
             "REF_NUMBER": doc.ref_number, "DOC_CHECK": doc_check, "LINES": len(doc.lines),
             "WMS_LINES": line_no, "DOC_QTY": sum(l.qty for l in doc.lines),
             "PICKED_QTY": sum(a["QTY_PICKED"] for a in doc_alloc),
+            "WMS_QTY": sum(float(r["QTY"]) for r in doc_detail),
+            "VERIFY": "✅ OK",
             "PALLETS": len({a["PALLET"] for a in doc_alloc}),
             "PLANTS": ", ".join(sorted({a["PLANT"] for a in doc_alloc})),
             "SOURCE_FILE": doc.source_file,
@@ -445,6 +460,7 @@ def run_pick(
         "rejected": pd.DataFrame(rejected, columns=["DOC_NUMBER", "DOC_TYPE", "REASON",
                                                     "DETAIL", "SOURCE_FILE"]),
         "shortage": pd.DataFrame(shortages),
+        "verify": pd.DataFrame(verify_rows, columns=VERIFY_COLS),
         "accepted": pd.DataFrame(accepted),
         "balance": pallet_balance(inv, alloc_df),
         "cfg": cfg,
@@ -453,6 +469,167 @@ def run_pick(
 
 def _qty_str(q: float) -> str:
     return str(int(round(q))) if abs(q - round(q)) < 1e-9 else f"{q:g}"
+
+
+# --------------------------------------------------------------------------- #
+# Quantity verification — Invoice / DC qty එකට හරියටම ගැලපෙනවද?
+# --------------------------------------------------------------------------- #
+VERIFY_COLS = ["DOC_NUMBER", "DOC_TYPE", "LINE", "ITEM_CODE", "ITEM_NUMBER",
+               "DOC_QTY", "PICKED_QTY", "WMS_QTY", "DIFF", "STATUS"]
+
+_TOL = 1e-6
+
+
+def _verify_doc(doc, doc_alloc: list[dict], doc_detail: list[dict]) -> tuple[list[dict], list[str]]:
+    """
+    Line by line + document total + WMS file total — තුනම match වෙන්න ඕන.
+    Fail වුණොත් document එක reject වෙනවා.
+    """
+    picked: dict[int, float] = {}
+    items: dict[int, set[str]] = {}
+    for a in doc_alloc:
+        picked[a["DOC_LINE"]] = picked.get(a["DOC_LINE"], 0.0) + float(a["QTY_PICKED"])
+        items.setdefault(a["DOC_LINE"], set()).add(str(a["ITEM_NUMBER"]))
+
+    rows: list[dict] = []
+    bad: list[str] = []
+
+    for ln in doc.lines:
+        p = picked.get(ln.line_no, 0.0)
+        diff = p - float(ln.qty)
+        ok = abs(diff) <= _TOL
+        if not ok:
+            bad.append(f"L{ln.line_no} {ln.item_code}: doc {ln.qty:g} ≠ picked {p:g}")
+        rows.append({
+            "DOC_NUMBER": doc.doc_number, "DOC_TYPE": doc.doc_type, "LINE": ln.line_no,
+            "ITEM_CODE": ln.item_code,
+            "ITEM_NUMBER": ", ".join(sorted(items.get(ln.line_no, set()))),
+            "DOC_QTY": float(ln.qty), "PICKED_QTY": p,
+            "WMS_QTY": p, "DIFF": diff, "STATUS": "✅ OK" if ok else "❌ MISMATCH",
+        })
+
+    doc_total = float(sum(l.qty for l in doc.lines))
+    pick_total = float(sum(picked.values()))
+    wms_total = float(sum(float(r["QTY"]) for r in doc_detail))
+
+    if abs(pick_total - doc_total) > _TOL:
+        bad.append(f"Document total: doc {doc_total:g} ≠ picked {pick_total:g}")
+    if abs(wms_total - doc_total) > _TOL:
+        bad.append(f"WMS file total: doc {doc_total:g} ≠ OutBound Detail {wms_total:g}")
+    if doc.declared_qty is not None and abs(doc.declared_qty - pick_total) > _TOL:
+        bad.append(f"Document 'Total Quantity' {doc.declared_qty:g} ≠ picked {pick_total:g}")
+
+    rows.append({
+        "DOC_NUMBER": doc.doc_number, "DOC_TYPE": doc.doc_type, "LINE": "TOTAL",
+        "ITEM_CODE": f"{len(doc.lines)} lines",
+        "ITEM_NUMBER": (f"doc says {doc.declared_qty:g}"
+                        if doc.declared_qty is not None else ""),
+        "DOC_QTY": doc_total, "PICKED_QTY": pick_total, "WMS_QTY": wms_total,
+        "DIFF": pick_total - doc_total,
+        "STATUS": "✅ OK" if not bad else "❌ MISMATCH",
+    })
+    return rows, bad
+
+
+# --------------------------------------------------------------------------- #
+# Per LOAD_ID slicing / files
+# --------------------------------------------------------------------------- #
+def safe_name(text: Any, fallback: str = "DOC") -> str:
+    """'333/26-27/62' -> '333-26-27-62' (filename safe LOAD_ID)"""
+    s = re.sub(r"[\\/:*?\"<>|\s]+", "-", str(text or "").strip())
+    s = re.sub(r"-{2,}", "-", s).strip("-.")
+    return s or fallback
+
+
+def _slice(df: pd.DataFrame, col: str, value: str) -> pd.DataFrame:
+    if df is None or not len(df) or col not in df.columns:
+        return pd.DataFrame(columns=df.columns if df is not None else [])
+    return df[df[col].astype(str) == str(value)].reset_index(drop=True)
+
+
+def doc_bundle(res: dict[str, Any], load_id: str) -> dict[str, Any]:
+    """එක LOAD_ID එකකට අදාල ඔක්කොම — master · detail · allocation · verify · info."""
+    acc = res["accepted"]
+    row = acc[acc["DOC_NUMBER"].astype(str) == str(load_id)]
+    info: dict[str, Any] = row.iloc[0].to_dict() if len(row) else {"DOC_NUMBER": load_id}
+    cfg: EngineConfig = res.get("cfg") or EngineConfig()
+    master = _slice(res["master"], "DISPLAY_ORDER_NUMBER", load_id)
+    detail = _slice(res["detail"], "DISPLAY_ORDER_NUMBER", load_id)
+    alloc = _slice(res["allocations"], "DOC_NUMBER", load_id)
+    verify = _slice(res.get("verify", pd.DataFrame()), "DOC_NUMBER", load_id)
+    return {
+        "load_id": str(load_id),
+        "safe": safe_name(load_id),
+        "master": master, "detail": detail, "allocations": alloc, "verify": verify,
+        "info": {
+            "LOAD_ID": str(load_id),
+            "DOC_NUMBER": str(load_id),
+            "DOC_TYPE": info.get("DOC_TYPE", ""),
+            "DOC_DATE": info.get("DOC_DATE", ""),
+            "REF_NUMBER": info.get("REF_NUMBER", ""),
+            "PLANT": info.get("PLANTS", ""),
+            "LINES": info.get("LINES", len(detail)),
+            "TOTAL_QTY": info.get("DOC_QTY", 0),
+            "PALLETS": info.get("PALLETS", 0),
+            "VERIFY": info.get("VERIFY", ""),
+            "SOURCE_FILE": info.get("SOURCE_FILE", ""),
+            "RUN_ID": res.get("run_id", ""),
+            "PICK_DATE": res.get("pick_date", ""),
+            "STRATEGY": cfg.strategy,
+            "WH_ID": cfg.wh_id,
+            "CLIENT": cfg.client_code,
+        },
+    }
+
+
+def load_ids(res: dict[str, Any]) -> list[str]:
+    acc = res.get("accepted")
+    if acc is None or not len(acc):
+        return []
+    return [str(x) for x in acc["DOC_NUMBER"].tolist()]
+
+
+def build_zip(files: list[tuple[str, bytes]]) -> bytes:
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, data in files:
+            if data:
+                z.writestr(name, data)
+    return buf.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# Global search
+# --------------------------------------------------------------------------- #
+def search_frames(query: str, frames: dict[str, pd.DataFrame],
+                  limit: int = 400) -> dict[str, pd.DataFrame]:
+    """
+    ඕනෑම data එකක් — word කීපයක් දුන්නොත් ඔක්කොම තියෙන rows විතරයි (AND).
+    """
+    terms = [t.strip().lower() for t in str(query).split() if t.strip()]
+    out: dict[str, pd.DataFrame] = {}
+    if not terms:
+        return out
+    for name, df in frames.items():
+        if df is None or not len(df):
+            continue
+        try:
+            joined = None
+            for c in df.columns:
+                col = df[c].astype("string").fillna("").str.lower()
+                joined = col if joined is None else joined.str.cat(col, sep=" | ")
+            if joined is None:
+                continue
+            mask = pd.Series(True, index=df.index)
+            for t in terms:
+                mask &= joined.str.contains(re.escape(t), na=False)
+            hit = df[mask]
+            if len(hit):
+                out[name] = hit.head(limit).reset_index(drop=True)
+        except Exception:
+            continue
+    return out
 
 
 def pallet_balance(inv: pd.DataFrame, alloc_df: pd.DataFrame) -> pd.DataFrame:
@@ -524,7 +701,8 @@ def build_report_excel(res: dict[str, Any]) -> bytes:
     """Pick report — allocations, pallet balance, shortage, rejected."""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        for name, key in [("Doc Summary", "accepted"), ("Pallet Allocation", "allocations"),
+        for name, key in [("Doc Summary", "accepted"), ("Qty Verification", "verify"),
+                          ("Pallet Allocation", "allocations"),
                           ("Pallet Balance", "balance"), ("Shortage", "shortage"),
                           ("Rejected Docs", "rejected")]:
             df = res.get(key)

@@ -16,6 +16,7 @@ import streamlit as st
 
 import doc_parser as P
 import pick_engine as E
+import pick_pdf as PP
 
 st.set_page_config(page_title="Donaldson OutBound Pick", page_icon="📦", layout="wide")
 
@@ -182,6 +183,54 @@ with st.sidebar:
             st.warning("Document completeness gate off — parse එක ඇස්සෙන් check කරන්න.")
         pick_date = st.date_input("Pick Date", value=datetime.now())
 
+    with st.expander("📧 Email settings", expanded=False):
+        book = st.session_state.get("mail_book")
+        if book is None:
+            book = str(conf.get("mail_to", ""))
+            if gs_ready:
+                try:
+                    import gsheet
+                    book = gsheet.read_setting(sa_info, sheet_key, "MAIL_TO", book) or book
+                except Exception:
+                    pass
+            st.session_state["mail_book"] = book
+
+        saved = PP._addr_list(st.session_state.get("mail_book", ""))
+        mail_to = st.multiselect("To (save කරපු addresses)", options=saved, default=saved)
+        extra_to = st.text_input("තව address (comma වලින්)", key="mail_extra")
+        mail_to = list(mail_to) + PP._addr_list(extra_to)
+        mail_cc = st.text_input("Cc", value=str(conf.get("mail_cc", "")))
+        mail_from = st.text_input("From (ඔයාගේ mail)", value=str(conf.get("mail_from", "")))
+        mail_sign = st.text_area("Signature", value=str(conf.get("mail_sign",
+                                                                "Thanks & regards,")),
+                                 height=70)
+
+        new_addr = st.text_input("➕ Address book එකට add කරන්න")
+        ab1, ab2 = st.columns(2)
+        if ab1.button("Add", use_container_width=True) and PP._addr_list(new_addr):
+            merged = PP._addr_list(st.session_state.get("mail_book", "")) \
+                + PP._addr_list(new_addr)
+            st.session_state["mail_book"] = ", ".join(dict.fromkeys(merged))
+            if gs_ready:
+                try:
+                    import gsheet
+                    gsheet.save_setting(sa_info, sheet_key, "MAIL_TO",
+                                        st.session_state["mail_book"])
+                except Exception as ex:
+                    st.warning(f"Sheet save error: {ex}")
+            st.rerun()
+        if ab2.button("Clear book", use_container_width=True):
+            st.session_state["mail_book"] = ""
+            if gs_ready:
+                try:
+                    import gsheet
+                    gsheet.save_setting(sa_info, sheet_key, "MAIL_TO", "")
+                except Exception:
+                    pass
+            st.rerun()
+        if saved:
+            st.caption("Book: " + ", ".join(saved))
+
     st.divider()
     st.subheader("💾 Google Sheet")
     if gs_ready:
@@ -231,8 +280,8 @@ with st.sidebar:
 
 appbar(gs_ready, "Körber One · INM0DONA" if gs_ready else "download-only mode")
 
-tab_gen, tab_bal, tab_hist, tab_help = st.tabs(
-    ["🚀 Pick Generate", "📦 Pallet Balance", "📜 History", "📘 Guide"]
+tab_gen, tab_search, tab_bal, tab_hist, tab_help = st.tabs(
+    ["🚀 Pick Generate", "🔎 Search", "📦 Pallet Balance", "📜 History", "📘 Guide"]
 )
 
 # =========================================================================== #
@@ -257,12 +306,16 @@ with tab_gen:
         sig = tuple(sorted((f.name, f.size) for f in f_docs))
         if st.session_state.get("doc_sig") != sig:
             parsed = []
+            raw: dict[str, bytes] = {}
             with st.spinner("PDF read කරනවා..."):
                 for f in f_docs:
                     try:
-                        parsed.append(P.parse_pdf(f.getvalue(), f.name))
+                        data = f.getvalue()
+                        raw[f.name] = data
+                        parsed.append(P.parse_pdf(data, f.name))
                     except Exception as ex:
                         st.error(f"{f.name} — parse error: {ex}")
+            st.session_state["doc_bytes"] = raw
             st.session_state["doc_sig"] = sig
             st.session_state["docs"] = parsed
             st.session_state["doc_frame"] = P.docs_to_frame(parsed)
@@ -413,6 +466,15 @@ with tab_gen:
                   f"{pd.to_numeric(alloc['QTY_PICKED'], errors='coerce').sum():g}"
                   if len(alloc) else "0")
 
+        vdf = res.get("verify", pd.DataFrame())
+        bad_v = vdf[vdf["STATUS"].astype(str).str.contains("MISMATCH")] if len(vdf) else vdf
+        if len(vdf) and not len(bad_v):
+            st.success("🔢 Quantity verify — Invoice / DC qty එකට **හරියටම** ගැලපෙනවා "
+                       "(line · document total · WMS file total).")
+        elif len(bad_v):
+            st.error("🔢 Quantity mismatch! මේ documents pick කළේ නෑ:")
+            st.dataframe(bad_v, hide_index=True, use_container_width=True)
+
         if len(rej):
             with st.expander(f"⛔ Pick කරන්න බැරි වුණ documents ({len(rej)})", expanded=True):
                 st.dataframe(rej, hide_index=True, use_container_width=True)
@@ -420,9 +482,9 @@ with tab_gen:
                     st.caption("Stock short lines:")
                     st.dataframe(res["shortage"], hide_index=True, use_container_width=True)
 
-        t1, t2, t3, t4, t5 = st.tabs(["🧾 OutBound MASTER", "📋 OutBound Detail",
-                                      "🎯 Pallet Allocation", "📦 Pallet Balance",
-                                      "✅ Doc Summary"])
+        t1, t2, t3, t4, t5, t6 = st.tabs(["🧾 OutBound MASTER", "📋 OutBound Detail",
+                                          "🎯 Pallet Allocation", "📦 Pallet Balance",
+                                          "🔢 Qty Verify", "✅ Doc Summary"])
         with t1:
             st.dataframe(res["master"], hide_index=True, use_container_width=True, height=280)
         with t2:
@@ -433,25 +495,134 @@ with tab_gen:
         with t4:
             st.dataframe(res["balance"], hide_index=True, use_container_width=True, height=380)
         with t5:
+            st.caption("Invoice / DC එකේ Quantity එකට **හරියටම** ගැලපෙනවද — line by line, "
+                       "document total, WMS file total.")
+            st.dataframe(res["verify"], hide_index=True, use_container_width=True, height=380)
+        with t6:
             st.dataframe(acc, hide_index=True, use_container_width=True, height=280)
 
-        st.subheader("⬇️ Downloads")
-        stamp = datetime.now().strftime("%Y%m%d_%H%M")
-        d1, d2 = st.columns(2)
-        with d1:
-            st.download_button(
-                "📥 WMS Upload file (OutBound MASTER + Detail)",
-                data=E.build_wms_excel(res["master"], res["detail"]),
-                file_name=f"OutBound_Upload_{stamp}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True, disabled=not len(res["master"]))
-        with d2:
-            st.download_button(
-                "📊 Pick Report (allocation / balance / rejected)",
-                data=E.build_report_excel(res),
-                file_name=f"Pick_Report_{stamp}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True)
+        # ------------------------------------------------------------------ #
+        # Downloads — LOAD_ID එකෙන් save
+        # ------------------------------------------------------------------ #
+        st.divider()
+        st.subheader("⬇️ Downloads — LOAD_ID එකෙන්")
+        ids = E.load_ids(res)
+        src_map = st.session_state.get("doc_bytes", {})
+
+        if not ids:
+            st.warning("Pick වුණ document නෑ — download කරන්න දෙයක් නෑ.")
+        else:
+            attach_src = st.checkbox("PDF එකට upload කරපු Invoice / DC pages එකතු කරන්න",
+                                     value=True)
+
+            cache_key = (res["run_id"], bool(attach_src))
+            if st.session_state.get("bundle_key") != cache_key:
+                with st.spinner("PDF + Excel හදනවා..."):
+                    made = {}
+                    zfiles: list[tuple[str, bytes]] = []
+                    for lid in ids:
+                        b = E.doc_bundle(res, lid)
+                        b["xlsx"] = E.build_wms_excel(b["master"], b["detail"])
+                        b["pdf"] = PP.build_doc_pdf(
+                            b["info"], b["allocations"], b["verify"],
+                            src_map.get(b["info"].get("SOURCE_FILE", "")),
+                            attach_source=attach_src)
+                        made[lid] = b
+                        zfiles += [(f"{b['safe']}.xlsx", b["xlsx"]),
+                                   (f"{b['safe']}.pdf", b["pdf"])]
+                    st.session_state["bundles"] = made
+                    st.session_state["zipfile"] = E.build_zip(zfiles)
+                    st.session_state["bundle_key"] = cache_key
+            bundles = st.session_state["bundles"]
+
+            for lid in ids:
+                b = bundles[lid]
+                with st.container(border=True):
+                    h1, h2, h3 = st.columns([2, 1, 1])
+                    i = b["info"]
+                    h1.markdown(f"**LOAD ID `{lid}`** · {i.get('DOC_TYPE','')} · "
+                                f"{i.get('LINES','')} lines · Qty "
+                                f"{E._qty_str(float(i.get('TOTAL_QTY') or 0))} · "
+                                f"{i.get('PALLETS','')} pallets · {i.get('VERIFY','')}")
+                    if b["safe"] != lid:
+                        h1.caption(f"File name: `{b['safe']}` (`/` filename වලට දාන්න බෑ)")
+                    h2.download_button("📥 Excel", data=b["xlsx"],
+                                       file_name=f"{b['safe']}.xlsx",
+                                       mime="application/vnd.openxmlformats-officedocument."
+                                            "spreadsheetml.sheet",
+                                       use_container_width=True, key=f"x_{b['safe']}")
+                    h3.download_button("🏷️ PDF + QR", data=b["pdf"],
+                                       file_name=f"{b['safe']}.pdf",
+                                       mime="application/pdf", use_container_width=True,
+                                       key=f"p_{b['safe']}")
+
+            st.markdown("**සියල්ලම එකට**")
+            z1, z2, z3 = st.columns(3)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M")
+            z1.download_button("🗜️ ZIP (හැම LOAD_ID එකකටම Excel + PDF)",
+                               data=st.session_state["zipfile"],
+                               file_name=f"OutBound_{stamp}.zip",
+                               mime="application/zip", use_container_width=True)
+            z2.download_button("📚 එකම Excel එකක (ඔක්කොම docs)",
+                               data=E.build_wms_excel(res["master"], res["detail"]),
+                               file_name=f"OutBound_Upload_{stamp}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument."
+                                    "spreadsheetml.sheet", use_container_width=True)
+            z3.download_button("📊 Pick Report", data=E.build_report_excel(res),
+                               file_name=f"Pick_Report_{stamp}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument."
+                                    "spreadsheetml.sheet", use_container_width=True)
+
+            # -------------------------------------------------------------- #
+            # Email
+            # -------------------------------------------------------------- #
+            st.divider()
+            st.subheader("📧 Email — pick details")
+            pick_for_mail = st.multiselect("මොන LOAD_ID ද mail එකට", ids, default=ids)
+            infos = [bundles[l]["info"] for l in pick_for_mail]
+            m_alloc = alloc[alloc["DOC_NUMBER"].astype(str).isin(pick_for_mail)] \
+                if len(alloc) else alloc
+
+            if infos:
+                subj0, body0, html0 = PP.pick_email_text(infos, m_alloc, mail_sign)
+                e1, e2 = st.columns([2, 1])
+                subject = e1.text_input("Subject", value=subj0, key="mail_subject")
+                add_att = e2.checkbox("Excel + PDF attach කරන්න", value=True)
+                body = st.text_area("Body", value=body0, height=240, key="mail_body")
+
+                to_list = PP._addr_list(mail_to)
+                cc_list = PP._addr_list(mail_cc)
+                if not to_list:
+                    st.warning("Sidebar → **📧 Email settings** එකේ 'To' address එකක් දාන්න.")
+                st.caption(f"To: {', '.join(to_list) or '—'}"
+                           + (f"  ·  Cc: {', '.join(cc_list)}" if cc_list else ""))
+
+                atts: list[tuple[str, bytes, str]] = []
+                if add_att:
+                    for l in pick_for_mail:
+                        b = bundles[l]
+                        atts.append((f"{b['safe']}.xlsx", b["xlsx"],
+                                     "application/vnd.openxmlformats-officedocument."
+                                     "spreadsheetml.sheet"))
+                        atts.append((f"{b['safe']}.pdf", b["pdf"], "application/pdf"))
+
+                mc1, mc2 = st.columns(2)
+                with mc1:
+                    st.link_button("✉️ Default mail app එකෙන් open කරන්න",
+                                   PP.mailto_link(to_list, subject, body, cc_list),
+                                   use_container_width=True,
+                                   disabled=not to_list)
+                    st.caption("mailto: — attachment යන්නේ නෑ, body විතරයි.")
+                with mc2:
+                    st.download_button(
+                        "📎 Draft (.eml) download — attachment එක්ක",
+                        data=PP.build_eml(to_list, subject, body, html0, cc_list,
+                                          sender=mail_from, attachments=atts),
+                        file_name=f"PICK_{E.safe_name(pick_for_mail[0])}"
+                                  f"{'_+' + str(len(pick_for_mail) - 1) if len(pick_for_mail) > 1 else ''}.eml",
+                        mime="message/rfc822", use_container_width=True)
+                    st.caption("Double-click කරාම Outlook/Mail එකේ draft එකක් විදිහට "
+                               "attachment එක්කම open වෙනවා.")
 
         if gs_ready and not autosave and st.session_state.get("saved") != res["run_id"]:
             if st.button("📝 Google Sheet එකට save කරන්න"):
@@ -465,8 +636,86 @@ with tab_gen:
                 except Exception as ex:
                     st.error(f"Save error: {ex}")
 
+
 # =========================================================================== #
-# TAB 2 — Pallet balance
+# TAB — Global search
+# =========================================================================== #
+with tab_search:
+    st.subheader("🔎 Search — ඕනෑම data එකක්")
+    st.caption("Item code · LOAD ID · pallet · location · GRN · plant · lot — "
+               "ඕන දෙයක් type කරන්න. Word කීපයක් දුන්නොත් ඔක්කොම තියෙන rows විතරයි.")
+
+    q = st.text_input("🔍", placeholder="උදා:  P550945   ·   333262712337   ·   "
+                                       "IMDS01 P502639   ·   DONAL130826",
+                      label_visibility="collapsed", key="global_q")
+
+    frames: dict[str, pd.DataFrame] = {}
+    res_s = st.session_state.get("result")
+    if st.session_state.get("doc_frame") is not None:
+        frames["📄 Document lines"] = st.session_state["doc_frame"]
+    if res_s:
+        frames["🎯 Pallet Allocation"] = res_s["allocations"]
+        frames["📋 OutBound Detail"] = res_s["detail"]
+        frames["🧾 OutBound MASTER"] = res_s["master"]
+        frames["🔢 Qty Verify"] = res_s.get("verify", pd.DataFrame())
+        frames["⛔ Rejected"] = res_s["rejected"]
+
+    src = st.multiselect(
+        "කොහෙන්ද හොයන්නේ",
+        options=["Current run", "Inventory (stock)", "Google Sheet — ledger",
+                 "Google Sheet — registry", "Google Sheet — detail"],
+        default=["Current run", "Inventory (stock)"],
+    )
+
+    if "Inventory (stock)" in src and st.session_state.get("inv_raw") is not None:
+        led = None
+        if gs_ready:
+            try:
+                import gsheet
+                led = gsheet.read_ledger(sa_info, sheet_key)
+            except Exception:
+                led = None
+        frames["📦 Inventory / balance"] = E.stock_view(st.session_state["inv_raw"], led)
+    if "Current run" not in src:
+        for k in ["🎯 Pallet Allocation", "📋 OutBound Detail", "🧾 OutBound MASTER",
+                  "🔢 Qty Verify", "⛔ Rejected", "📄 Document lines"]:
+            frames.pop(k, None)
+    if gs_ready:
+        try:
+            import gsheet
+            if "Google Sheet — ledger" in src:
+                frames["📜 Sheet · PALLET_LEDGER"] = gsheet.read_ws(sa_info, sheet_key,
+                                                                   gsheet.WS_LEDGER)
+            if "Google Sheet — registry" in src:
+                frames["📜 Sheet · DOC_REGISTRY"] = gsheet.read_ws(sa_info, sheet_key,
+                                                                  gsheet.WS_REGISTRY)
+            if "Google Sheet — detail" in src:
+                frames["📜 Sheet · OUTBOUND_DETAIL"] = gsheet.read_ws(sa_info, sheet_key,
+                                                                     gsheet.WS_DETAIL)
+        except Exception as ex:
+            st.warning(f"Google Sheet read error: {ex}")
+
+    if not q.strip():
+        st.info("ⓘ හොයන්න ඕන දේ type කරන්න.")
+    elif not frames:
+        st.warning("Search කරන්න data නෑ — Generate tab එකෙන් upload කරන්න.")
+    else:
+        hits = E.search_frames(q, frames)
+        total = sum(len(v) for v in hits.values())
+        if not total:
+            st.warning(f"'{q}' — කිසිම තැනක නෑ.")
+        else:
+            st.success(f"**{total}** rows · {len(hits)} තැනක හම්බුණා")
+            for name, df in hits.items():
+                with st.expander(f"{name} — {len(df)} rows", expanded=len(hits) <= 2):
+                    st.dataframe(df, hide_index=True, use_container_width=True,
+                                 height=min(420, 60 + 32 * len(df)))
+                    st.download_button("⬇️ CSV", data=df.to_csv(index=False).encode(),
+                                       file_name=f"search_{E.safe_name(name)}.csv",
+                                       mime="text/csv", key=f"dl_{name}")
+
+# =========================================================================== #
+# TAB — Pallet balance
 # =========================================================================== #
 with tab_bal:
     st.subheader("📦 Pallet-level balance")
