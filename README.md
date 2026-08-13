@@ -1,183 +1,153 @@
-# VIP Pick Generation System
+# Donaldson OutBound Pick Generator
 
-Python + Streamlit + Google Sheets + GitHub system that turns a **Requirement**
-file into two warehouse pick deliverables for the VIP Industries / EFL 3PL flow:
-
-- **INDIA_SO_Pick.xlsx** — WMS upload format (`OutBound MASTER` + `OutBound Detail`)
-- **VIP_PICK.xlsx** — pick summary sheet with CBM / time estimate block
-
-The whole pipeline is driven by one validated engine (`pick_engine.py`) and
-exposed through a Streamlit UI (`app.py`).
-
-**Flow:** upload **Requirement** + **Inventory_Report** Excel files →
-**SKU_MASTER** is read from a Google Sheet (managed/uploaded in the app's
-🗂️ SKU_MASTER tab) → before generating, any Requirement material missing from
-SKU_MASTER is flagged so it can be added first → generate the two deliverables.
-
----
-
-## සිංහල — කෙටි විස්තරය
-
-මේ system එක `Requirement` file එක අරගෙන:
-
-1. `SKU_MASTER` එකෙන් එක් එක් Material එකේ **Category (LOOSE/SET)**, **HJ**, **SAP** lookup කරනවා.
-2. `Inventory_Report` එකෙන් **box size** (Actual Qty mode), **CBM**, සහ **available qty** ගන්නවා.
-3. carton rounding logic එකෙන් **HJ Box Qty / HJ Pcs Qty** calculate කරනවා.
-4. **INDIA SO Pick** සහ **VIP PICK** Excel දෙක generate කරනවා.
-
-Input එක Excel upload කරලාවත්, Google Sheet එකකින්වත් දෙන්න පුළුවන්.
-Output Excel දෙක download කරගන්න පුළුවන්, ඕනෙ නම් ආපහු Google Sheet එකකට write කරන්නත් පුළුවන්.
-
----
-
-## Pick logic (authoritative)
-
-For every requirement line:
+Invoice / Delivery Challan **PDF** + **Inventory Report** → pallet-level pick →
+Google Sheet ledger + **`OutBound MASTER` / `OutBound Detail`** Excel (Körber One upload).
 
 ```
-mult        = HJ / SAP            (pieces per requirement / order unit)
-                LOOSE : SAP == HJ  -> mult = 1     -> pick = Req Qty pieces
-                SET   : SAP divides HJ -> mult = set size (e.g. 3)
-target_pcs  = Req Qty * mult
-available   = sum of Inventory_Report "Actual Qty" for that Item Number
-```
-
-We pick **whole order-units**, never exceeding available stock:
-
-```
-units_available = available // mult
-units_picked    = min(Req Qty, units_available)
-HJ Pcs Qty      = units_picked * mult       (pieces -> INDIA SO Detail QTY)
-HJ Box Qty      = units_picked
-Pcs/Box         = mult
-Short Variance  = target_pcs - HJ Pcs Qty   (only if stock is short)
-```
-
-| Example | Req | Cat | SAP | HJ | mult | Available | Pick |
-|---|---|---|---|---|---|---|---|
-| LOOSE | 4 | LOOSE | 1 | 1 | 1 | 4 | **4** |
-| SET   | 2 | SET | 1 | 3 | 3 | 186 | **6** (2×3) |
-| SET   | 2 | SET | 1 | 2 | 2 | 4 | **4** (2×2) |
-| LOOSE | 2 | LOOSE | 1 | 1 | 1 | 28 | **2** |
-
-The match is done by **Requirement Material -> Inventory Item Number**, summing
-that item's Actual Qty across all pallets. **Nothing is ever picked beyond the
-sum of Actual Qty** (whole order-units only).
-
-### Cannot-Pick report (separate)
-A line is reported in **Cannot Pick** (a sheet in VIP PICK, a tab in the app,
-and a Google Sheet worksheet) when:
-
-- **Insufficient stock** — `target_pcs` exceeds available; the whole units that
-  fit are still picked, and the short part is shown as **Short Variance** with
-  **Picked Pcs**.
-- **Missing SKU / inventory data** — material not in SKU_MASTER and/or inventory.
-  (The app also pre-checks the Requirement and asks you to add missing materials
-  to SKU_MASTER before generating.)
-
-### INDIA SO attributes
-`GEN_ATTRIBUTE_VALUE1..11` in the OutBound Detail are filled from the
-Inventory_Report, matched per item:
-Color, Size, Style, Supplier, Plant, Client So, Client So Line, Po Cust Dec,
-Customer Ref Number, Item Id, Invoice Number1.
-
-### HighJump-compatible empty cells
-Blank cells in the INDIA SO file are written as **truly empty** cells (not empty
-strings), so HighJump validations such as `cartonLabel` (000-999) accept them.
-
-## Project layout
-
-```
-vip-pick-system/
-├── app.py                      # Streamlit UI
-├── pick_engine.py              # validated calculation + Excel writers
-├── gsheet.py                   # Google Sheets read/write helper
-├── test_engine.py              # validation harness (166/169 guard)
-├── requirements.txt
-├── README.md
-├── .gitignore
-├── .streamlit/
-│   ├── config.toml             # theme
-│   └── secrets.toml.example    # Google service-account template
-└── sample_data/                # the 5 reference files for local testing
+app.py          Streamlit UI (4 tabs)
+doc_parser.py   Donaldson Invoice + Delivery Challan PDF parser
+pick_engine.py  matching · allocation · WMS output · Excel writers
+gsheet.py       Google Sheet ledger / registry / history
 ```
 
 ---
 
-## Run locally
+## 1. Setup
 
 ```bash
 pip install -r requirements.txt
-# or, on Microsoft Store Python:
-python -m pip install -r requirements.txt
-
 streamlit run app.py
-# or:
-python -m streamlit run app.py
 ```
 
-Run the validation test any time you touch the engine:
+`.streamlit/secrets.toml`:
 
-```bash
-python test_engine.py
+```toml
+[gcp_service_account]
+type = "service_account"
+project_id = "..."
+private_key_id = "..."
+private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+client_email = "xxx@yyy.iam.gserviceaccount.com"
+client_id = "..."
+token_uri = "https://oauth2.googleapis.com/token"
+
+[google_sheet]
+data_sheet  = "https://docs.google.com/spreadsheets/d/<SHEET_KEY>/edit"
+auto_save   = true
+wh_id       = "INMM01"
+client_code = "INM0DONA"
 ```
 
----
+Sheet එක service-account email එකට **Editor** විදිහට share කරන්න.
+පළවෙනි වතාවට sidebar එකේ **🆕 Initialize worksheets** click කරන්න.
 
-## Google Sheets setup (optional input/output)
-
-1. Google Cloud Console → create a **service account** → create a **JSON key**.
-2. Enable **Google Sheets API** and **Google Drive API** for the project.
-3. Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`, paste
-   your JSON values under `[gcp_service_account]`, and set the `[google_sheet]`
-   section — `data_sheet` (the Sheet URL or key), `sku_worksheet`, `auto_save`,
-   `load_id_registry`. The app reads the sheet connection from here, **not** the UI.
-4. **Share** the target Google Sheet with the service-account `client_email`
-   (Editor access).
-5. The sidebar shows **✅ Google Sheet — secrets වලින් connected** when both the
-   credentials and `[google_sheet] data_sheet` are set. SKU_MASTER worksheet
-   defaults to `SKU_MASTER`.
-6. Open the **🗂️ SKU_MASTER** tab and click **🆕 Initialize sheet** once — this
-   auto-creates every required worksheet with headers (works on a brand-new
-   empty sheet). Auto-save also ensures the worksheets exist on each run.
-
-The app reads/creates these worksheets in that one Data Sheet:
-
-| Worksheet | Purpose | Updated |
-|---|---|---|
-| `SKU_MASTER` | SKU master data (CRUD source) | on Save |
-| `VIP PICK`, `CBM Summary`, `OutBound MASTER`, `OutBound Detail`, `LOAD ID QR` | latest run outputs | overwrite each run |
-| `Cannot Pick` | carton-split / stock-short lines | overwrite each run |
-| `LOAD_ID Registry` | every LOAD ID ever used (uniqueness) | append |
-| `History YYYY-MM` | monthly pick history | append |
-| `Run Log` | one summary row per run | append |
+Google Sheet නැතුවත් app එක වැඩ කරනවා — Excel download විතරක් (ledger / duplicate check නෑ).
 
 ---
 
-## Deploy to Streamlit Cloud (via GitHub)
+## 2. Flow
 
-1. Create a new GitHub repo and push this folder:
-   ```bash
-   git init
-   git add .
-   git commit -m "VIP pick generation system"
-   git branch -M main
-   git remote add origin https://github.com/<you>/vip-pick-system.git
-   git push -u origin main
-   ```
-   (`.gitignore` already keeps `secrets.toml` and generated `*.xlsx` out of the repo.)
-2. Go to **share.streamlit.io** → **New app** → pick the repo, branch `main`,
-   main file `app.py`.
-3. In **App → Settings → Secrets**, paste your `[gcp_service_account]` block
-   (only needed if you use the Google Sheets source).
-4. Deploy.
+1. **Upload** — Invoice / DC PDF (කීයක් හරි) + Inventory Report Excel.
+2. **Parse + completeness check** — S.No sequence · `Total Quantity` · `Grand Total`.
+   Fail වුණොත් ⛔ — **pick කරන්නේ නෑ**.
+   Parse එක වැරදුනොත් *Lines review / edit* table එකෙන් හදන්න පුළුවන්.
+3. **Plant confirm** — inventory එකේ තියෙන plant ටික පෙන්නලා confirm ගන්නවා.
+   Confirm කරන කල් generate button එක enable වෙන්නේ නෑ.
+4. **Pick** — pallet level, FIFO (හෝ තෝරගත්ත strategy එකට).
+5. **Save + download** — Google Sheet එකට append + Excel 2ක් download.
 
 ---
 
-## Notes
-- All WMS constants (WH_ID `LPGL`, CLIENT_CODE `INM0VIP`, ORDER_TYPE
-  `Sales Orders`, etc.) are editable in the sidebar "WMS constants" expander.
-- **Reset data** (sidebar 🧹): clear the current session result, or reset the
-  Google Sheet data by scope — outputs, monthly history tabs, LOAD_ID Registry,
-  Run Log, and optionally SKU_MASTER. Needs an explicit confirm tick; SKU_MASTER
-  is left out by default so master data isn't wiped accidentally.
+## 3. Rules
+
+| Rule | Implementation |
+|---|---|
+| Item match — base ID විතරයි | `P162400-000-140` → `P162400`. Inventory `P162400-016-140` ගැලපෙනවා |
+| Exact item priority | Base ID එක ගැලපුනත් full item number එකට මුල් තැන (option) |
+| Plant | Confirm කරපු plant(s) එකෙන් විතරයි |
+| Document complete නැත්නම් pick නෑ | Qty total / amount total / S.No sequence mismatch → `INCOMPLETE DOCUMENT` |
+| Stock මදි නම් pick නෑ | එක line එකක් මදි වුණත් **මුළු document එකම** reject (`STOCK SHORT`). Partial pick නෑ |
+| Duplicate | Batch එකේ + `DOC_REGISTRY` sheet එකේ check → එකක් විතරයි |
+| Pallet level save | `QTY_BEFORE → QTY_PICKED → QTY_BALANCE` හැම pallet එකකටම `PALLET_LEDGER` එකට |
+| Next run balance | Ledger එකේ commit වුණු qty, inventory එකෙන් අඩු කරලා pick කරනවා |
+
+**Pick strategies**
+
+* `FIFO` — පරණ stock මුලින් (default)
+* `SINGLE_PALLET_FIRST` — හැකි නම් එක pallet එකෙන් (pallet touch අඩුයි)
+* `LEAST_PALLETS` — ලොකු pallet මුලින්
+
+---
+
+## 4. Output — `OutBound_Upload_*.xlsx`
+
+හැම cell එකක්ම **text** (`number_format = "@"`), හිස් cell **හිස්මයි** (WMS එකට ඕන විදිහට).
+
+### Sheet `OutBound MASTER` (101 columns)
+
+| Column | Value |
+|---|---|
+| `DISPLAY_ORDER_NUMBER` | Invoice No / DC No |
+| `STORE_ORDER_NUMBER` | Invoice No / DC No |
+| `CUSTOMER_PO_NUMBER` | Invoice No / DC No |
+| `LOAD_ID` | Invoice No / DC No |
+| `PROCESSING_CODE` | `NEW` |
+| `WH_ID` / `CLIENT_CODE` / `ORDER_TYPE` | sidebar values (`INMM01` / `INM0DONA` / `Sales Orders`) |
+| `BACKORDER`, `PARTIAL_ORDER_FLAG`, `SAT_DELIVERY_FLAG`, `REGISTERED_MAIL_FLAG`, `RESTRICTED_MAIL_FLAG`, `COD_FLAG`, `COD_PAY_TYPE`, `COD_OPTION`, `INSURANCE_FLAG`, `SHIP_TO_RESIDENTIAL_FLAG` | `N` |
+| අනිත් ඔක්කොම | හිස් |
+
+### Sheet `OutBound Detail` (42 columns)
+
+| Column | Source |
+|---|---|
+| `DISPLAY_ORDER_NUMBER` | Invoice No / DC No |
+| `LINE_NUMBER` | 1, 2, 3, … |
+| `DISPLAY_ITEM_NUMBER` | Inventory **Item Number** (WMS එකේ තියෙන හරියටම — trailing `.` වුණත්) |
+| `LOT_NUMBER` | Inventory `Lot Number` |
+| `QTY` | Invoice / DC Quantity |
+| `ORDER_UOM` | Inventory `Uom` |
+| `GEN_ATTRIBUTE_VALUE1` | Color |
+| `GEN_ATTRIBUTE_VALUE2` | Size |
+| `GEN_ATTRIBUTE_VALUE3` | Style |
+| `GEN_ATTRIBUTE_VALUE4` | Supplier |
+| `GEN_ATTRIBUTE_VALUE5` | **Plant** |
+| `GEN_ATTRIBUTE_VALUE6` | Client So |
+| `GEN_ATTRIBUTE_VALUE7` | Client So Line |
+| `GEN_ATTRIBUTE_VALUE8` | Po Cust Dec |
+| `GEN_ATTRIBUTE_VALUE9` | Customer Ref Number |
+| `GEN_ATTRIBUTE_VALUE10` | Item Id |
+| `GEN_ATTRIBUTE_VALUE11` | Invoice Number 1 |
+
+හිස් attribute එකකට `TBC` (sidebar එකෙන් වෙනස් කරන්න පුළුවන්).
+
+එක document line එකක් pallet කීපයකින් pick වුණොත් — item number + lot + uom + attributes
+එකයි නම් **එක detail line එකකට merge** වෙනවා (qty එකතු කරලා). වෙනස් නම් වෙන වෙනම lines.
+
+### `Pick_Report_*.xlsx`
+
+`Doc Summary` · `Pallet Allocation` · `Pallet Balance` · `Shortage` · `Rejected Docs`
+
+---
+
+## 5. Google Sheet worksheets
+
+| Worksheet | Content |
+|---|---|
+| `OUTBOUND_MASTER` | හැම run එකකම master rows |
+| `OUTBOUND_DETAIL` | හැම run එකකම detail rows |
+| `PALLET_LEDGER` | pallet · before · picked · balance · row key |
+| `DOC_REGISTRY` | process කරපු Invoice / DC numbers (duplicate gate) |
+| `REJECTED_LOG` | reject වුණ docs + හේතුව |
+| `RUN_LOG` | run summary |
+
+වැරදුනු run එකක් → sidebar **Reset / Undo** එකට `RUN_ID` දාලා delete කරන්න
+(ledger + registry එකෙන් අයින් වෙනවා, ඒ නිසා ආපහු pick කරන්න පුළුවන්).
+
+---
+
+## 6. ⚠️ Document check bypass
+
+Parse එක හරි වුණත් total එකක් වැරදියට කියවුනොත් — sidebar එකේ
+**Document check bypass** on කරලා pick කරන්න පුළුවන්.
+`DOC_REGISTRY` එකේ `DOC_CHECK = MANUAL OVERRIDE — …` කියලා log වෙනවා.
+**Stock check එක bypass වෙන්නේ නෑ** — stock මදි නම් හැම වෙලේම reject.
