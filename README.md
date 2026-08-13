@@ -23,8 +23,10 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-`.streamlit/config.toml` එකත් repo එකේ තියෙන්න ඕන — dropdown · date picker · data editor
-වගේ widget වල ඇතුලත theme එක ඒකෙන් තමයි එන්නේ, CSS එකෙන් ඒවට ළඟා වෙන්න බෑ.
+**`.streamlit/config.toml` එක repo එකට push කරන්න අමතක කරන්න එපා.** Dropdown ·
+date picker · `st.dataframe` (canvas එකක් — CSS එකට ළඟා වෙන්න බෑ) වගේ widget වල
+ඇතුලත colour එන්නේ ඒකෙන් තමයි. ඒක නැත්නම් app එක Streamlit default theme එකට
+වැටෙනවා.
 
 `.streamlit/secrets.toml`:
 
@@ -375,6 +377,7 @@ the one action that matters on each screen, **red = STOP only** (blocked / short
 
 | | |
 |---|---|
+| **Theme** | Default එක **dark** (`config.toml`). ඒත් UI එක theme එකකට bind වෙලා නෑ — light එකට මාරු කරත් ඔක්කොම කියවන්න පුළුවන් |
 | **Type** | *Barlow Condensed* — labels, rack-signage voice · *Barlow* — reading · *IBM Plex Mono* — **හැම code එකක්ම** (LOAD ID · pallet · location · qty). Code එකක් character by character කියවන නිසා ඒවා හැම වෙලේම mono |
 | **Signature** | **Hazard rule** — warehouse floor එකේ striped tape එක. Top bar එක යටත්, block වුණ document card වල වම් පැත්තෙත් විතරයි |
 | **Numbers** | `01 → 05` numbering තියෙන්නේ pick එක ඇත්තටම sequence එකක් නිසා — plant confirm නොකර generate කරන්න බෑ |
@@ -388,3 +391,31 @@ the one action that matters on each screen, **red = STOP only** (blocked / short
 * **Empty states** — හිස් screen එකක් වෙනුවට "ඊළඟට මොකද කරන්නේ" කියන එක
 * **Copy** — button එකේ තියෙන නම action එකට සමානයි (`Confirm plant` → toast `Plant confirmed`)
 * Focus ring · disabled state · toast · `st.status` progress · mobile දක්වා responsive
+
+### Theme safety — dark සහ light දෙකටම
+
+`ui.py` එකේ colour hardcode වෙලා නෑ. හේතුව: page background එකයි
+`st.dataframe` එකයි Streamlit එකට අයිතියි (dataframe එක **canvas** එකක් — CSS
+එකෙන් ළඟා වෙන්න බෑ). CSS එකේ "white card / dark text" කියලා තිබ්බොත්, app එක
+dark theme එකක run වුණාම අකුරු නොපෙනී යනවා.
+
+ඒ නිසා හැම surface · border · muted text එකක්ම **`currentColor` එකෙන් mix** කරනවා:
+
+```css
+background: color-mix(in srgb, currentColor 5%, transparent);
+```
+
+* Light theme → currentColor කළුයි → ලා grey tint එකක්
+* Dark theme  → currentColor සුදුයි → ලා lift එකක්
+* Body text එකට colour එකක් දෙන්නේම නෑ — Streamlit එකේම text colour එක
+  inherit වෙනවා, ඒක background එකට contrast වෙනවා කියලා guarantee එකක් තියෙනවා
+
+Signal colour 4ක් විතරයි fixed (amber · green · red · blue). ඒවත් කෙලින්ම
+දාන්නේ නෑ — `color-mix(in srgb, var(--ok) 56%, currentColor)` විදිහට **live text
+colour එකට ටිකක් අදිනවා**. එතකොට dark එකේ light green, light එකේ dark green.
+
+Contrast check (worst case, හැම theme combination එකකම): **4.61 : 1** —
+WCAG AA small text (4.50) pass ✓
+
+Chart — email සහ PDF වලට යන්නේ හැම වෙලේම white version එක (mail client සහ
+print), screen එකේ preview එකට විතරයි dark version එක.

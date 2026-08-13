@@ -1,11 +1,12 @@
-# Widget internals (dropdown popovers, data editor, date picker) follow this,
-# so the theme has to be set here — CSS alone cannot reach them.
+# Widget internals — dropdowns, date picker, and the st.dataframe canvas — take
+# their colours from here, not from CSS. Push this file with the repo, otherwise
+# the app falls back to Streamlit's default theme.
 [theme]
-base                    = "light"
-primaryColor            = "#F0A81C"
-backgroundColor         = "#F4F6F8"
-secondaryBackgroundColor = "#FFFFFF"
-textColor               = "#0B1A2B"
+base                     = "dark"
+primaryColor             = "#F0A81C"   # hi-vis amber — primary actions
+backgroundColor          = "#0F1720"   # page
+secondaryBackgroundColor = "#18222E"   # sidebar, inputs, dataframe surface
+textColor                = "#E6EDF5"
 
 [server]
 maxUploadSize = 200

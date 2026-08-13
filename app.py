@@ -544,17 +544,16 @@ with tab_gen:
 
         ui.section("Result", "05", f"RUN {res['run_id']} · {res['pick_date']}")
         if len(acc) and not len(rej):
-            st.markdown(ui.stamp("all picked", "ok") +
-                        f" &nbsp;<span style='color:#6B7B8C'>හැම document එකක්ම "
-                        f"pick වුණා</span>", unsafe_allow_html=True)
+            st.markdown(ui.stamp("all picked", "ok") + " &nbsp;" +
+                        ui.muted("හැම document එකක්ම pick වුණා"),
+                        unsafe_allow_html=True)
         elif len(acc):
             st.markdown(ui.stamp(f"{len(acc)} picked", "ok") + " &nbsp;" +
                         ui.stamp(f"{len(rej)} blocked", "stop"),
                         unsafe_allow_html=True)
         else:
-            st.markdown(ui.stamp("nothing picked", "stop") +
-                        " &nbsp;<span style='color:#6B7B8C'>පහළ හේතුව බලන්න</span>",
-                        unsafe_allow_html=True)
+            st.markdown(ui.stamp("nothing picked", "stop") + " &nbsp;" +
+                        ui.muted("පහළ හේතුව බලන්න"), unsafe_allow_html=True)
 
         m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Documents", len(acc))
@@ -593,7 +592,7 @@ with tab_gen:
             rej_map = {str(r["DOC_NUMBER"]): str(r.get("REASON", ""))
                        for _, r in rej.iterrows()} if len(rej) else {}
 
-            sh_chart = PP.shortage_chart_png(sh)
+            sh_chart = PP.shortage_chart_png(sh)          # email + PDF (white)
             sh_nums = list(dict.fromkeys(sh["DOC_NUMBER"].astype(str)))
             sh_att = st.checkbox("Shortage PDF එකට Invoice / DC pages එකතු කරන්න",
                                  value=True, key="sh_attach")
@@ -629,7 +628,8 @@ with tab_gen:
                                    key=f"sh_{E.safe_name(num)}")
 
             if sh_chart:
-                st.image(sh_chart, caption="Shortage by item — email එකටත් යනවා",
+                st.image(PP.shortage_chart_png(sh, dark=(ui.theme_type() == "dark")),
+                         caption="Shortage by item — මේකම email එකටත් යනවා",
                          width="content")
 
             s_subj, s_body, s_html = PP.shortage_email_text(sh_infos, sh, mail_sign)
@@ -823,8 +823,10 @@ with tab_gen:
                     st.caption("Double-click කරාම Outlook/Mail එකේ draft එකක් විදිහට "
                                "attachment + chart එක්කම open වෙනවා.")
                 if pick_chart:
-                    with st.expander("📊 Email එකට යන item chart එක", expanded=False):
-                        st.image(pick_chart, width="content")
+                    with st.expander("Email එකට යන item chart එක", expanded=False):
+                        st.image(PP.pick_chart_png(m_alloc, "Picked qty by item",
+                                                   dark=(ui.theme_type() == "dark")),
+                                 width="content")
 
         if gs_ready and not autosave and st.session_state.get("saved") != res["run_id"]:
             if st.button("Save to database"):

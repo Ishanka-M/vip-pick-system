@@ -312,12 +312,24 @@ CHART_OK = "#0E8F5E"
 CHART_WARN = "#F2B33D"
 
 
-def _fig_png(fig, dpi: int = 130) -> bytes:
+# on-screen preview needs a dark canvas; email + PDF always stay on white paper
+_DARK = {"page": "#141C26", "ink": "#E6EDF5", "soft": "#93A3B5", "grid": "#22303F",
+         "axis": "#3A4B5D", "bar": "#7FA8CF"}
+
+
+def _fig_png(fig, dpi: int = 130, face: str = "white") -> bytes:
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight",
-                facecolor="white", edgecolor="none")
+                facecolor=face, edgecolor="none")
     plt.close(fig)
     return buf.getvalue()
+
+
+def _palette(dark: bool) -> dict:
+    if not dark:
+        return {"page": "white", "ink": CHART_INK, "soft": "#5B6C82",
+                "grid": "#EEF3F9", "axis": "#D6DEE8", "bar": CHART_INK}
+    return _DARK
 
 
 def _short_label(v: Any, n: int = 22) -> str:
@@ -326,7 +338,7 @@ def _short_label(v: Any, n: int = 22) -> str:
 
 
 def pick_chart_png(alloc: pd.DataFrame, title: str = "Picked qty by item",
-                   top: int = 12) -> bytes | None:
+                   top: int = 12, dark: bool = False) -> bytes | None:
     """Item එකකට කීයද pick කරේ — horizontal bar chart (email එකට)."""
     if alloc is None or not len(alloc):
         return None
@@ -339,33 +351,35 @@ def pick_chart_png(alloc: pd.DataFrame, title: str = "Picked qty by item",
         return None
     g = g.tail(top)
 
+    pal = _palette(dark)
     h = max(2.0, 0.42 * len(g) + 1.1)
     fig, ax = plt.subplots(figsize=(7.6, h))
+    ax.set_facecolor(pal["page"])
     labels = [_short_label(i, 26) for i in g.index]
-    bars = ax.barh(labels, g["qty"], color=CHART_INK, height=0.62)
+    bars = ax.barh(labels, g["qty"], color=pal["bar"], height=0.62)
     top_i = int(g["qty"].values.argmax())
     bars[top_i].set_color(CHART_ACC)
 
     for b, (q, p) in zip(bars, zip(g["qty"], g["pallets"])):
         ax.text(b.get_width() + max(g["qty"]) * 0.015,
                 b.get_y() + b.get_height() / 2,
-                f"{_n(q)}  ({int(p)} plt)", va="center", fontsize=8, color="#5B6C82")
+                f"{_n(q)}  ({int(p)} plt)", va="center", fontsize=8, color=pal["soft"])
 
-    ax.set_title(title, fontsize=11, color=CHART_INK, weight="bold", loc="left", pad=10)
-    ax.set_xlabel("Qty", fontsize=8.5, color="#5B6C82")
+    ax.set_title(title, fontsize=11, color=pal["ink"], weight="bold", loc="left", pad=10)
+    ax.set_xlabel("Qty", fontsize=8.5, color=pal["soft"])
     ax.set_xlim(0, float(g["qty"].max()) * 1.22)
-    ax.tick_params(axis="y", labelsize=8.5, colors=CHART_INK, length=0)
-    ax.tick_params(axis="x", labelsize=8, colors="#5B6C82")
+    ax.tick_params(axis="y", labelsize=8.5, colors=pal["ink"], length=0)
+    ax.tick_params(axis="x", labelsize=8, colors=pal["soft"])
     for sp in ("top", "right", "left"):
         ax.spines[sp].set_visible(False)
-    ax.spines["bottom"].set_color("#D6DEE8")
-    ax.grid(axis="x", color="#EEF3F9", linewidth=0.9)
+    ax.spines["bottom"].set_color(pal["axis"])
+    ax.grid(axis="x", color=pal["grid"], linewidth=0.9)
     ax.set_axisbelow(True)
-    return _fig_png(fig)
+    return _fig_png(fig, face=pal["page"])
 
 
 def shortage_chart_png(short: pd.DataFrame, title: str = "Shortage by item",
-                       top: int = 12) -> bytes | None:
+                       top: int = 12, dark: bool = False) -> bytes | None:
     """Required vs Available vs Short — grouped bars."""
     if short is None or not len(short):
         return None
@@ -379,33 +393,37 @@ def shortage_chart_png(short: pd.DataFrame, title: str = "Shortage by item",
     if not len(g):
         return None
 
+    pal = _palette(dark)
     idx = range(len(g))
     h = max(2.2, 0.62 * len(g) + 1.2)
     fig, ax = plt.subplots(figsize=(7.6, h))
+    ax.set_facecolor(pal["page"])
     bh = 0.26
-    ax.barh([i + bh for i in idx], g["REQUIRED"], height=bh, color=CHART_INK,
+    ax.barh([i + bh for i in idx], g["REQUIRED"], height=bh, color=pal["bar"],
             label="Required")
     ax.barh(list(idx), g["AVAILABLE"], height=bh, color=CHART_OK, label="Available")
     ax.barh([i - bh for i in idx], g["SHORT"], height=bh, color=CHART_ACC, label="Short")
 
     ax.set_yticks(list(idx))
     ax.set_yticklabels([_short_label(i, 26) for i in g.index], fontsize=8.5,
-                       color=CHART_INK)
+                       color=pal["ink"])
     for i, v in zip(idx, g["SHORT"]):
         if v > 0:
             ax.text(v + float(g["REQUIRED"].max()) * 0.015, i - bh, f"-{_n(v)}",
                     va="center", fontsize=8, color=CHART_ACC, weight="bold")
-    ax.set_title(title, fontsize=11, color=CHART_INK, weight="bold", loc="left", pad=10)
-    ax.set_xlabel("Qty", fontsize=8.5, color="#5B6C82")
-    ax.legend(fontsize=8, frameon=False, loc="lower right", ncols=3)
-    ax.tick_params(axis="x", labelsize=8, colors="#5B6C82")
+    ax.set_title(title, fontsize=11, color=pal["ink"], weight="bold", loc="left", pad=10)
+    ax.set_xlabel("Qty", fontsize=8.5, color=pal["soft"])
+    leg = ax.legend(fontsize=8, frameon=False, loc="lower right", ncols=3)
+    for t in leg.get_texts():
+        t.set_color(pal["ink"])
+    ax.tick_params(axis="x", labelsize=8, colors=pal["soft"])
     ax.tick_params(axis="y", length=0)
     for sp in ("top", "right", "left"):
         ax.spines[sp].set_visible(False)
-    ax.spines["bottom"].set_color("#D6DEE8")
-    ax.grid(axis="x", color="#EEF3F9", linewidth=0.9)
+    ax.spines["bottom"].set_color(pal["axis"])
+    ax.grid(axis="x", color=pal["grid"], linewidth=0.9)
     ax.set_axisbelow(True)
-    return _fig_png(fig)
+    return _fig_png(fig, face=pal["page"])
 
 
 # --------------------------------------------------------------------------- #
