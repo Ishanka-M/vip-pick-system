@@ -14,6 +14,9 @@ from email.message import EmailMessage
 from typing import Any
 from urllib.parse import quote
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt          # noqa: E402
 import pandas as pd
 import qrcode
 from pypdf import PdfReader, PdfWriter
@@ -301,8 +304,251 @@ def build_doc_pdf(info: dict[str, Any], alloc: pd.DataFrame,
 
 
 # --------------------------------------------------------------------------- #
+# Charts — email / PDF එකට item details chart එකක්
+# --------------------------------------------------------------------------- #
+CHART_INK = "#0F1F33"
+CHART_ACC = "#FF365B"
+CHART_OK = "#0E8F5E"
+CHART_WARN = "#F2B33D"
+
+
+def _fig_png(fig, dpi: int = 130) -> bytes:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight",
+                facecolor="white", edgecolor="none")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def _short_label(v: Any, n: int = 22) -> str:
+    s = str(v or "")
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def pick_chart_png(alloc: pd.DataFrame, title: str = "Picked qty by item",
+                   top: int = 12) -> bytes | None:
+    """Item එකකට කීයද pick කරේ — horizontal bar chart (email එකට)."""
+    if alloc is None or not len(alloc):
+        return None
+    d = alloc.copy()
+    d["QTY_PICKED"] = pd.to_numeric(d["QTY_PICKED"], errors="coerce").fillna(0)
+    g = (d.groupby("ITEM_NUMBER", dropna=False)
+           .agg(qty=("QTY_PICKED", "sum"), pallets=("PALLET", "nunique"))
+           .sort_values("qty", ascending=True))
+    if not len(g):
+        return None
+    g = g.tail(top)
+
+    h = max(2.0, 0.42 * len(g) + 1.1)
+    fig, ax = plt.subplots(figsize=(7.6, h))
+    labels = [_short_label(i, 26) for i in g.index]
+    bars = ax.barh(labels, g["qty"], color=CHART_INK, height=0.62)
+    top_i = int(g["qty"].values.argmax())
+    bars[top_i].set_color(CHART_ACC)
+
+    for b, (q, p) in zip(bars, zip(g["qty"], g["pallets"])):
+        ax.text(b.get_width() + max(g["qty"]) * 0.015,
+                b.get_y() + b.get_height() / 2,
+                f"{_n(q)}  ({int(p)} plt)", va="center", fontsize=8, color="#5B6C82")
+
+    ax.set_title(title, fontsize=11, color=CHART_INK, weight="bold", loc="left", pad=10)
+    ax.set_xlabel("Qty", fontsize=8.5, color="#5B6C82")
+    ax.set_xlim(0, float(g["qty"].max()) * 1.22)
+    ax.tick_params(axis="y", labelsize=8.5, colors=CHART_INK, length=0)
+    ax.tick_params(axis="x", labelsize=8, colors="#5B6C82")
+    for sp in ("top", "right", "left"):
+        ax.spines[sp].set_visible(False)
+    ax.spines["bottom"].set_color("#D6DEE8")
+    ax.grid(axis="x", color="#EEF3F9", linewidth=0.9)
+    ax.set_axisbelow(True)
+    return _fig_png(fig)
+
+
+def shortage_chart_png(short: pd.DataFrame, title: str = "Shortage by item",
+                       top: int = 12) -> bytes | None:
+    """Required vs Available vs Short — grouped bars."""
+    if short is None or not len(short):
+        return None
+    d = short.copy()
+    for c in ("REQUIRED", "AVAILABLE", "SHORT"):
+        d[c] = pd.to_numeric(d.get(c), errors="coerce").fillna(0)
+    key = "DOC_ITEM_CODE" if "DOC_ITEM_CODE" in d.columns else d.columns[0]
+    g = (d.groupby(key).agg(REQUIRED=("REQUIRED", "sum"), AVAILABLE=("AVAILABLE", "sum"),
+                            SHORT=("SHORT", "sum"))
+           .sort_values("SHORT", ascending=True).tail(top))
+    if not len(g):
+        return None
+
+    idx = range(len(g))
+    h = max(2.2, 0.62 * len(g) + 1.2)
+    fig, ax = plt.subplots(figsize=(7.6, h))
+    bh = 0.26
+    ax.barh([i + bh for i in idx], g["REQUIRED"], height=bh, color=CHART_INK,
+            label="Required")
+    ax.barh(list(idx), g["AVAILABLE"], height=bh, color=CHART_OK, label="Available")
+    ax.barh([i - bh for i in idx], g["SHORT"], height=bh, color=CHART_ACC, label="Short")
+
+    ax.set_yticks(list(idx))
+    ax.set_yticklabels([_short_label(i, 26) for i in g.index], fontsize=8.5,
+                       color=CHART_INK)
+    for i, v in zip(idx, g["SHORT"]):
+        if v > 0:
+            ax.text(v + float(g["REQUIRED"].max()) * 0.015, i - bh, f"-{_n(v)}",
+                    va="center", fontsize=8, color=CHART_ACC, weight="bold")
+    ax.set_title(title, fontsize=11, color=CHART_INK, weight="bold", loc="left", pad=10)
+    ax.set_xlabel("Qty", fontsize=8.5, color="#5B6C82")
+    ax.legend(fontsize=8, frameon=False, loc="lower right", ncols=3)
+    ax.tick_params(axis="x", labelsize=8, colors="#5B6C82")
+    ax.tick_params(axis="y", length=0)
+    for sp in ("top", "right", "left"):
+        ax.spines[sp].set_visible(False)
+    ax.spines["bottom"].set_color("#D6DEE8")
+    ax.grid(axis="x", color="#EEF3F9", linewidth=0.9)
+    ax.set_axisbelow(True)
+    return _fig_png(fig)
+
+
+# --------------------------------------------------------------------------- #
+# Shortage PDF (invoice එකත් එක්කම)
+# --------------------------------------------------------------------------- #
+def build_shortage_sheet(info: dict[str, Any], short: pd.DataFrame,
+                         doc_lines: pd.DataFrame | None = None,
+                         chart: bytes | None = None) -> bytes:
+    """Stock මදි නිසා pick කරන්න බැරි වුණ document එකට shortage sheet එකක්."""
+    buf = io.BytesIO()
+    page = landscape(A4)
+    doc = SimpleDocTemplate(buf, pagesize=page, leftMargin=11 * mm, rightMargin=11 * mm,
+                            topMargin=9 * mm, bottomMargin=10 * mm,
+                            title=f"Shortage {info.get('DOC_NUMBER','')}")
+    W = page[0] - 22 * mm
+    story: list = []
+    num = str(info.get("DOC_NUMBER", ""))
+
+    qr_img = Image(io.BytesIO(qr_png(num, box=8, border=1)), width=30 * mm, height=30 * mm)
+    left = Table([[Paragraph("STOCK SHORTAGE  -  NOT PICKED", P_TITLE)],
+                  [Paragraph(f"{_txt(info.get('CLIENT','INM0DONA'))} &nbsp;·&nbsp; "
+                             f"WH {_txt(info.get('WH_ID',''))} &nbsp;·&nbsp; "
+                             f"{_txt(info.get('DOC_TYPE',''))} <b>{_txt(num)}</b>", P_SUB)],
+                  [Paragraph(f"Printed {datetime.now():%d-%b-%Y %H:%M} &nbsp;·&nbsp; "
+                             f"RUN {_txt(info.get('RUN_ID',''))}", P_SUB)]],
+                 colWidths=[W - 42 * mm])
+    left.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 0),
+                              ("TOPPADDING", (0, 0), (-1, -1), 0),
+                              ("BOTTOMPADDING", (0, 0), (-1, -1), 2)]))
+    qb = Table([[qr_img], [Paragraph(_txt(num), P_LOAD)], [Paragraph("DOCUMENT", P_LOADK)]],
+               colWidths=[40 * mm])
+    qb.setStyle(TableStyle([("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                            ("BOX", (0, 0), (-1, -1), 0.8, ACC),
+                            ("TOPPADDING", (0, 0), (-1, -1), 3),
+                            ("BOTTOMPADDING", (0, 0), (-1, -1), 2)]))
+    head = Table([[left, qb]], colWidths=[W - 42 * mm, 42 * mm])
+    head.setStyle(TableStyle([("VALIGN", (0, 0), (-1, 0), "TOP"),
+                              ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                              ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+    story += [head, Spacer(1, 5)]
+
+    tot_req = float(pd.to_numeric(short.get("REQUIRED"), errors="coerce").sum() or 0)
+    tot_sh = float(pd.to_numeric(short.get("SHORT"), errors="coerce").sum() or 0)
+    story.append(_kv_table([
+        ("DOCUMENT", f"{info.get('DOC_TYPE','')} {num}"),
+        ("DOC DATE", info.get("DOC_DATE", "")),
+        ("PLANT", info.get("PLANT", "")),
+        ("SHORT LINES", str(len(short))),
+        ("SHORT QTY", _n(tot_sh)),
+        ("REQUIRED QTY", _n(tot_req)),
+    ], cols=6, width=W))
+    story.append(Spacer(1, 7))
+
+    story.append(Paragraph("SHORT LINES", P_H))
+    rows = []
+    for _, r in short.iterrows():
+        rows.append([str(r.get("DOC_LINE", "")), str(r.get("DOC_ITEM_CODE", "")),
+                     str(r.get("BASE_ID", "")), str(r.get("DESCRIPTION", ""))[:46],
+                     _n(r.get("REQUIRED")), _n(r.get("AVAILABLE")), _n(r.get("SHORT")),
+                     str(r.get("REASON", ""))])
+    widths = [11, 32, 26, 60, 20, 20, 18, 34]
+    sc = W / sum(widths)
+    story.append(_grid(["Ln", "Doc Item Code", "Base ID", "Description", "Required",
+                        "Available", "SHORT", "Reason"], rows, [w * sc for w in widths],
+                       aligns={0: "CENTER", 4: "RIGHT", 5: "RIGHT", 6: "RIGHT"}))
+    story.append(Spacer(1, 8))
+
+    if chart:
+        story.append(KeepTogether([Paragraph("SHORTAGE CHART", P_H),
+                                   Image(io.BytesIO(chart), width=W * 0.62,
+                                         height=W * 0.62 * _ratio(chart))]))
+        story.append(Spacer(1, 8))
+
+    if doc_lines is not None and len(doc_lines):
+        rows2 = [[str(r.get("Line", r.get("DOC_LINE", ""))),
+                  str(r.get("Item Code", r.get("DOC_ITEM_CODE", ""))),
+                  str(r.get("Description", ""))[:52], _n(r.get("Qty", r.get("DOC_QTY"))),
+                  str(r.get("Doc UOM", r.get("UOM", "")))]
+                 for _, r in doc_lines.iterrows()]
+        w2 = [12, 34, 70, 18, 14]
+        s2 = (W * 0.72) / sum(w2)
+        story.append(KeepTogether([Paragraph("DOCUMENT LINES (full)", P_H),
+                                   _grid(["Ln", "Item Code", "Description", "Qty", "UOM"],
+                                         rows2, [w * s2 for w in w2],
+                                         aligns={0: "CENTER", 3: "RIGHT"})]))
+        story.append(Spacer(1, 8))
+
+    sign = Table([[Paragraph("<b>Raised by</b><br/><br/>______________________", P_CELL),
+                   Paragraph("<b>Stock checked by</b><br/><br/>______________________",
+                             P_CELL),
+                   Paragraph("<b>Action</b><br/><br/>____________________________________",
+                             P_CELL)]], colWidths=[W / 3] * 3)
+    sign.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), 0.6, LINE),
+                              ("INNERGRID", (0, 0), (-1, -1), 0.4, LINE),
+                              ("TOPPADDING", (0, 0), (-1, -1), 7),
+                              ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+                              ("LEFTPADDING", (0, 0), (-1, -1), 6)]))
+    story.append(KeepTogether(sign))
+
+    def _footer(canv, _d):
+        canv.saveState()
+        canv.setFont("Helvetica", 6.6)
+        canv.setFillColor(colors.HexColor("#7C90AB"))
+        canv.drawString(11 * mm, 5.5 * mm,
+                        f"SHORTAGE · {_txt(info.get('DOC_TYPE',''))} {_txt(num)} · "
+                        f"not picked - stock short · EFL OutBound Pick Generator")
+        canv.drawRightString(page[0] - 11 * mm, 5.5 * mm, f"Page {canv.getPageNumber()}")
+        canv.setStrokeColor(ACC)
+        canv.setLineWidth(1.6)
+        canv.line(11 * mm, page[1] - 6 * mm, page[0] - 11 * mm, page[1] - 6 * mm)
+        canv.restoreState()
+
+    doc.build(story, onFirstPage=_footer, onLaterPages=_footer)
+    return buf.getvalue()
+
+
+def _ratio(png: bytes) -> float:
+    try:
+        from PIL import Image as PILImage
+        w, h = PILImage.open(io.BytesIO(png)).size
+        return h / w
+    except Exception:
+        return 0.5
+
+
+def build_shortage_pdf(info: dict[str, Any], short: pd.DataFrame,
+                       doc_lines: pd.DataFrame | None = None,
+                       source_pdf: bytes | None = None,
+                       attach_source: bool = True,
+                       chart: bytes | None = None) -> bytes:
+    """Shortage sheet + upload කරපු Invoice / DC PDF එකම එකට."""
+    sheet = build_shortage_sheet(info, short, doc_lines, chart)
+    if attach_source and source_pdf:
+        return merge_pdfs([sheet, source_pdf])
+    return sheet
+
+
+# --------------------------------------------------------------------------- #
 # Email
 # --------------------------------------------------------------------------- #
+CID_CHART = "itemchart@efl"
+
+
 def _addr_list(raw: Any) -> list[str]:
     if raw is None:
         return []
@@ -392,7 +638,90 @@ def pick_email_text(docs_info: list[dict[str, Any]], alloc: pd.DataFrame,
 
     lines += ["", f"Total picked qty: {_n(total)}", "",
               signature or "Thanks & regards,", ""]
+    html.append("<p style='margin:14px 0 4px'><b>Item details</b></p>"
+                f"<img src='cid:{CID_CHART}' alt='Picked qty by item' "
+                "style='max-width:640px;width:100%;border:1px solid #B9C6D6;"
+                "border-radius:6px'/>")
     html.append(f"<p><b>Total picked qty: {_n(total)}</b></p>"
+                f"<p>{(signature or 'Thanks &amp; regards,')}</p></div>")
+    return subject, "\n".join(lines), "".join(html)
+
+
+def shortage_email_text(docs_info: list[dict[str, Any]], short: pd.DataFrame,
+                        signature: str = "") -> tuple[str, str, str]:
+    """Stock මදි නිසා pick කරන්න බැරි වුණ document වලට email එකක්."""
+    nums = [str(d.get("DOC_NUMBER", "")) for d in docs_info]
+    tot_short = float(pd.to_numeric(short.get("SHORT"), errors="coerce").sum() or 0) \
+        if short is not None and len(short) else 0.0
+
+    subject = ("⚠ Stock Shortage · " + ", ".join(nums[:3])
+               + (f" +{len(nums) - 3}" if len(nums) > 3 else ""))
+
+    lines = ["Hi,", "",
+             "Below document(s) could NOT be picked - stock is short.",
+             "Full document qty නැති නිසා pick කරලා නෑ (partial pick කරන්නේ නෑ).", ""]
+    html = ["<div style='font-family:Segoe UI,Arial,sans-serif;font-size:13px;"
+            "color:#0F1F33'><p>Hi,</p><p><b style='color:#FF365B'>Stock shortage</b> - "
+            "below document(s) could not be picked. Full document qty නැති නිසා "
+            "pick කරලා නෑ.</p>"]
+
+    for d in docs_info:
+        num = d.get("DOC_NUMBER", "")
+        lines += [f"Document   : {d.get('DOC_TYPE','')} {num}  ({d.get('DOC_DATE','')})",
+                  f"Plant      : {d.get('PLANT','')}",
+                  f"Doc qty    : {_n(d.get('TOTAL_QTY'))}",
+                  f"Reason     : {d.get('REASON','Stock short')}", ""]
+        html.append(
+            "<table cellpadding='5' cellspacing='0' style='border-collapse:collapse;"
+            "border:1px solid #B9C6D6;margin-bottom:8px;font-size:12.5px'>"
+            f"<tr><td style='background:#FF365B;color:#fff' colspan='2'>"
+            f"<b>{d.get('DOC_TYPE','')} {num}</b></td></tr>"
+            f"<tr><td style='border:1px solid #B9C6D6'>Doc date</td>"
+            f"<td style='border:1px solid #B9C6D6'>{d.get('DOC_DATE','')}</td></tr>"
+            f"<tr><td style='border:1px solid #B9C6D6'>Plant</td>"
+            f"<td style='border:1px solid #B9C6D6'>{d.get('PLANT','')}</td></tr>"
+            f"<tr><td style='border:1px solid #B9C6D6'>Doc qty</td>"
+            f"<td style='border:1px solid #B9C6D6'>{_n(d.get('TOTAL_QTY'))}</td></tr>"
+            "</table>")
+
+    if short is not None and len(short):
+        lines += ["Short lines:",
+                  f"{'Doc':<16}{'Ln':<4}{'Item':<20}{'Req':>7}{'Avail':>8}{'Short':>8}"]
+        html.append("<table cellpadding='5' cellspacing='0' style='border-collapse:"
+                    "collapse;border:1px solid #B9C6D6;font-size:12px'>"
+                    "<tr style='background:#0F1F33;color:#fff'><th>Document</th><th>Ln</th>"
+                    "<th>Item Code</th><th>Description</th><th>Required</th>"
+                    "<th>Available</th><th>Short</th></tr>")
+        for _, r in short.iterrows():
+            lines.append(
+                f"{str(r.get('DOC_NUMBER','')):<16}{str(r.get('DOC_LINE','')):<4}"
+                f"{str(r.get('DOC_ITEM_CODE','')):<20}{_n(r.get('REQUIRED')):>7}"
+                f"{_n(r.get('AVAILABLE')):>8}{_n(r.get('SHORT')):>8}")
+            html.append(
+                "<tr>"
+                f"<td style='border:1px solid #B9C6D6'>{r.get('DOC_NUMBER','')}</td>"
+                f"<td style='border:1px solid #B9C6D6' align='center'>"
+                f"{r.get('DOC_LINE','')}</td>"
+                f"<td style='border:1px solid #B9C6D6'>{r.get('DOC_ITEM_CODE','')}</td>"
+                f"<td style='border:1px solid #B9C6D6'>"
+                f"{str(r.get('DESCRIPTION',''))[:40]}</td>"
+                f"<td style='border:1px solid #B9C6D6' align='right'>"
+                f"{_n(r.get('REQUIRED'))}</td>"
+                f"<td style='border:1px solid #B9C6D6' align='right'>"
+                f"{_n(r.get('AVAILABLE'))}</td>"
+                f"<td style='border:1px solid #B9C6D6;color:#FF365B' align='right'>"
+                f"<b>{_n(r.get('SHORT'))}</b></td></tr>")
+        html.append("</table>")
+
+    html.append("<p style='margin:14px 0 4px'><b>Item details</b></p>"
+                f"<img src='cid:{CID_CHART}' alt='Shortage by item' "
+                "style='max-width:640px;width:100%;border:1px solid #B9C6D6;"
+                "border-radius:6px'/>")
+    lines += ["", f"Total short qty: {_n(tot_short)}",
+              "Please arrange stock / confirm short shipment.", "",
+              signature or "Thanks & regards,", ""]
+    html.append(f"<p><b>Total short qty: {_n(tot_short)}</b></p>"
+                "<p>Please arrange stock / confirm short shipment.</p>"
                 f"<p>{(signature or 'Thanks &amp; regards,')}</p></div>")
     return subject, "\n".join(lines), "".join(html)
 
@@ -410,7 +739,8 @@ def mailto_link(to: Any, subject: str, body: str, cc: Any = None,
 
 
 def build_eml(to: Any, subject: str, body: str, html: str = "", cc: Any = None,
-              sender: str = "", attachments: list[tuple[str, bytes, str]] | None = None) -> bytes:
+              sender: str = "", attachments: list[tuple[str, bytes, str]] | None = None,
+              inline_png: bytes | None = None, cid: str = CID_CHART) -> bytes:
     """
     .eml file — double-click කරාම default mail app එකේ **draft** එකක් විදිහට open වෙනවා
     (attachment ඔක්කොම ඇතුලේ). Outlook එකට 'X-Unsent: 1' header එක ඕන.
@@ -427,6 +757,11 @@ def build_eml(to: Any, subject: str, body: str, html: str = "", cc: Any = None,
     msg.set_content(body)
     if html:
         msg.add_alternative(html, subtype="html")
+        if inline_png:
+            # HTML part එකට chart එක inline (cid:) විදිහට
+            html_part = msg.get_payload()[-1]
+            html_part.add_related(inline_png, maintype="image", subtype="png",
+                                  cid=f"<{cid}>", filename="item_chart.png")
 
     for name, data, mime in (attachments or []):
         if not data:

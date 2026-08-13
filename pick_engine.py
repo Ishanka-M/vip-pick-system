@@ -311,6 +311,7 @@ class EngineConfig:
     use_ledger: bool = True             # pallet balance එකට ledger එක බලනවද
     blank_fill: str = "TBC"
     fill_item_number_col: bool = False
+    fill_description: bool = False       # OutBound Detail එකේ ITEM_DESCRIPTION පුරවනවද
     merge_same_item_lines: bool = False
     override_doc_check: bool = False    # ⚠️ manual verify කරලා විතරක් — stock check bypass වෙන්නේ නෑ
     pick_date: datetime = field(default_factory=datetime.now)
@@ -346,11 +347,21 @@ def run_pick(
     cfg: EngineConfig,
     ledger: pd.DataFrame | None = None,
     processed_docs: set[str] | None = None,
+    sku_desc: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """මුළු pipeline එක — validate -> duplicate -> allocate -> WMS output."""
     run_id = datetime.now().strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:4]
     stamp = cfg.pick_date.strftime("%Y-%m-%d %H:%M:%S")
     processed_docs = {str(x).strip() for x in (processed_docs or set())}
+    sku_desc = sku_desc or {}
+
+    def _desc(inv_d: Any, item: Any, doc_d: Any = "") -> str:
+        """Description — inventory -> SKU master -> document."""
+        for v in (inv_d, sku_desc.get(clean_item(item)), sku_desc.get(base_item(item)),
+                  doc_d):
+            if str(v or "").strip():
+                return str(v).strip()
+        return ""
 
     inv = normalize_inventory(inv_raw)
     if cfg.statuses:
@@ -420,7 +431,8 @@ def run_pick(
                 doc_short.append({
                     "DOC_NUMBER": num, "DOC_TYPE": doc.doc_type, "DOC_LINE": ln.line_no,
                     "DOC_ITEM_CODE": ln.item_code, "BASE_ID": ln.base,
-                    "DESCRIPTION": ln.description, "REQUIRED": need,
+                    "DESCRIPTION": _desc("", ln.item_code, ln.description),
+                    "REQUIRED": need,
                     "AVAILABLE": have, "SHORT": max(0.0, need - have),
                     "REASON": "Item not in inventory/plant" if pool.empty else "Stock short",
                 })
@@ -440,7 +452,8 @@ def run_pick(
                     "DOC_NUMBER": num, "DOC_LINE": ln.line_no,
                     "DOC_ITEM_CODE": ln.item_code, "BASE_ID": ln.base,
                     "ITEM_NUMBER": r["item_number_raw"] or r["item_number"],
-                    "DESCRIPTION": r["description"] or ln.description,
+                    "DESCRIPTION": _desc(r["description"], r["item_number"],
+                                         ln.description),
                     "PALLET": r["pallet"], "LOCATION_ID": r["location_id"],
                     "LOT_NUMBER": r["lot_number"], "PLANT": r["plant"],
                     "UOM": r["uom"] or ln.uom, "QTY_BEFORE": before,
@@ -486,6 +499,8 @@ def run_pick(
             row["DISPLAY_ORDER_NUMBER"] = num
             row["LINE_NUMBER"] = str(line_no)
             row["DISPLAY_ITEM_NUMBER"] = a["ITEM_NUMBER"]
+            if cfg.fill_description:
+                row["ITEM_DESCRIPTION"] = a["DESCRIPTION"]
             if cfg.fill_item_number_col:
                 row["ITEM_NUMBER"] = a["ITEM_NUMBER"]
             row["LOT_NUMBER"] = a["LOT_NUMBER"] or cfg.blank_fill

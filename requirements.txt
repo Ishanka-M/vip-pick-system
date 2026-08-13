@@ -8,3 +8,4 @@ reportlab>=4.0
 qrcode>=7.4
 pillow>=10.0
 pypdf>=4.0
+matplotlib>=3.8

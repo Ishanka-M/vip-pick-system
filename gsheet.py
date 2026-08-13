@@ -1,19 +1,24 @@
 """
-gsheet.py — Google Sheet backend (ledger + registry + outputs)
-==============================================================
+gsheet.py — Google Sheet backend + API manager (multi-user safe)
+================================================================
 Worksheets
-  OUTBOUND_MASTER   : WMS master rows (append)
-  OUTBOUND_DETAIL   : WMS detail rows (append)
-  PALLET_LEDGER     : pallet-level pick — before / picked / balance
-  DOC_REGISTRY      : process කරපු Invoice / DC numbers (duplicate gate)
-  REJECTED_LOG      : pick කරන්න බැරි වුණ docs + හේතුව
-  RUN_LOG           : run summary
+  OUTBOUND_MASTER · OUTBOUND_DETAIL · PALLET_LEDGER · DOC_REGISTRY
+  REJECTED_LOG · RUN_LOG · SKU_MASTER · APP_SETTINGS · _LOCKS
+
+API management
+  * හැම call එකකටම retry + exponential backoff (429 / 5xx)
+  * Read cache — TTL එකක් එක්ක (user කීපදෙනෙක් read කරද්දී quota ඉතුරු වෙනවා)
+  * Write lock — user දෙන්නෙක් එකවර save කරද්දී corrupt වෙන එක නවත්තනවා
+  * Save කරද්දී lock එක ඇතුලේම duplicate re-check එකක්
 """
 from __future__ import annotations
 
+import random
 import re
-from datetime import datetime
-from typing import Any
+import time
+import uuid
+from datetime import datetime, timedelta
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -31,16 +36,20 @@ WS_REGISTRY = "DOC_REGISTRY"
 WS_REJECT = "REJECTED_LOG"
 WS_RUNLOG = "RUN_LOG"
 WS_SETTINGS = "APP_SETTINGS"
+WS_SKU = "SKU_MASTER"
+WS_LOCK = "_LOCKS"
 
 LEDGER_COLS = E.ALLOC_COLS
 REGISTRY_COLS = ["DOC_NUMBER", "DOC_TYPE", "DOC_DATE", "REF_NUMBER", "DOC_CHECK",
-                 "LINES", "WMS_LINES",
-                 "DOC_QTY", "PICKED_QTY", "PALLETS", "PLANTS", "RUN_ID", "PROCESSED_AT",
-                 "SOURCE_FILE"]
+                 "LINES", "WMS_LINES", "DOC_QTY", "PICKED_QTY", "WMS_QTY", "VERIFY",
+                 "PALLETS", "PLANTS", "RUN_ID", "PROCESSED_AT", "SOURCE_FILE"]
 REJECT_COLS = ["RUN_ID", "PROCESSED_AT", "DOC_NUMBER", "DOC_TYPE", "REASON", "DETAIL",
                "SOURCE_FILE"]
 RUNLOG_COLS = ["RUN_ID", "PROCESSED_AT", "USER_NOTE", "PLANTS", "STRATEGY", "DOCS_OK",
                "DOCS_REJECTED", "MASTER_ROWS", "DETAIL_ROWS", "PALLETS", "TOTAL_QTY"]
+SKU_COLS = ["ITEM_NUMBER", "BASE_ID", "MATCH_KEY", "ITEM_DESCRIPTION",
+            "UPDATED_AT", "UPDATED_BY", "SOURCE"]
+LOCK_COLS = ["NAME", "OWNER", "ACQUIRED_AT", "EXPIRES_AT"]
 
 _SHEETS = {
     WS_MASTER: ["RUN_ID", "PROCESSED_AT"] + E.MASTER_COLS,
@@ -49,81 +58,167 @@ _SHEETS = {
     WS_REGISTRY: REGISTRY_COLS,
     WS_REJECT: REJECT_COLS,
     WS_RUNLOG: RUNLOG_COLS,
+    WS_SKU: SKU_COLS,
     WS_SETTINGS: ["KEY", "VALUE", "UPDATED_AT"],
+    WS_LOCK: LOCK_COLS,
 }
 
+# LOAD_ID තියෙන column එක worksheet එකට අනුව
+_LOAD_COL = {
+    WS_MASTER: "DISPLAY_ORDER_NUMBER",
+    WS_DETAIL: "DISPLAY_ORDER_NUMBER",
+    WS_LEDGER: "DOC_NUMBER",
+    WS_REGISTRY: "DOC_NUMBER",
+    WS_REJECT: "DOC_NUMBER",
+}
 
 # --------------------------------------------------------------------------- #
-# connection
+# API manager — retry · cache · stats
 # --------------------------------------------------------------------------- #
+STATS: dict[str, Any] = {"calls": 0, "retries": 0, "cache_hits": 0, "errors": 0,
+                         "last_error": "", "last_call": ""}
+
+_CACHE: dict[tuple, tuple[float, Any]] = {}
+_CACHE_TTL = 45.0
+MAX_RETRY = 5
+
+
 def _key(sheet_key: str) -> str:
     s = str(sheet_key).strip()
     m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", s)
     return m.group(1) if m else s
 
 
+def cache_clear(sheet_key: str | None = None) -> None:
+    if sheet_key is None:
+        _CACHE.clear()
+        return
+    for k in [k for k in _CACHE if k[0] == _key(sheet_key)]:
+        _CACHE.pop(k, None)
+
+
+def set_cache_ttl(seconds: float) -> None:
+    global _CACHE_TTL
+    _CACHE_TTL = max(0.0, float(seconds))
+
+
+def _retryable(ex: Exception) -> bool:
+    code = getattr(getattr(ex, "response", None), "status_code", None)
+    if code in (429, 500, 502, 503, 504):
+        return True
+    txt = str(ex)
+    return any(s in txt for s in ("429", "500", "502", "503", "504", "Quota exceeded",
+                                  "RATE_LIMIT_EXCEEDED", "internal error",
+                                  "currently unavailable"))
+
+
+def api(fn: Callable, *a, **kw):
+    """Google API call wrapper — 429 / 5xx වලට exponential backoff + jitter."""
+    delay = 1.0
+    for attempt in range(MAX_RETRY):
+        try:
+            STATS["calls"] += 1
+            STATS["last_call"] = datetime.now().strftime("%H:%M:%S")
+            return fn(*a, **kw)
+        except Exception as ex:                      # noqa: BLE001
+            if not _retryable(ex) or attempt == MAX_RETRY - 1:
+                STATS["errors"] += 1
+                STATS["last_error"] = f"{type(ex).__name__}: {str(ex)[:200]}"
+                raise
+            STATS["retries"] += 1
+            time.sleep(delay + random.uniform(0, 0.6))
+            delay = min(delay * 2, 20.0)
+
+
+# --------------------------------------------------------------------------- #
+# connection
+# --------------------------------------------------------------------------- #
 def open_book(sa_info: dict, sheet_key: str):
     import gspread
     from google.oauth2.service_account import Credentials
 
     creds = Credentials.from_service_account_info(dict(sa_info), scopes=SCOPES)
     gc = gspread.authorize(creds)
-    return gc.open_by_key(_key(sheet_key))
+    return api(gc.open_by_key, _key(sheet_key))
 
 
 def _ensure(book, title: str, header: list[str]):
     try:
-        ws = book.worksheet(title)
+        ws = api(book.worksheet, title)
     except Exception:
-        ws = book.add_worksheet(title=title, rows=1000, cols=max(10, len(header) + 2))
-        ws.update(values=[header], range_name="A1", value_input_option="RAW")
+        ws = api(book.add_worksheet, title=title, rows=1000, cols=max(10, len(header) + 2))
+        api(ws.update, values=[header], range_name="A1", value_input_option="RAW")
         return ws
-    first = ws.row_values(1)
-    if not first:
-        ws.update(values=[header], range_name="A1", value_input_option="RAW")
+    if not api(ws.row_values, 1):
+        api(ws.update, values=[header], range_name="A1", value_input_option="RAW")
     return ws
 
 
 def init_sheet(sa_info: dict, sheet_key: str) -> dict[str, Any]:
     book = open_book(sa_info, sheet_key)
-    made = {}
+    have = {w.title for w in api(book.worksheets)}
+    made: dict[str, Any] = {}
     for title, header in _SHEETS.items():
-        existed = title in [w.title for w in book.worksheets()]
         _ensure(book, title, header)
-        made[title] = not existed
+        made[title] = title not in have
     made["url"] = book.url
+    cache_clear(sheet_key)
     return made
 
 
+def health(sa_info: dict, sheet_key: str) -> dict[str, Any]:
+    t0 = time.time()
+    book = open_book(sa_info, sheet_key)
+    sheets = [w.title for w in api(book.worksheets)]
+    return {"ok": True, "ms": int((time.time() - t0) * 1000), "url": book.url,
+            "worksheets": sheets, "missing": [t for t in _SHEETS if t not in sheets],
+            "cached": len([k for k in _CACHE if k[0] == _key(sheet_key)]),
+            "ttl": _CACHE_TTL, **STATS}
+
+
 # --------------------------------------------------------------------------- #
-# read
+# read (cached)
 # --------------------------------------------------------------------------- #
-def read_ws(sa_info: dict, sheet_key: str, title: str) -> pd.DataFrame:
+def read_ws(sa_info: dict, sheet_key: str, title: str, use_cache: bool = True,
+            ttl: float | None = None) -> pd.DataFrame:
+    ck = (_key(sheet_key), title)
+    life = _CACHE_TTL if ttl is None else ttl
+    if use_cache and ck in _CACHE:
+        ts, df = _CACHE[ck]
+        if time.time() - ts < life:
+            STATS["cache_hits"] += 1
+            return df.copy()
+
     book = open_book(sa_info, sheet_key)
     try:
-        ws = book.worksheet(title)
+        ws = api(book.worksheet, title)
     except Exception:
-        return pd.DataFrame()
-    rows = ws.get_all_values()
-    if not rows:
-        return pd.DataFrame()
-    head, *body = rows
-    return pd.DataFrame(body, columns=head)
+        df = pd.DataFrame()
+    else:
+        rows = api(ws.get_all_values)
+        if not rows:
+            df = pd.DataFrame()
+        else:
+            head, *body = rows
+            head = [h if h else f"COL{i}" for i, h in enumerate(head)]
+            body = [r + [""] * (len(head) - len(r)) for r in body]
+            df = pd.DataFrame([r[:len(head)] for r in body], columns=head)
+    _CACHE[ck] = (time.time(), df.copy())
+    return df
 
 
 def read_ledger(sa_info: dict, sheet_key: str) -> pd.DataFrame:
     return read_ws(sa_info, sheet_key, WS_LEDGER)
 
 
-def read_processed_docs(sa_info: dict, sheet_key: str) -> set[str]:
-    df = read_ws(sa_info, sheet_key, WS_REGISTRY)
+def read_processed_docs(sa_info: dict, sheet_key: str, fresh: bool = False) -> set[str]:
+    df = read_ws(sa_info, sheet_key, WS_REGISTRY, use_cache=not fresh)
     if df is None or not len(df) or "DOC_NUMBER" not in df.columns:
         return set()
     return {str(x).strip() for x in df["DOC_NUMBER"] if str(x).strip()}
 
 
 def read_setting(sa_info: dict, sheet_key: str, key: str, default: str = "") -> str:
-    """APP_SETTINGS worksheet එකෙන් එක value එකක් (email book වගේ)."""
     df = read_ws(sa_info, sheet_key, WS_SETTINGS)
     if df is None or not len(df) or "KEY" not in df.columns:
         return default
@@ -134,13 +229,127 @@ def read_setting(sa_info: dict, sheet_key: str, key: str, default: str = "") -> 
 def save_setting(sa_info: dict, sheet_key: str, key: str, value: str) -> None:
     book = open_book(sa_info, sheet_key)
     ws = _ensure(book, WS_SETTINGS, _SHEETS[WS_SETTINGS])
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    rows = ws.get_all_values()
+    rows = api(ws.get_all_values)
     head = rows[0] if rows else _SHEETS[WS_SETTINGS]
     body = [r for r in rows[1:] if (r[0] if r else "") != str(key)]
-    body.append([str(key), str(value), now])
-    ws.clear()
-    ws.update(values=[head] + body, range_name="A1", value_input_option="RAW")
+    body.append([str(key), str(value), datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+    api(ws.clear)
+    api(ws.update, values=[head] + body, range_name="A1", value_input_option="RAW")
+    cache_clear(sheet_key)
+
+
+# --------------------------------------------------------------------------- #
+# write lock (multi-user)
+# --------------------------------------------------------------------------- #
+class LockBusy(RuntimeError):
+    pass
+
+
+class sheet_lock:
+    """
+    with sheet_lock(sa, key, "SAVE"):  ... write ...
+
+    `_LOCKS` worksheet එකෙන් soft lock එකක්. තව කෙනෙක් save කරමින් නම් රැඳිලා,
+    timeout එකේදී LockBusy. Expire වුණ lock auto-clear වෙනවා.
+    """
+
+    def __init__(self, sa_info: dict, sheet_key: str, name: str = "SAVE",
+                 owner: str = "", wait: float = 25.0, hold: float = 90.0):
+        self.sa, self.key, self.name = sa_info, sheet_key, name
+        self.owner = owner or f"user-{uuid.uuid4().hex[:6]}"
+        self.wait, self.hold = wait, hold
+        self.ws = None
+        self.got = False
+
+    def _rows(self):
+        rows = api(self.ws.get_all_values)
+        head = rows[0] if rows else LOCK_COLS
+        return head, [r + [""] * (len(head) - len(r)) for r in rows[1:]]
+
+    def _write(self, head, body):
+        api(self.ws.clear)
+        api(self.ws.update, values=[head] + body, range_name="A1", value_input_option="RAW")
+
+    def acquire(self) -> bool:
+        book = open_book(self.sa, self.key)
+        self.ws = _ensure(book, WS_LOCK, LOCK_COLS)
+        deadline = time.time() + self.wait
+        while True:
+            head, body = self._rows()
+            now = datetime.now()
+            keep, busy = [], False
+            for r in body:
+                if not r or not r[0]:
+                    continue
+                try:
+                    exp = datetime.strptime(r[3], "%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    exp = now - timedelta(seconds=1)
+                if exp <= now:
+                    continue                          # stale -> drop
+                keep.append(r)
+                if r[0] == self.name:
+                    busy = True
+            if not busy:
+                keep.append([self.name, self.owner, now.strftime("%Y-%m-%d %H:%M:%S"),
+                             (now + timedelta(seconds=self.hold)).strftime(
+                                 "%Y-%m-%d %H:%M:%S")])
+                self._write(head, keep)
+                time.sleep(0.6)                       # settle, then confirm it's ours
+                _, chk = self._rows()
+                mine = [r for r in chk if r and r[0] == self.name]
+                if len(mine) == 1 and mine[0][1] == self.owner:
+                    self.got = True
+                    return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(1.2 + random.uniform(0, 0.8))
+
+    def release(self) -> None:
+        if not self.got or self.ws is None:
+            return
+        try:
+            head, body = self._rows()
+            self._write(head, [r for r in body
+                               if not (r and r[0] == self.name and r[1] == self.owner)])
+        except Exception:
+            pass
+        finally:
+            self.got = False
+
+    def __enter__(self):
+        if not self.acquire():
+            raise LockBusy("තව කෙනෙක් දැන් save කරමින් ඉන්නවා — විනාඩියකින් try කරන්න.")
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+
+def active_locks(sa_info: dict, sheet_key: str) -> pd.DataFrame:
+    df = read_ws(sa_info, sheet_key, WS_LOCK, use_cache=False)
+    if df is None or not len(df):
+        return pd.DataFrame(columns=LOCK_COLS)
+    now = datetime.now()
+    keep = []
+    for _, r in df.iterrows():
+        try:
+            if datetime.strptime(str(r.get("EXPIRES_AT", "")), "%Y-%m-%d %H:%M:%S") > now:
+                keep.append(r)
+        except Exception:
+            continue
+    return pd.DataFrame(keep, columns=df.columns) if keep else pd.DataFrame(columns=LOCK_COLS)
+
+
+def clear_locks(sa_info: dict, sheet_key: str) -> int:
+    book = open_book(sa_info, sheet_key)
+    ws = _ensure(book, WS_LOCK, LOCK_COLS)
+    n = max(0, len(api(ws.get_all_values)) - 1)
+    api(ws.clear)
+    api(ws.update, values=[LOCK_COLS], range_name="A1", value_input_option="RAW")
+    cache_clear(sheet_key)
+    return n
 
 
 # --------------------------------------------------------------------------- #
@@ -152,115 +361,233 @@ def _append(ws, df: pd.DataFrame, header: list[str]) -> int:
     d = df.reindex(columns=header).fillna("")
     values = [["" if pd.isna(v) else str(v) for v in row] for row in d.values.tolist()]
     for i in range(0, len(values), 2000):
-        ws.append_rows(values[i:i + 2000], value_input_option="RAW",
-                       insert_data_option="INSERT_ROWS")
+        api(ws.append_rows, values[i:i + 2000], value_input_option="RAW",
+            insert_data_option="INSERT_ROWS")
     return len(values)
 
 
 def save_run(sa_info: dict, sheet_key: str, res: dict, cfg: E.EngineConfig,
-             note: str = "") -> dict[str, Any]:
-    book = open_book(sa_info, sheet_key)
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    run_id = res.get("run_id", "")
-    out: dict[str, Any] = {"url": book.url}
+             note: str = "", owner: str = "", skip_dupes: bool = True) -> dict[str, Any]:
+    """
+    Lock එකක් ඇතුලේ save + ඒ ඇතුලේම registry re-check.
+    User දෙන්නෙක් එකවර එකම Invoice එක save කරන්න ගියත් එකක් විතරයි යන්නේ.
+    """
+    out: dict[str, Any] = {}
+    with sheet_lock(sa_info, sheet_key, "SAVE", owner=owner) as lk:
+        book = open_book(sa_info, sheet_key)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        run_id = res.get("run_id", "")
+        out["url"] = book.url
+        out["owner"] = lk.owner
 
-    master = res["master"].copy()
-    if len(master):
-        master.insert(0, "PROCESSED_AT", now)
-        master.insert(0, "RUN_ID", run_id)
-    detail = res["detail"].copy()
-    if len(detail):
-        detail.insert(0, "PROCESSED_AT", now)
-        detail.insert(0, "RUN_ID", run_id)
+        master, detail = res["master"].copy(), res["detail"].copy()
+        alloc, reg = res["allocations"].copy(), res["accepted"].copy()
+        rej = res["rejected"].copy()
 
-    out["master"] = _append(_ensure(book, WS_MASTER, _SHEETS[WS_MASTER]), master,
-                            _SHEETS[WS_MASTER])
-    out["detail"] = _append(_ensure(book, WS_DETAIL, _SHEETS[WS_DETAIL]), detail,
-                            _SHEETS[WS_DETAIL])
-    out["ledger"] = _append(_ensure(book, WS_LEDGER, LEDGER_COLS), res["allocations"],
-                            LEDGER_COLS)
+        clash: list[str] = []
+        if skip_dupes and len(reg):
+            done = read_processed_docs(sa_info, sheet_key, fresh=True)
+            clash = [d for d in reg["DOC_NUMBER"].astype(str) if d in done]
+            if clash:
+                reg = reg[~reg["DOC_NUMBER"].astype(str).isin(clash)]
+                master = master[~master["DISPLAY_ORDER_NUMBER"].astype(str).isin(clash)]
+                detail = detail[~detail["DISPLAY_ORDER_NUMBER"].astype(str).isin(clash)]
+                if len(alloc):
+                    alloc = alloc[~alloc["DOC_NUMBER"].astype(str).isin(clash)]
+                rej = pd.concat([rej, pd.DataFrame([{
+                    "DOC_NUMBER": d, "DOC_TYPE": "", "REASON": "DUPLICATE (other user)",
+                    "DETAIL": "Save කරද්දී තව කෙනෙක් මේක දාලා තිබුණා",
+                    "SOURCE_FILE": ""} for d in clash])], ignore_index=True)
+        out["skipped"] = clash
 
-    reg = res["accepted"].copy()
-    if len(reg):
-        reg["RUN_ID"] = run_id
-        reg["PROCESSED_AT"] = now
-    out["registry"] = _append(_ensure(book, WS_REGISTRY, REGISTRY_COLS), reg, REGISTRY_COLS)
+        if len(master):
+            master.insert(0, "PROCESSED_AT", now)
+            master.insert(0, "RUN_ID", run_id)
+        if len(detail):
+            detail.insert(0, "PROCESSED_AT", now)
+            detail.insert(0, "RUN_ID", run_id)
+        if len(reg):
+            reg["RUN_ID"] = run_id
+            reg["PROCESSED_AT"] = now
+        if len(rej):
+            rej["RUN_ID"] = run_id
+            rej["PROCESSED_AT"] = now
 
-    rej = res["rejected"].copy()
-    if len(rej):
-        rej["RUN_ID"] = run_id
-        rej["PROCESSED_AT"] = now
-    out["rejected"] = _append(_ensure(book, WS_REJECT, REJECT_COLS), rej, REJECT_COLS)
+        out["master"] = _append(_ensure(book, WS_MASTER, _SHEETS[WS_MASTER]), master,
+                                _SHEETS[WS_MASTER])
+        out["detail"] = _append(_ensure(book, WS_DETAIL, _SHEETS[WS_DETAIL]), detail,
+                                _SHEETS[WS_DETAIL])
+        out["ledger"] = _append(_ensure(book, WS_LEDGER, LEDGER_COLS), alloc, LEDGER_COLS)
+        out["registry"] = _append(_ensure(book, WS_REGISTRY, REGISTRY_COLS), reg,
+                                  REGISTRY_COLS)
+        out["rejected"] = _append(_ensure(book, WS_REJECT, REJECT_COLS), rej, REJECT_COLS)
 
-    alloc = res["allocations"]
-    runlog = pd.DataFrame([{
-        "RUN_ID": run_id, "PROCESSED_AT": now, "USER_NOTE": note,
-        "PLANTS": ", ".join(cfg.plants), "STRATEGY": cfg.strategy,
-        "DOCS_OK": len(res["accepted"]), "DOCS_REJECTED": len(res["rejected"]),
-        "MASTER_ROWS": len(res["master"]), "DETAIL_ROWS": len(res["detail"]),
-        "PALLETS": int(alloc["PALLET"].nunique()) if len(alloc) else 0,
-        "TOTAL_QTY": float(pd.to_numeric(alloc["QTY_PICKED"], errors="coerce").sum())
-        if len(alloc) else 0,
-    }])
-    out["runlog"] = _append(_ensure(book, WS_RUNLOG, RUNLOG_COLS), runlog, RUNLOG_COLS)
+        runlog = pd.DataFrame([{
+            "RUN_ID": run_id, "PROCESSED_AT": now, "USER_NOTE": note,
+            "PLANTS": ", ".join(cfg.plants), "STRATEGY": cfg.strategy,
+            "DOCS_OK": len(reg), "DOCS_REJECTED": len(rej),
+            "MASTER_ROWS": len(master), "DETAIL_ROWS": len(detail),
+            "PALLETS": int(alloc["PALLET"].nunique()) if len(alloc) else 0,
+            "TOTAL_QTY": float(pd.to_numeric(alloc["QTY_PICKED"], errors="coerce").sum())
+            if len(alloc) else 0,
+        }])
+        out["runlog"] = _append(_ensure(book, WS_RUNLOG, RUNLOG_COLS), runlog, RUNLOG_COLS)
+
+    cache_clear(sheet_key)
     return out
 
 
-def delete_run(sa_info: dict, sheet_key: str, run_id: str) -> dict[str, int]:
-    """වැරදුනු run එකක් undo — ලේඩ්ජරයෙන් සහ registry එකෙන් අයින් කරනවා."""
-    book = open_book(sa_info, sheet_key)
+# --------------------------------------------------------------------------- #
+# LOAD_ID — read / delete
+# --------------------------------------------------------------------------- #
+def list_loads(sa_info: dict, sheet_key: str, fresh: bool = False) -> pd.DataFrame:
+    df = read_ws(sa_info, sheet_key, WS_REGISTRY, use_cache=not fresh)
+    if df is None or not len(df):
+        return pd.DataFrame(columns=REGISTRY_COLS)
+    cols = [c for c in ["DOC_NUMBER", "DOC_TYPE", "DOC_DATE", "LINES", "DOC_QTY",
+                        "PICKED_QTY", "VERIFY", "PALLETS", "PLANTS", "RUN_ID",
+                        "PROCESSED_AT", "SOURCE_FILE"] if c in df.columns]
+    return df[cols].iloc[::-1].reset_index(drop=True)
+
+
+def read_load(sa_info: dict, sheet_key: str, load_id: str,
+              fresh: bool = False) -> dict[str, pd.DataFrame]:
+    """LOAD_ID එකකට අදාල ඔක්කොම rows — master · detail · ledger · registry · rejected."""
+    lid = str(load_id).strip()
+    out: dict[str, pd.DataFrame] = {}
+    for title, col in _LOAD_COL.items():
+        df = read_ws(sa_info, sheet_key, title, use_cache=not fresh)
+        if df is None or not len(df) or col not in df.columns:
+            out[title] = pd.DataFrame()
+            continue
+        out[title] = df[df[col].astype(str).str.strip() == lid].reset_index(drop=True)
+    return out
+
+
+def delete_load(sa_info: dict, sheet_key: str, load_id: str,
+                owner: str = "") -> dict[str, int]:
+    """
+    LOAD_ID එකක් DB එකෙන් සම්පූර්ණයෙන් අයින් —
+    ledger එකෙන් යන නිසා **pallet balance ආපහු එනවා**,
+    registry එකෙන් යන නිසා **ආපහු pick කරන්නත් පුළුවන්**.
+    """
+    lid = str(load_id).strip()
     removed: dict[str, int] = {}
-    for title in (WS_MASTER, WS_DETAIL, WS_LEDGER, WS_REGISTRY, WS_REJECT, WS_RUNLOG):
-        try:
-            ws = book.worksheet(title)
-        except Exception:
-            continue
-        rows = ws.get_all_values()
-        if not rows:
-            continue
-        head, *body = rows
-        if "RUN_ID" not in head:
-            continue
-        i = head.index("RUN_ID")
-        keep = [r for r in body if (r[i] if i < len(r) else "") != run_id]
-        removed[title] = len(body) - len(keep)
-        ws.clear()
-        ws.update(values=[head] + keep, range_name="A1", value_input_option="RAW")
+    with sheet_lock(sa_info, sheet_key, "SAVE", owner=owner):
+        book = open_book(sa_info, sheet_key)
+        for title, col in _LOAD_COL.items():
+            try:
+                ws = api(book.worksheet, title)
+            except Exception:
+                continue
+            rows = api(ws.get_all_values)
+            if not rows:
+                continue
+            head, *body = rows
+            if col not in head:
+                continue
+            i = head.index(col)
+            keep = [r for r in body if (r[i].strip() if i < len(r) else "") != lid]
+            n = len(body) - len(keep)
+            removed[title] = n
+            if n:
+                api(ws.clear)
+                api(ws.update, values=[head] + keep, range_name="A1",
+                    value_input_option="RAW")
+    cache_clear(sheet_key)
     return removed
 
 
+def delete_run(sa_info: dict, sheet_key: str, run_id: str) -> dict[str, int]:
+    """වැරදුනු run එකක් undo."""
+    removed: dict[str, int] = {}
+    with sheet_lock(sa_info, sheet_key, "SAVE"):
+        book = open_book(sa_info, sheet_key)
+        for title in (WS_MASTER, WS_DETAIL, WS_LEDGER, WS_REGISTRY, WS_REJECT, WS_RUNLOG):
+            try:
+                ws = api(book.worksheet, title)
+            except Exception:
+                continue
+            rows = api(ws.get_all_values)
+            if not rows:
+                continue
+            head, *body = rows
+            if "RUN_ID" not in head:
+                continue
+            i = head.index("RUN_ID")
+            keep = [r for r in body if (r[i] if i < len(r) else "") != run_id]
+            removed[title] = len(body) - len(keep)
+            api(ws.clear)
+            api(ws.update, values=[head] + keep, range_name="A1", value_input_option="RAW")
+    cache_clear(sheet_key)
+    return removed
+
+
+# --------------------------------------------------------------------------- #
+# SKU master
+# --------------------------------------------------------------------------- #
+def read_sku(sa_info: dict, sheet_key: str, fresh: bool = False) -> pd.DataFrame:
+    return read_ws(sa_info, sheet_key, WS_SKU, use_cache=not fresh)
+
+
+def save_sku(sa_info: dict, sheet_key: str, master: pd.DataFrame,
+             owner: str = "") -> dict[str, Any]:
+    """SKU master full replace (upsert එක app එකේ කරලා එවනවා) — lock එකක් ඇතුලේ."""
+    head = list(master.columns) if (master is not None and len(master)) else SKU_COLS
+    values = [head]
+    if master is not None and len(master):
+        values += [["" if pd.isna(v) else str(v) for v in row]
+                   for row in master.reindex(columns=head).values.tolist()]
+    with sheet_lock(sa_info, sheet_key, "SKU", owner=owner):
+        book = open_book(sa_info, sheet_key)
+        ws = _ensure(book, WS_SKU, head)
+        api(ws.clear)
+        for i in range(0, len(values), 2000):
+            api(ws.update, values=values[i:i + 2000], range_name=f"A{i + 1}",
+                value_input_option="RAW")
+    cache_clear(sheet_key)
+    return {"rows": len(values) - 1}
+
+
+# --------------------------------------------------------------------------- #
+# reset
+# --------------------------------------------------------------------------- #
 RESET_SCOPES = {
     "outputs": [WS_MASTER, WS_DETAIL],
     "ledger": [WS_LEDGER],
     "registry": [WS_REGISTRY],
     "rejected": [WS_REJECT],
     "runlog": [WS_RUNLOG],
+    "sku": [WS_SKU],
     "settings": [WS_SETTINGS],
 }
 
 
 def reset_data(sa_info: dict, sheet_key: str, scope: list[str]) -> list[str]:
     book = open_book(sa_info, sheet_key)
-    pick = RESET_SCOPES
     done: list[str] = []
     for s in scope:
-        for title in pick.get(s, []):
+        for title in RESET_SCOPES.get(s, []):
             try:
-                ws = book.worksheet(title)
+                ws = api(book.worksheet, title)
             except Exception:
                 continue
-            ws.clear()
-            ws.update(values=[_SHEETS[title]], range_name="A1", value_input_option="RAW")
+            api(ws.clear)
+            api(ws.update, values=[_SHEETS[title]], range_name="A1",
+                value_input_option="RAW")
             done.append(title)
+    cache_clear(sheet_key)
     return done
 
 
-def reset_all(sa_info: dict, sheet_key: str, keep_settings: bool = True) -> dict[str, Any]:
-    """
-    ⚠️ FULL DB RESET — ledger · registry · outputs · rejected · run log ඔක්කොම clear.
-    Header row එක විතරක් ඉතුරු වෙනවා (worksheet delete වෙන්නේ නෑ).
-    """
-    scope = [k for k in RESET_SCOPES if not (keep_settings and k == "settings")]
-    done = reset_data(sa_info, sheet_key, scope)
-    return {"cleared": done, "count": len(done), "at":
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+def reset_all(sa_info: dict, sheet_key: str, keep_settings: bool = True,
+              keep_sku: bool = True) -> dict[str, Any]:
+    """⚠️ FULL DB RESET — header row එක විතරක් ඉතුරු වෙනවා."""
+    skip = set()
+    if keep_settings:
+        skip.add("settings")
+    if keep_sku:
+        skip.add("sku")
+    done = reset_data(sa_info, sheet_key, [k for k in RESET_SCOPES if k not in skip])
+    return {"cleared": done, "count": len(done),
+            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}

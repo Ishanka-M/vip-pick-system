@@ -4,11 +4,12 @@ Invoice / Delivery Challan **PDF** + **Inventory Report** → pallet-level pick 
 Google Sheet ledger + **`OutBound MASTER` / `OutBound Detail`** Excel (Körber One upload).
 
 ```
-app.py          Streamlit UI (5 tabs)
+app.py          Streamlit UI (7 tabs)
 doc_parser.py   Donaldson Invoice + Delivery Challan PDF parser
 pick_engine.py  matching · allocation · qty verify · WMS output · Excel · search
-pick_pdf.py     Pick sheet PDF (LOAD_ID QR) + document merge + email (.eml / mailto)
-gsheet.py       Google Sheet ledger / registry / settings / history
+pick_pdf.py     Pick sheet + Shortage PDF (QR) · charts · email (.eml / mailto)
+sku_master.py   SKU master — dedupe upsert · base-ID search
+gsheet.py       Google Sheet DB + API manager (retry · cache · lock · load delete)
 ```
 
 ---
@@ -270,3 +271,90 @@ Result එකේ **📧 Email** section එකෙන්:
 Body එකේ තියෙන්නේ LOAD ID · document · plant · lines/qty · pallets · qty check +
 pallet-by-pallet pick table එක (plain text + HTML දෙකම).
 Subject / body edit කරන්නත් පුළුවන්.
+
+---
+
+## 13. 🚚 Load Manager — LOAD_ID එකෙන් download / delete
+
+Tab **🚚 Loads**. LOAD_ID එකක් type කරන්න, නැත්නම් save කරපු list එකෙන් තෝරන්න.
+
+* **බලන්න** — pick details (ledger) · OutBound Detail · OutBound MASTER
+* **Download** — `<LOAD_ID>.xlsx` (WMS upload) · `<LOAD_ID>.pdf` (pick sheet + QR) ·
+  pick details CSV
+* **Delete** — sidebar password එකෙන් unlock කරලා, LOAD_ID එක ආපහු type කරලා confirm
+
+> Delete කරාම `PALLET_LEDGER` + `DOC_REGISTRY` + master/detail/rejected වලින් අයින් වෙනවා
+> → **pallet balance ආපහු එනවා** සහ **ආපහු pick කරන්නත් පුළුවන්**.
+> DB එකේ original Invoice / DC PDF එක save වෙන්නේ නෑ, ඒ නිසා මෙතනින් එන PDF එකේ
+> තියෙන්නේ pick sheet එක විතරයි.
+
+---
+
+## 14. 🏷️ SKU Master
+
+Tab **🏷️ SKU Master**. Format එක: `Item Number`, `Item Description`
+(+ ඕනෑම extra column ගාණක් — ඒවත් save වෙනවා).
+
+| Sub-tab | වැඩේ |
+|---|---|
+| ⬆️ **Upload / Update** | File එක දාලා preview — 🆕 New · ♻️ Updated · = Unchanged. Save කරාම `SKU_MASTER` worksheet එකට |
+| 🔎 **Search** | `07011636` දුන්නම **`07011636-000-440`** හම්බෙනවා. Description එකෙනුත් හොයනවා |
+| ✏️ **Edit** | කෙලින්ම edit / අලුත් row. Save කරද්දී duplicate check ආපහු |
+
+**Duplicate නෑ** — key එක `MATCH_KEY` (item number එක clean කරපු එක).
+තියෙන item එකක් ආපහු දැම්මොත් **update** වෙනවා, අලුත් row එකක් හැදෙන්නේ නෑ.
+හිස් value වලින් තියෙන data overwrite වෙන්නෙත් නෑ — වෙනස් වුණ field මොනවද කියලා
+preview එකේ පේනවා.
+
+`ITEM_NUMBER` file එකේ තියෙන හරියටම රැකෙනවා (`#1301` වගේ ඒවත්),
+`BASE_ID` සහ `MATCH_KEY` auto calculate වෙනවා.
+
+SKU master එකේ description, pick කරද්දී inventory එකේ description එක හිස් නම්
+automatic fill වෙනවා (pick sheet · email · shortage PDF ඔක්කොම).
+
+> **Base ID rule** — suffix එක කියලා ගන්නේ **3-digit කෑලි විතරක්** නම්:
+> `07011636-000-440` → `07011636` ✅ · `100409-101` → `100409` ✅ ·
+> `05-47174` → `05-47174` (`05` නෙවෙයි — වැරදි match වළක්වන්න)
+
+---
+
+## 15. 🔌 Google Sheet API manage (multi-user)
+
+Sidebar → **🔌 API / Multi-user**
+
+| දේ | කොහොමද |
+|---|---|
+| **Retry + backoff** | 429 / 5xx වලට exponential backoff + jitter, 5 attempts. Quota error නිසා app එක බිඳෙන්නේ නෑ |
+| **Read cache** | TTL එකක් එක්ක (default 45s, slider එකෙන් 0–180). User කීපදෙනෙක් read කරද්දී quota ඉතුරු වෙනවා |
+| **Write lock** | `_LOCKS` worksheet එකෙන් soft lock. තව කෙනෙක් save කරමින් නම් රැඳිලා, බැරි වුණොත් 🔒 message එකක් |
+| **Duplicate re-check** | Save කරන lock එක ඇතුලේම registry ආපහු කියවනවා — user දෙන්නෙක් එකවර එකම Invoice එක දැම්මොත් එකක් විතරයි යනවා, අනිත් එක "DUPLICATE (other user)" |
+| **Stats** | API calls · cache hits · retries · errors · last error |
+| **Health check** | Latency + worksheet ටික check |
+
+Sidebar එකේ **👤 User** එකක් දාන්න — lock owner සහ SKU `UPDATED_BY` එකට ඒක යනවා.
+
+---
+
+## 16. ⚠️ Shortage — PDF + Email
+
+Stock මදි නිසා reject වුණ document එකකට:
+
+* **`SHORT_<LOAD_ID>.pdf`** — shortage sheet (QR · short lines · required/available/short ·
+  **chart** · මුළු document lines) + **upload කරපු Invoice / DC pages එකම එකට**
+* **Shortage email** — ✉️ mailto හෝ 📎 `.eml` draft (shortage PDF attach + chart inline)
+* Document කීපයක් නම් 🗜️ ZIP එකක්
+
+---
+
+## 17. 📊 Email charts
+
+Email දෙකේම item details වලට chart එකක් **body එකට inline** යනවා (`cid:` image,
+Outlook / Gmail / Apple Mail වල පේනවා):
+
+| Email | Chart |
+|---|---|
+| Pick email | **Picked qty by item** — item එකකට qty + pallet ගාණ, ලොකුම එක red |
+| Shortage email | **Required vs Available vs Short** — grouped bars |
+
+Chart එක `.eml` එකේ විතරයි (mailto: වලට image යවන්න බෑ).
+Pick email එකේ chart එක result screen එකේ preview කරන්නත් පුළුවන්.

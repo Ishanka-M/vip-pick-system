@@ -35,15 +35,22 @@ def clean_item(code: Any) -> str:
 
 def base_item(code: Any) -> str:
     """
-    Matching key — suffix එක අයින් කරලා base ID එක විතරක්.
-        P162400-000-140 -> P162400
+    Matching key — Donaldson suffix එක අයින් කරලා base ID එක විතරක්.
+        P162400-000-140  -> P162400
         P550576-016-140. -> P550576
+        07011636-000-440 -> 07011636
+        100409-101       -> 100409
         P550945          -> P550945
+    Suffix එක කියලා ගන්නේ **3-digit කෑලි විතරක්** නම් — එහෙම නැත්නම් මුළු code එකම.
+        05-47174 -> 05-47174   (05 නෙවෙයි — වැරදි match වළක්වන්න)
     """
     s = clean_item(code)
     if not s:
         return ""
-    return s.split("-")[0].split("/")[0].strip()
+    parts = s.split("-")
+    if len(parts) > 1 and all(re.fullmatch(r"\d{3}", p) for p in parts[1:]):
+        return parts[0]
+    return s
 
 
 def _num(x: Any) -> float | None:
