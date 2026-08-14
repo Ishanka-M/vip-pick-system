@@ -17,6 +17,7 @@ from urllib.parse import quote
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt          # noqa: E402
+from matplotlib.ticker import MaxNLocator  # noqa: E402
 import pandas as pd
 import qrcode
 from pypdf import PdfReader, PdfWriter
@@ -426,6 +427,175 @@ def shortage_chart_png(short: pd.DataFrame, title: str = "Shortage by item",
     return _fig_png(fig, face=pal["page"])
 
 
+
+def _line_labels(keys: list[str], items: list[str], n_max: int = 14) -> tuple[list[str], int]:
+    """Tick labels — line number, plus the item number when there is room."""
+    if len(keys) <= n_max:
+        return [f"{k}\n{_short_label(i, 17)}" for k, i in zip(keys, items)], (
+            0 if len(keys) <= 8 else 20)
+    return list(keys), (0 if len(keys) <= 24 else 60)
+
+
+def pick_line_chart_png(alloc: pd.DataFrame, title: str = "Pick details by line",
+                        dark: bool = False, max_docs: int = 6) -> bytes | None:
+    """
+    Line chart over the document lines — this is what the pick actually is:
+    line 1, 2, 3 … in order, with the qty taken and the stock left behind.
+
+    One document  -> Pick qty + Balance left
+    Several       -> one line per document
+    """
+    if alloc is None or not len(alloc):
+        return None
+    d = alloc.copy()
+    for c in ("QTY_PICKED", "QTY_BALANCE"):
+        d[c] = pd.to_numeric(d.get(c), errors="coerce").fillna(0)
+    d["DOC_LINE"] = pd.to_numeric(d["DOC_LINE"], errors="coerce").fillna(0).astype(int)
+
+    docs = list(dict.fromkeys(d["DOC_NUMBER"].astype(str)))
+    # a line needs at least two points — one line item is a bar chart
+    if len(docs) == 1 and d["DOC_LINE"].nunique() < 2:
+        return pick_chart_png(alloc, "Picked qty by item", dark=dark)
+
+    pal = _palette(dark)
+    fig, ax = plt.subplots(figsize=(7.8, 3.5))
+    ax.set_facecolor(pal["page"])
+
+    ax2 = None
+    if len(docs) == 1:
+        g = (d.groupby("DOC_LINE")
+               .agg(qty=("QTY_PICKED", "sum"), bal=("QTY_BALANCE", "sum"),
+                    plt_n=("PALLET", "nunique"), item=("ITEM_NUMBER", "first"))
+               .sort_index())
+        x = list(range(len(g)))
+        # Balance left is often 100x the pick qty (a full pallet behind a 2-unit
+        # pick), so it goes on its own axis or the pick line flattens to nothing.
+        ax2 = ax.twinx()
+        ax2.set_facecolor("none")
+        ax2.plot(x, g["bal"], marker="s", markersize=4.5, linewidth=1.5, linestyle="--",
+                 color=CHART_OK, label="Balance left", zorder=2)
+        ax.plot(x, g["qty"], marker="o", markersize=6, linewidth=2.2,
+                color=CHART_ACC, label="Pick qty", zorder=3)
+        top = max(float(g["qty"].max()), 1.0)
+        for i, (q, n) in enumerate(zip(g["qty"], g["plt_n"])):
+            ax.annotate(f"{_n(q)}" + (f"  ({int(n)} plt)" if n > 1 else ""),
+                        (i, q), textcoords="offset points", xytext=(0, 10),
+                        ha="center", fontsize=7.6, color=CHART_ACC, weight="bold",
+                        zorder=5)
+        ax2.set_ylim(0, max(float(g["bal"].max()), 1.0) * 1.35)
+        ax2.yaxis.set_major_locator(MaxNLocator(nbins=6, integer=True))
+        ax2.set_ylabel("Balance left on pallets", fontsize=8.5, color=CHART_OK)
+        ax2.tick_params(axis="y", labelsize=8, colors=CHART_OK)
+        for sp in ("top", "left"):
+            ax2.spines[sp].set_visible(False)
+        ax2.spines["right"].set_color(CHART_OK)
+        h1, l1 = ax.get_legend_handles_labels()
+        h2, l2 = ax2.get_legend_handles_labels()
+        leg = ax.legend(h1 + h2, l1 + l2, fontsize=8, frameon=False,
+                        loc="upper left", ncols=2,
+                        bbox_to_anchor=(0, 1.02))
+        for t in leg.get_texts():
+            t.set_color(pal["ink"])
+        labels, rot = _line_labels([str(i) for i in g.index],
+                                   [str(v) for v in g["item"]])
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=7.4, color=pal["ink"], rotation=rot,
+                           ha="center" if rot == 0 else "right")
+        ax.set_title(f"{title}  ·  {docs[0]}", fontsize=11, color=pal["ink"],
+                     weight="bold", loc="left", pad=16)
+    else:
+        top = 1.0
+        for k, doc in enumerate(docs[:max_docs]):
+            one = (d[d["DOC_NUMBER"].astype(str) == doc].groupby("DOC_LINE")["QTY_PICKED"]
+                   .sum().sort_index())
+            top = max(top, float(one.max()))
+            ax.plot(list(one.index), one.values, marker="o", markersize=5,
+                    linewidth=1.8, label=_short_label(doc, 18),
+                    color=[CHART_ACC, CHART_INK if not dark else pal["bar"], CHART_OK,
+                           CHART_WARN, "#7B5EA7", "#2F8FA8"][k % 6], zorder=3)
+        ax.set_xlabel("Document line", fontsize=8.5, color=pal["soft"])
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))   # lines are 1,2,3…
+        ax.tick_params(axis="x", labelsize=8, colors=pal["soft"])
+        ax.set_title(f"{title}  ·  {len(docs)} documents", fontsize=11, color=pal["ink"],
+                     weight="bold", loc="left", pad=12)
+
+    ax.set_ylabel("Pick qty", fontsize=8.5,
+                  color=CHART_ACC if ax2 is not None else pal["soft"])
+    ax.set_ylim(0, top * 1.34)
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=7, integer=True))
+    ax.tick_params(axis="y", labelsize=8,
+                   colors=CHART_ACC if ax2 is not None else pal["soft"])
+    if ax2 is None:
+        leg = ax.legend(fontsize=8, frameon=False, loc="upper right", ncols=3)
+        for t in leg.get_texts():
+            t.set_color(pal["ink"])
+    ax.spines["top"].set_visible(False)
+    if ax2 is None:
+        ax.spines["right"].set_visible(False)
+    ax.spines["bottom"].set_color(pal["axis"])
+    ax.spines["left"].set_color(CHART_ACC if ax2 is not None else pal["axis"])
+    ax.grid(axis="y", color=pal["grid"], linewidth=0.9)
+    ax.set_axisbelow(True)
+    return _fig_png(fig, face=pal["page"])
+
+
+def shortage_line_chart_png(short: pd.DataFrame, title: str = "Shortage by line",
+                            dark: bool = False) -> bytes | None:
+    """Required / free / short across the short lines, in document order."""
+    if short is None or not len(short):
+        return None
+    d = short.copy()
+    for c in ("REQUIRED", "AVAILABLE", "SHORT", "ON_PICK_TASK"):
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0)
+        else:
+            d[c] = 0.0
+    d["DOC_LINE"] = pd.to_numeric(d.get("DOC_LINE"), errors="coerce").fillna(0).astype(int)
+    d = d.sort_values(["DOC_NUMBER", "DOC_LINE"]).reset_index(drop=True)
+    if len(d) < 2:                       # one short line — bars read better
+        return shortage_chart_png(short, "Shortage by item", dark=dark)
+
+    pal = _palette(dark)
+    fig, ax = plt.subplots(figsize=(7.8, 3.5))
+    ax.set_facecolor(pal["page"])
+    x = range(len(d))
+    ax.plot(x, d["REQUIRED"], marker="o", markersize=5.5, linewidth=1.9,
+            color=CHART_INK if not dark else pal["bar"], label="Required", zorder=3)
+    ax.plot(x, d["AVAILABLE"], marker="s", markersize=4.8, linewidth=1.7,
+            color=CHART_OK, label="Free stock", zorder=3)
+    ax.plot(x, d["SHORT"], marker="v", markersize=5.5, linewidth=1.9,
+            color=CHART_ACC, label="Short", zorder=4)
+    if float(d["ON_PICK_TASK"].sum()) > 0:
+        ax.plot(x, d["ON_PICK_TASK"], marker="d", markersize=4.5, linewidth=1.4,
+                linestyle=":", color=CHART_WARN, label="On pick task", zorder=2)
+
+    for i, v in enumerate(d["SHORT"]):
+        if v > 0:
+            ax.annotate(f"-{_n(v)}", (i, v), textcoords="offset points", xytext=(0, 10),
+                        ha="center", fontsize=7.8, color=CHART_ACC, weight="bold")
+
+    labels, rot = _line_labels([str(v) for v in d["DOC_LINE"]],
+                               [str(v) for v in d.get("DOC_ITEM_CODE", "")])
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(labels, fontsize=7.4, color=pal["ink"], rotation=rot,
+                       ha="center" if rot == 0 else "right")
+    ax.set_title(title, fontsize=11, color=pal["ink"], weight="bold", loc="left", pad=12)
+    ax.set_ylabel("Qty", fontsize=8.5, color=pal["soft"])
+    ax.set_ylim(0, max(1.0, float(d["REQUIRED"].max())) * 1.3)
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=7, integer=True))
+    ax.tick_params(axis="y", labelsize=8, colors=pal["soft"])
+    leg = ax.legend(fontsize=8, frameon=False, loc="upper right", ncols=4)
+    for t in leg.get_texts():
+        t.set_color(pal["ink"])
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+    for sp in ("bottom", "left"):
+        ax.spines[sp].set_color(pal["axis"])
+    ax.grid(axis="y", color=pal["grid"], linewidth=0.9)
+    ax.set_axisbelow(True)
+    return _fig_png(fig, face=pal["page"])
+
+
 # --------------------------------------------------------------------------- #
 # Shortage PDF (invoice එකත් එක්කම)
 # --------------------------------------------------------------------------- #
@@ -660,8 +830,8 @@ def pick_email_text(docs_info: list[dict[str, Any]], alloc: pd.DataFrame,
     lines += ["", f"Total picked qty: {_n(total)}", "",
               signature or "Thanks & regards,", ""]
     html.append("<p style='margin:14px 0 4px'><b>Item details</b></p>"
-                f"<img src='cid:{CID_CHART}' alt='Picked qty by item' "
-                "style='max-width:640px;width:100%;border:1px solid #B9C6D6;"
+                f"<img src='cid:{CID_CHART}' alt='Pick details by line' "
+                "style='max-width:660px;width:100%;border:1px solid #B9C6D6;"
                 "border-radius:6px'/>")
     html.append(f"<p><b>Total picked qty: {_n(total)}</b></p>"
                 f"<p>{(signature or 'Thanks &amp; regards,')}</p></div>")
@@ -736,8 +906,8 @@ def shortage_email_text(docs_info: list[dict[str, Any]], short: pd.DataFrame,
         html.append("</table>")
 
     html.append("<p style='margin:14px 0 4px'><b>Item details</b></p>"
-                f"<img src='cid:{CID_CHART}' alt='Shortage by item' "
-                "style='max-width:640px;width:100%;border:1px solid #B9C6D6;"
+                f"<img src='cid:{CID_CHART}' alt='Shortage by line' "
+                "style='max-width:660px;width:100%;border:1px solid #B9C6D6;"
                 "border-radius:6px'/>")
     lines += ["", f"Total short qty: {_n(tot_short)}",
               "Please arrange stock / confirm short shipment.", "",

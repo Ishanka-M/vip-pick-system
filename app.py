@@ -135,6 +135,12 @@ with st.sidebar:
         mail_sign = st.text_area("Signature", value=str(conf.get("mail_sign",
                                                                 "Thanks & regards,")),
                                  height=70)
+        chart_style = st.radio(
+            "Chart in the email", ["Line by document line", "Bar by item"],
+            help="Line: one point per document line, in order, with the pallet "
+                 "balance on a second axis. Bar: quantity grouped by item. "
+                 "A single line falls back to bars either way.")
+        CHART_LINE = chart_style.startswith("Line")
 
         new_addr = st.text_input("Save an address")
         ab1, ab2 = st.columns(2)
@@ -616,7 +622,9 @@ with tab_gen:
             rej_map = {str(r["DOC_NUMBER"]): str(r.get("REASON", ""))
                        for _, r in rej.iterrows()} if len(rej) else {}
 
-            sh_chart = PP.shortage_chart_png(sh)          # email + PDF (white)
+            # email + PDF always on white paper
+            sh_chart = (PP.shortage_line_chart_png(sh) if CHART_LINE
+                        else PP.shortage_chart_png(sh))
             sh_nums = list(dict.fromkeys(sh["DOC_NUMBER"].astype(str)))
             sh_att = st.checkbox("Add the Invoice / DC pages to the shortage PDF",
                                  value=True, key="sh_attach")
@@ -641,7 +649,9 @@ with tab_gen:
                 pdf_b = PP.build_shortage_pdf(
                     info, one, lines_df, src_map0.get(info["SOURCE_FILE"]),
                     attach_source=sh_att,
-                    chart=PP.shortage_chart_png(one, f"Shortage · {num}"))
+                    chart=(PP.shortage_line_chart_png(one, f"Shortage · {num}")
+                           if CHART_LINE
+                           else PP.shortage_chart_png(one, f"Shortage · {num}")))
                 fn = f"SHORT_{E.safe_name(num)}.pdf"
                 sh_files.append((fn, pdf_b))
                 c1, c2 = st.columns([3, 1])
@@ -652,8 +662,10 @@ with tab_gen:
                                    key=f"sh_{E.safe_name(num)}")
 
             if sh_chart:
-                st.image(PP.shortage_chart_png(sh, dark=(ui.theme_type() == "dark")),
-                         caption="Shortage by item - the same chart goes into the email",
+                _dk = ui.theme_type() == "dark"
+                st.image(PP.shortage_line_chart_png(sh, dark=_dk) if CHART_LINE
+                         else PP.shortage_chart_png(sh, dark=_dk),
+                         caption="The same chart goes into the shortage email",
                          width="content")
 
             s_subj, s_body, s_html = PP.shortage_email_text(sh_infos, sh, mail_sign)
@@ -807,7 +819,8 @@ with tab_gen:
 
             if infos:
                 subj0, body0, html0 = PP.pick_email_text(infos, m_alloc, mail_sign)
-                pick_chart = PP.pick_chart_png(m_alloc, "Picked qty by item")
+                pick_chart = (PP.pick_line_chart_png(m_alloc) if CHART_LINE
+                              else PP.pick_chart_png(m_alloc, "Picked qty by item"))
                 e1, e2 = st.columns([2, 1])
                 subject = e1.text_input("Subject", value=subj0, key="mail_subject")
                 add_att = e2.checkbox("Attach Excel + PDF", value=True)
@@ -848,9 +861,12 @@ with tab_gen:
                     st.caption("Double-click it and Outlook / Mail opens a draft with "
                                "the attachments and the chart already in place.")
                 if pick_chart:
-                    with st.expander("The item chart that goes into the email", expanded=False):
-                        st.image(PP.pick_chart_png(m_alloc, "Picked qty by item",
-                                                   dark=(ui.theme_type() == "dark")),
+                    with st.expander("The chart that goes into the email",
+                                     expanded=False):
+                        _dk = ui.theme_type() == "dark"
+                        st.image(PP.pick_line_chart_png(m_alloc, dark=_dk) if CHART_LINE
+                                 else PP.pick_chart_png(m_alloc, "Picked qty by item",
+                                                        dark=_dk),
                                  width="content")
 
         if gs_ready and not autosave and st.session_state.get("saved") != res["run_id"]:

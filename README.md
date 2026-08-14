@@ -359,10 +359,22 @@ Stock මදි නිසා reject වුණ document එකකට:
 Email දෙකේම item details වලට chart එකක් **body එකට inline** යනවා (`cid:` image,
 Outlook / Gmail / Apple Mail වල පේනවා):
 
-| Email | Chart |
+Sidebar → **Email** → **Chart in the email** එකෙන් style එක තෝරන්න.
+
+**Line by document line** (default) — pick එක ඇත්තටම sequence එකක් නිසා
+`x` axis = document line (1, 2, 3, …):
+
+| Email | Series |
 |---|---|
-| Pick email | **Picked qty by item** — item එකකට qty + pallet ගාණ, ලොකුම එක red |
-| Shortage email | **Required vs Available vs Short** — grouped bars |
+| Pick email | **Pick qty** (line එකකට, pallet කීයකින්ද කියලා annotate වෙනවා) + **Balance left on pallets** — දෙකේ magnitude එක හාත්පසින් වෙනස් නිසා balance එක **වෙනම (right) axis** එකකට දාලා තියෙනවා. නැත්නම් pallet එකේ 468 එකෙන් qty 2 flat වෙනවා |
+| Shortage email | **Required · Free stock · Short · On pick task** — line එකකට |
+| Document කීපයක් | document එකකට line එකක් (max 6), legend එකේ doc numbers |
+
+**Bar by item** — කලින් තිබ්බ එක: pick email එකට *Picked qty by item*,
+shortage email එකට *Required vs Available vs Short* grouped bars.
+
+Line එකක් විතරක් තියෙනවා නම් (point එකක් line chart එකකට මදි) **automatic
+bar chart එකට වැටෙනවා**. Y සහ X ticks integer විතරයි — qty වලට 2.5 වගේ එකක් නෑ.
 
 Chart එක `.eml` එකේ විතරයි (mailto: වලට image යවන්න බෑ).
 Pick email එකේ chart එක result screen එකේ preview කරන්නත් පුළුවන්.
