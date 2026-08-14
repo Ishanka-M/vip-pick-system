@@ -323,6 +323,8 @@ class EngineConfig:
     plants: list[str] = field(default_factory=list)
     statuses: list[str] = field(default_factory=lambda: ["Available"])
     pick_id_zero_only: bool = True       # Pick Id 0 විතරක් — 0 නොවන එක locked
+    # user confirm කරලා release කරපු ඒවා: {doc number: [pick id, …]}  ("*" = ඔක්කොම)
+    release_locked: dict[str, list[str]] = field(default_factory=dict)
     strategy: str = "FIFO"              # FIFO | LEAST_PALLETS | SINGLE_PALLET_FIRST
     exact_item_first: bool = True
     use_ledger: bool = True             # pallet balance එකට ledger එක බලනවද
@@ -387,12 +389,11 @@ def run_pick(
         inv = inv[inv["plant"].isin(cfg.plants)]
 
     # ---- Pick Id — 0 නොවන pallet දැනටමත් pick task එකකට allocate වෙලා ----
+    # Locked rows stay in the pool so a released document can still reach them;
+    # the gate is applied per document inside the loop.
+    released: dict[str, set[str]] = {str(k).strip(): {str(v).strip() for v in (ids or [])}
+                                     for k, ids in (cfg.release_locked or {}).items()}
     locked = inv[~inv["pick_free"]].copy() if cfg.pick_id_zero_only else inv.iloc[0:0].copy()
-    if cfg.pick_id_zero_only:
-        inv = inv[inv["pick_free"]]
-    locked_qty = (locked.groupby("base_id")["free_qty"].sum().to_dict() if len(locked) else {})
-    locked_ids = ({b: ", ".join(sorted({str(x) for x in g})[:4])
-                   for b, g in locked.groupby("base_id")["pick_id"]} if len(locked) else {})
 
     # ---- pallet level stock basis (QTY_BEFORE same ද කියලා බලලා) ----
     inv, basis = stock_basis(inv, ledger, use_ledger=cfg.use_ledger)
@@ -444,24 +445,43 @@ def run_pick(
         trial = {k: v for k, v in remaining.items()}
         doc_alloc: list[dict] = []
         doc_short: list[dict] = []
+        allow = released.get(num, set())
+        all_released = "*" in allow
+        used_ids: set[str] = set()
+
+        def _open(df: pd.DataFrame) -> pd.Series:
+            """Rows this document may take from — free, or released by the user."""
+            if not cfg.pick_id_zero_only:
+                return pd.Series(True, index=df.index)
+            ok = df["pick_free"]
+            if all_released:
+                return pd.Series(True, index=df.index)
+            if allow:
+                ok = ok | df["pick_id"].isin(allow)
+            return ok
 
         for ln in doc.lines:
             need = float(ln.qty)
-            pool = inv[inv["base_id"] == ln.base].copy()
-            pool["avail"] = pool["row_key"].map(trial).fillna(0.0)
-            pool = pool[pool["avail"] > 0]
+            base_pool = inv[inv["base_id"] == ln.base].copy()
+            base_pool["avail"] = base_pool["row_key"].map(trial).fillna(0.0)
+            base_pool = base_pool[base_pool["avail"] > 0]
+            open_mask = _open(base_pool)
+            pool = base_pool[open_mask].copy()
+            shut = base_pool[~open_mask]
             have = float(pool["avail"].sum())
 
             if pool.empty or have + 1e-9 < need:
-                lock_q = float(locked_qty.get(ln.base, 0.0))
+                lock_q = float(shut["avail"].sum()) if len(shut) else 0.0
+                lock_id = (", ".join(sorted({str(x) for x in shut["pick_id"]})[:4])
+                           if len(shut) else "")
                 if pool.empty and not lock_q:
                     why = "Item not in inventory / plant"
                 elif lock_q and have + lock_q + 1e-9 >= need:
                     why = (f"On another pick task — {_qty_str(lock_q)} locked "
-                           f"(Pick Id {locked_ids.get(ln.base, '')})")
+                           f"(Pick Id {lock_id})")
                 elif lock_q:
                     why = (f"Stock short · {_qty_str(lock_q)} also locked to a pick task "
-                           f"(Pick Id {locked_ids.get(ln.base, '')})")
+                           f"(Pick Id {lock_id})")
                 else:
                     why = "Stock short"
                 doc_short.append({
@@ -469,8 +489,8 @@ def run_pick(
                     "DOC_ITEM_CODE": ln.item_code, "BASE_ID": ln.base,
                     "DESCRIPTION": _desc("", ln.item_code, ln.description),
                     "REQUIRED": need, "AVAILABLE": have,
-                    "ON_PICK_TASK": lock_q, "SHORT": max(0.0, need - have),
-                    "REASON": why,
+                    "ON_PICK_TASK": lock_q, "PICK_IDS": lock_id,
+                    "SHORT": max(0.0, need - have), "REASON": why,
                 })
                 continue
 
@@ -483,6 +503,8 @@ def run_pick(
                 before = float(trial.get(r["row_key"], 0.0))
                 trial[r["row_key"]] = before - take
                 need -= take
+                if not bool(r.get("pick_free", True)):
+                    used_ids.add(str(r.get("pick_id", "")))
                 doc_alloc.append({
                     "RUN_ID": run_id, "PICK_DATE": stamp, "DOC_TYPE": doc.doc_type,
                     "DOC_NUMBER": num, "DOC_LINE": ln.line_no,
@@ -588,9 +610,13 @@ def run_pick(
         m["LOAD_ID"] = num
         master_rows.append(m)
 
+        rel_note = ", ".join(sorted(x for x in used_ids if x))
+        if rel_note:
+            doc_check = (doc_check + " · " if doc_check != "OK" else "") + \
+                f"RELEASED from pick task {rel_note}"
         accepted.append({
             "DOC_NUMBER": num, "LOAD_ID": num, "DOC_TYPE": doc.doc_type,
-            "DOC_DATE": doc.doc_date,
+            "DOC_DATE": doc.doc_date, "RELEASED": rel_note,
             "REF_NUMBER": doc.ref_number, "DOC_CHECK": doc_check, "LINES": len(doc.lines),
             "WMS_LINES": line_no, "DOC_QTY": sum(l.qty for l in doc.lines),
             "PICKED_QTY": sum(a["QTY_PICKED"] for a in doc_alloc),
@@ -619,7 +645,7 @@ def run_pick(
         "shortage": pd.DataFrame(shortages),
         "verify": pd.DataFrame(verify_rows, columns=VERIFY_COLS),
         "basis": basis,
-        "locked": _locked_view(locked),
+        "locked": _locked_view(locked, released),
         "accepted": pd.DataFrame(accepted),
         "balance": pallet_balance(basis, alloc_df, cap),
         "cfg": cfg,
@@ -690,6 +716,52 @@ def _verify_doc(doc, doc_alloc: list[dict], doc_detail: list[dict]) -> tuple[lis
     return rows, bad
 
 
+RELEASE_COLS = ["DOC_NUMBER", "DOC_TYPE", "SHORT_LINES", "SHORT_QTY", "ON_PICK_TASK",
+                "PICK_IDS", "ITEMS"]
+
+
+def releasable(res: dict[str, Any]) -> pd.DataFrame:
+    """
+    Documents that failed **only** because the stock sits on another pick task —
+    every short line would be covered if those pallets were released.
+    Anything genuinely out of stock is not listed: a confirmation cannot invent
+    inventory.
+    """
+    sh = res.get("shortage")
+    if sh is None or not len(sh) or "ON_PICK_TASK" not in sh.columns:
+        return pd.DataFrame(columns=RELEASE_COLS)
+
+    d = sh.copy()
+    for c in ("REQUIRED", "AVAILABLE", "ON_PICK_TASK", "SHORT"):
+        d[c] = pd.to_numeric(d.get(c), errors="coerce").fillna(0.0)
+
+    rows: list[dict] = []
+    for num, g in d.groupby("DOC_NUMBER"):
+        if not (g["ON_PICK_TASK"] > 0).any():
+            continue
+        if not ((g["AVAILABLE"] + g["ON_PICK_TASK"]) + QTY_TOL >= g["REQUIRED"]).all():
+            continue                      # some line is short even after a release
+        # The reason string caps the ids for readability — the release set must
+        # be complete, so take it from the locked frame by base id instead.
+        bases = {str(b) for b in g["BASE_ID"]}
+        lk = res.get("locked")
+        ids: set[str] = set()
+        if lk is not None and len(lk) and "BASE_ID" in lk.columns:
+            ids = {str(x) for x in lk.loc[lk["BASE_ID"].astype(str).isin(bases), "PICK_ID"]
+                   if str(x).strip()}
+        if not ids:
+            for v in g.get("PICK_IDS", pd.Series(dtype=str)):
+                ids |= {x.strip() for x in str(v).split(",") if x.strip()}
+        rows.append({
+            "DOC_NUMBER": str(num), "DOC_TYPE": str(g["DOC_TYPE"].iloc[0]),
+            "SHORT_LINES": int(len(g)), "SHORT_QTY": float(g["SHORT"].sum()),
+            "ON_PICK_TASK": float(g["ON_PICK_TASK"].sum()),
+            "PICK_IDS": ", ".join(sorted(ids)),
+            "ITEMS": ", ".join(sorted({str(x) for x in g["DOC_ITEM_CODE"]})),
+        })
+    return pd.DataFrame(rows, columns=RELEASE_COLS)
+
+
 # --------------------------------------------------------------------------- #
 # Per LOAD_ID slicing / files
 # --------------------------------------------------------------------------- #
@@ -731,6 +803,7 @@ def doc_bundle(res: dict[str, Any], load_id: str) -> dict[str, Any]:
             "TOTAL_QTY": info.get("DOC_QTY", 0),
             "PALLETS": info.get("PALLETS", 0),
             "VERIFY": info.get("VERIFY", ""),
+            "RELEASED": info.get("RELEASED", ""),
             "SOURCE_FILE": info.get("SOURCE_FILE", ""),
             "RUN_ID": res.get("run_id", ""),
             "PICK_DATE": res.get("pick_date", ""),
@@ -822,19 +895,25 @@ def pallet_balance(basis: pd.DataFrame, alloc_df: pd.DataFrame,
 
 
 LOCKED_COLS = ["PALLET", "LOCATION_ID", "ITEM_NUMBER", "BASE_ID", "DESCRIPTION",
-               "LOT_NUMBER", "PLANT", "UOM", "QTY", "PICK_ID", "STATUS"]
+               "LOT_NUMBER", "PLANT", "UOM", "QTY", "PICK_ID", "RELEASED", "STATUS"]
 
 
-def _locked_view(locked: pd.DataFrame) -> pd.DataFrame:
+def _locked_view(locked: pd.DataFrame,
+                 released: dict[str, set[str]] | None = None) -> pd.DataFrame:
     """Pick Id 0 නොවන නිසා අයින් කරපු stock — කොහෙද, කීයද, මොන pick task එකේද."""
     if locked is None or not len(locked):
         return pd.DataFrame(columns=LOCKED_COLS)
+    free_ids: set[str] = set()
+    for ids in (released or {}).values():
+        free_ids |= {str(i) for i in ids}
     d = locked.rename(columns={
         "pallet": "PALLET", "location_id": "LOCATION_ID", "base_id": "BASE_ID",
         "description": "DESCRIPTION", "lot_number": "LOT_NUMBER", "plant": "PLANT",
         "uom": "UOM", "free_qty": "QTY", "pick_id": "PICK_ID", "status": "STATUS"}).copy()
     d["ITEM_NUMBER"] = d["item_number_raw"].where(d["item_number_raw"].astype(bool),
                                                   d["item_number"])
+    d["RELEASED"] = ["YES" if ("*" in free_ids or str(p) in free_ids) else ""
+                     for p in d["PICK_ID"]]
     return (d[LOCKED_COLS].sort_values(["BASE_ID", "PALLET"]).reset_index(drop=True))
 
 

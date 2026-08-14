@@ -195,7 +195,22 @@ def build_pick_sheet(info: dict[str, Any], alloc: pd.DataFrame,
         ("PALLETS", _n(info.get("PALLETS", ""))),
         ("QTY CHECK", info.get("VERIFY", "")),
     ], cols=5, width=W))
-    story.append(Spacer(1, 7))
+    story.append(Spacer(1, 5))
+
+    if str(info.get("RELEASED", "")).strip():
+        note = Table([[Paragraph(
+            "<b>RELEASED FROM ANOTHER PICK TASK</b> &nbsp; Stock for this order was "
+            "committed to pick task <b>" + _txt(info.get("RELEASED")) + "</b> and was "
+            "released by the user before picking. Confirm the other task before the "
+            "load leaves.", P_CELL)]], colWidths=[W])
+        note.setStyle(TableStyle([
+            ("BOX", (0, 0), (-1, -1), 0.8, ACC),
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#FFF3F5")),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6)]))
+        story += [note, Spacer(1, 5)]
+    story.append(Spacer(1, 2))
 
     # ---------------- pick details ----------------
     story.append(Paragraph("PICK DETAILS — pallet level", P_H))
@@ -806,8 +821,10 @@ def pick_email_text(docs_info: list[dict[str, Any]], alloc: pd.DataFrame,
             f"Lines / Qty   : {d.get('LINES','')} lines · {_n(d.get('TOTAL_QTY'))} pcs",
             f"Pallets       : {d.get('PALLETS','')}",
             f"Qty check     : {d.get('VERIFY','')}",
-            "",
         ]
+        if str(d.get("RELEASED", "")).strip():
+            lines.append(f"Released      : taken from pick task {d.get('RELEASED')}")
+        lines.append("")
         html.append(
             "<table cellpadding='5' cellspacing='0' style='border-collapse:collapse;"
             "border:1px solid #B9C6D6;margin-bottom:8px;font-size:12.5px'>"
@@ -823,7 +840,12 @@ def pick_email_text(docs_info: list[dict[str, Any]], alloc: pd.DataFrame,
             f"<tr><td style='border:1px solid #B9C6D6'>Pallets</td>"
             f"<td style='border:1px solid #B9C6D6'>{d.get('PALLETS','')}</td></tr>"
             f"<tr><td style='border:1px solid #B9C6D6'>Qty check</td>"
-            f"<td style='border:1px solid #B9C6D6'>{d.get('VERIFY','')}</td></tr></table>"
+            f"<td style='border:1px solid #B9C6D6'>{d.get('VERIFY','')}</td></tr>"
+            + (f"<tr><td style='border:1px solid #B9C6D6;background:#FFF3F5'>"
+               f"<b>Released</b></td><td style='border:1px solid #B9C6D6;"
+               f"background:#FFF3F5'>from pick task {d.get('RELEASED','')}</td></tr>"
+               if str(d.get("RELEASED", "")).strip() else "")
+            + "</table>"
         )
 
     if alloc is not None and len(alloc):

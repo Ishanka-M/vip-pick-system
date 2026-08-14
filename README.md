@@ -537,3 +537,41 @@ Document      Ln  Item Number       Pallet                 Location          Qty
 333262712337   1  P502639-288-140   DONAL130826-SB-13-1    IMDS01             24      300
 333/26-27/62   4  P550576-016-140.  DONA081026-M-2         IMDS01             20      232
 ```
+
+---
+
+## 21. Release stock from another pick task
+
+Document එකක් block වුණේ **stock එක තියෙනවා, ඒත් තව pick task එකකට allocate
+වෙලා** කියන එක නිසා විතරක් නම් —
+
+```
+On another pick task — 12 locked (Pick Id 1284465, 1294759)
+```
+
+— result එකේ **Release stock** panel එකක් එනවා:
+
+1. මොන documents ද කියලා පෙන්නනවා — short lines · short qty · locked qty · Pick Ids
+2. *"The pallets that would be taken"* expander එකේ pallet · location · qty ·
+   Pick Id ඔක්කොම
+3. **"I have checked the other pick task and this stock is free to take"**
+   tick කරන කල් button එක disabled
+4. **Release and pick** → ඒ Pick Id ටික විතරක් open කරලා pick එක ආපහු run වෙනවා
+
+**Release වෙන්නේ තෝරගත්ත document එකට, තෝරගත්ත Pick Id වලට විතරයි.** අනිත්
+locked pallet ටික ඒ විදිහටම locked. `"*"` දුන්නොත් ඒ document එකට ඔක්කොම open.
+
+**ඇත්තටම stock මදි නම් panel එක එන්නේම නෑ** — `AVAILABLE + ON_PICK_TASK ≥
+REQUIRED` හැම line එකකටම හරි ගියොත් විතරයි. Confirmation එකකින් stock හදන්න බෑ.
+
+**Audit** — මේක silent override එකක් නෙවෙයි:
+
+| තැන | මොකද පේන්නේ |
+|---|---|
+| `DOC_REGISTRY` → `DOC_CHECK` | `RELEASED from pick task 1284465, 1294759` |
+| Pick sheet PDF | header එක යටින් red box එකක් — *"RELEASED FROM ANOTHER PICK TASK … Confirm the other task before the load leaves."* |
+| Pick email | `Released : taken from pick task …` (text + HTML දෙකේම) |
+| On Pick Task report | `RELEASED` column එකේ `YES` |
+
+Result එකේ **Undo the release** button එකෙන් ආපහු ගන්නත් පුළුවන් — release එක
+අයින් වෙලා pick එක ආපහු run වෙනවා.

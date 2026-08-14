@@ -437,15 +437,15 @@ with tab_gen:
                 st.rerun()
 
     # ---------------- inventory + plant confirm ---------------- #
-    inv_raw = None
-    if f_inv is not None:
-        if st.session_state.get("inv_sig") != (f_inv.name, f_inv.size):
-            with st.spinner("Reading the inventory..."):
-                st.session_state["inv_raw"] = pd.read_excel(f_inv, dtype=str)
-            st.session_state["inv_sig"] = (f_inv.name, f_inv.size)
-            st.session_state.pop("plants_ok", None)
-            st.session_state.pop("result", None)
-        inv_raw = st.session_state.get("inv_raw")
+    # the parsed frame lives in session state, so a rerun that loses the
+    # uploader value still has the inventory to work with
+    if f_inv is not None and st.session_state.get("inv_sig") != (f_inv.name, f_inv.size):
+        with st.spinner("Reading the inventory..."):
+            st.session_state["inv_raw"] = pd.read_excel(f_inv, dtype=str)
+        st.session_state["inv_sig"] = (f_inv.name, f_inv.size)
+        for _k in ("plants_ok", "result", "release_locked"):
+            st.session_state.pop(_k, None)
+    inv_raw = st.session_state.get("inv_raw")
 
     if inv_raw is not None:
         inv_norm = E.normalize_inventory(inv_raw)
@@ -498,7 +498,9 @@ with tab_gen:
             wh_id=wh_id, client_code=client_code, order_type=order_type,
             plants=st.session_state["plants_ok"], statuses=statuses, strategy=strategy,
             exact_item_first=exact_first, use_ledger=use_ledger,
-            pick_id_zero_only=pick_id_gate, blank_fill=blank_fill,
+            pick_id_zero_only=pick_id_gate,
+            release_locked=st.session_state.get("release_locked", {}),
+            blank_fill=blank_fill,
             fill_item_number_col=fill_item_col, merge_same_item_lines=merge_lines,
             override_doc_check=override,
             pick_date=datetime.combine(pick_date, datetime.now().time()),
@@ -511,7 +513,8 @@ with tab_gen:
                               label_visibility="collapsed")
         go = gc2.button("Generate pick", type="primary", width="stretch")
 
-        if go:
+        _auto = st.session_state.pop("rerun_pick", False)
+        if go or _auto:
             ledger = None
             done_docs: set[str] = set()
             if gs_ready:
@@ -604,6 +607,57 @@ with tab_gen:
         # ------------------------------------------------------------------ #
         # Shortage — PDF (merged with the invoice) + email
         # ------------------------------------------------------------------ #
+        rel = E.releasable(res)
+        if len(rel):
+            st.divider()
+            ui.section("Release stock",
+                       hint="blocked only because the stock sits on another pick task")
+            st.markdown(
+                ui.stamp("confirmation needed", "warn") + " &nbsp;" +
+                ui.muted("These documents have enough stock — it is just committed "
+                         "to another pick task in the WMS. Releasing takes it anyway."),
+                unsafe_allow_html=True)
+            st.dataframe(rel, hide_index=True, width="stretch")
+
+            lk_all = res.get("locked", pd.DataFrame())
+            if len(lk_all):
+                with st.expander("The pallets that would be taken"):
+                    ids_all = {i.strip() for v in rel["PICK_IDS"] for i in str(v).split(",")
+                               if i.strip()}
+                    st.dataframe(lk_all[lk_all["PICK_ID"].astype(str).isin(ids_all)],
+                                 hide_index=True, width="stretch")
+
+            rc1, rc2 = st.columns([2, 1])
+            take = rc1.multiselect("Documents to release", rel["DOC_NUMBER"].tolist(),
+                                   default=rel["DOC_NUMBER"].tolist(),
+                                   key="release_pick")
+            sure_rel = rc1.checkbox(
+                "I have checked the other pick task and this stock is free to take",
+                key="release_confirm")
+            rc2.write("")
+            if rc2.button("Release and pick", type="primary", width="stretch",
+                          disabled=not (take and sure_rel)):
+                book = dict(st.session_state.get("release_locked", {}))
+                for _, r in rel[rel["DOC_NUMBER"].isin(take)].iterrows():
+                    book[str(r["DOC_NUMBER"])] = [i.strip() for i in
+                                                  str(r["PICK_IDS"]).split(",") if i.strip()]
+                st.session_state["release_locked"] = book
+                st.session_state["rerun_pick"] = True
+                st.toast(f"Released {len(take)} document(s) — picking again", icon="🔓")
+                st.rerun()
+            if not sure_rel:
+                rc1.caption("The tick box is the confirmation — nothing is released "
+                            "until it is on.")
+
+        if st.session_state.get("release_locked"):
+            done_rel = ", ".join(st.session_state["release_locked"])
+            st.caption(f"Released from a pick task in this run: {done_rel} — "
+                       "logged against the document in DOC_REGISTRY.")
+            if st.button("Undo the release"):
+                st.session_state.pop("release_locked", None)
+                st.session_state["rerun_pick"] = True
+                st.rerun()
+
         lk = res.get("locked", pd.DataFrame())
         if len(lk):
             with st.expander(f"On a pick task — excluded ({len(lk)} pallets · "
@@ -1353,6 +1407,10 @@ with tab_help:
    WMS has already committed that pallet to another pick task — its `Status` still
    reads `Available`, so without this gate the same stock would be picked twice.
    Whatever is skipped shows up under **On a pick task** with its Pick Id.
+   If a document fails *only* because of this, a **Release stock** panel appears:
+   tick the confirmation, press **Release and pick**, and those pallets are used.
+   The release is recorded against the document (`DOC_CHECK`), printed on the pick
+   sheet and written into the email — so it is never a silent override.
 6. A document is picked **only if every line can be filled**. One short line
    blocks the whole document (`STOCK SHORT`) — there is no partial picking.
    When the missing quantity does exist but is locked, the reason says so:
