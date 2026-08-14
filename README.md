@@ -506,3 +506,34 @@ Stock short · 128 also locked to a pick task (Pick Id …)
 
 Shortage PDF එකේත් **On pick task** column එකක් තියෙනවා. එතකොට "stock නෑ" කියලා
 හොයන්න යන්නේ නැතුව, කවුරු හරි ඒක pick task එකකට දාලා තියෙනවා කියලා වහාම පේනවා.
+
+---
+
+## 20. Email — plain-text table alignment
+
+Email එකේ කොටස් 2ක් යනවා: **HTML** එකයි (mail client එකක් පෙන්නන්නේ ඒක)
+**plain text** එකයි (fallback). HTML එකේ ඇත්ත `<table>` එකක් තියෙනවා, ඒත් plain
+text එකේ column ගැලපෙන්නේ space ගාණෙන් — ඒක කැඩිලා තිබුණා.
+
+**හේතු 2ක්:**
+
+1. Column width `<16`, `<20` වගේ **hardcode වෙලා තිබුණා**. Doc number එකක් හෝ
+   pallet id එකක් ඊට වඩා දිග වුණොත් ඊට පස්සේ තියෙන ඔක්කොම එහාට තල්ලු වෙනවා.
+   දැන් width එක **data එකෙන්ම calculate වෙනවා** (`_ascii_table`), header එකට
+   යටින් `----` rule එකකුත් තියෙනවා.
+2. App එකේ preview text area එකේ font එක **proportional** (Barlow) වුණා —
+   ඒකෙන් හරියට align වුණ table එකකුත් කැඩිලා පේනවා. දැන් mail body 2ම
+   monospace (`st-key-mail_body` · `st-key-sh_body` scoped CSS).
+
+`text/plain` part එකට `format=fixed` header එකත් දාලා තියෙනවා — ඒක respect කරන
+client එකක් column straight තියාගන්නවා.
+
+**Document කීපයක් නම්** `Ln` එක document එකකට 1, 2, 3 කියලා restart වෙන නිසා
+**Document column එකක්** එකතු වෙනවා. එකක් විතරයි නම් ඒක නෑ — table එක පටුයි.
+
+```
+Document      Ln  Item Number       Pallet                 Location          Qty  Balance
+------------  --  ----------------  ---------------------  ----------------  ---  -------
+333262712337   1  P502639-288-140   DONAL130826-SB-13-1    IMDS01             24      300
+333/26-27/62   4  P550576-016-140.  DONA081026-M-2         IMDS01             20      232
+```

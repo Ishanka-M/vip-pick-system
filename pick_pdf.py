@@ -740,6 +740,32 @@ def build_shortage_pdf(info: dict[str, Any], short: pd.DataFrame,
 CID_CHART = "itemchart@efl"
 
 
+def _ascii_table(headers: list[str], rows: list[list[str]],
+                 right: set[int] | None = None, gap: str = "  ") -> list[str]:
+    """
+    Plain-text table where the header always sits over its own column.
+
+    Column widths come from the data, not from guessed constants — a long doc
+    number or pallet id used to push every following column out of line.
+    Mail clients that render text/plain in a proportional font will still drift,
+    which is why the HTML part carries a real <table>; this is the fallback.
+    """
+    right = right or set()
+    cells = [[str("" if c is None else c) for c in r] for r in rows]
+    n = len(headers)
+    width = [max([len(headers[i])] + [len(r[i]) for r in cells]) if cells
+             else len(headers[i]) for i in range(n)]
+
+    def fmt(vals: list[str]) -> str:
+        out = []
+        for i, v in enumerate(vals):
+            out.append(v.rjust(width[i]) if i in right else v.ljust(width[i]))
+        return gap.join(out).rstrip()
+
+    rule = gap.join("-" * w for w in width)
+    return [fmt(headers), rule] + [fmt(r) for r in cells]
+
+
 def _addr_list(raw: Any) -> list[str]:
     if raw is None:
         return []
@@ -801,19 +827,20 @@ def pick_email_text(docs_info: list[dict[str, Any]], alloc: pd.DataFrame,
         )
 
     if alloc is not None and len(alloc):
-        lines += ["Pick details:",
-                  f"{'Ln':<4}{'Item Number':<20}{'Pallet':<24}{'Location':<18}"
-                  f"{'Qty':>6}  Balance"]
+        lines.append("Pick details:")
+        # line numbers restart per document, so name the document when there
+        # is more than one — otherwise "Ln 1" twice is ambiguous
+        _multi = alloc["DOC_NUMBER"].astype(str).nunique() > 1
+        _rows: list[list[str]] = []
         html.append("<table cellpadding='5' cellspacing='0' style='border-collapse:collapse;"
                     "border:1px solid #B9C6D6;font-size:12px'><tr style='background:#0F1F33;"
                     "color:#fff'><th>Doc</th><th>Ln</th><th>Item Number</th><th>Pallet</th>"
                     "<th>Location</th><th>Qty</th><th>Balance</th></tr>")
         for _, r in alloc.iterrows():
-            lines.append(
-                f"{str(r.get('DOC_LINE','')):<4}{str(r.get('ITEM_NUMBER','')):<20}"
-                f"{str(r.get('PALLET','')):<24}{str(r.get('LOCATION_ID','')):<18}"
-                f"{_n(r.get('QTY_PICKED')):>6}  {_n(r.get('QTY_BALANCE'))}"
-            )
+            _row = [str(r.get("DOC_LINE", "")), str(r.get("ITEM_NUMBER", "")),
+                    str(r.get("PALLET", "")), str(r.get("LOCATION_ID", "")),
+                    _n(r.get("QTY_PICKED")), _n(r.get("QTY_BALANCE"))]
+            _rows.append(([str(r.get("DOC_NUMBER", ""))] + _row) if _multi else _row)
             html.append(
                 "<tr>"
                 f"<td style='border:1px solid #B9C6D6'>{r.get('DOC_NUMBER','')}</td>"
@@ -825,6 +852,9 @@ def pick_email_text(docs_info: list[dict[str, Any]], alloc: pd.DataFrame,
                 f"<td style='border:1px solid #B9C6D6' align='right'>{_n(r.get('QTY_BALANCE'))}</td>"
                 "</tr>"
             )
+        _head = ["Ln", "Item Number", "Pallet", "Location", "Qty", "Balance"]
+        lines += (_ascii_table(["Document"] + _head, _rows, right={1, 5, 6}) if _multi
+                  else _ascii_table(_head, _rows, right={0, 4, 5}))
         html.append("</table>")
 
     lines += ["", f"Total picked qty: {_n(total)}", "",
@@ -877,18 +907,19 @@ def shortage_email_text(docs_info: list[dict[str, Any]], short: pd.DataFrame,
             "</table>")
 
     if short is not None and len(short):
-        lines += ["Short lines:",
-                  f"{'Doc':<16}{'Ln':<4}{'Item':<20}{'Req':>7}{'Avail':>8}{'Short':>8}"]
+        lines.append("Short lines:")
+        _multi = short["DOC_NUMBER"].astype(str).nunique() > 1
+        _rows: list[list[str]] = []
         html.append("<table cellpadding='5' cellspacing='0' style='border-collapse:"
                     "collapse;border:1px solid #B9C6D6;font-size:12px'>"
                     "<tr style='background:#0F1F33;color:#fff'><th>Document</th><th>Ln</th>"
                     "<th>Item Code</th><th>Description</th><th>Required</th>"
                     "<th>Available</th><th>Short</th></tr>")
         for _, r in short.iterrows():
-            lines.append(
-                f"{str(r.get('DOC_NUMBER','')):<16}{str(r.get('DOC_LINE','')):<4}"
-                f"{str(r.get('DOC_ITEM_CODE','')):<20}{_n(r.get('REQUIRED')):>7}"
-                f"{_n(r.get('AVAILABLE')):>8}{_n(r.get('SHORT')):>8}")
+            _row = [str(r.get("DOC_LINE", "")), str(r.get("DOC_ITEM_CODE", "")),
+                    _n(r.get("REQUIRED")), _n(r.get("AVAILABLE")),
+                    _n(r.get("ON_PICK_TASK")), _n(r.get("SHORT"))]
+            _rows.append(([str(r.get("DOC_NUMBER", ""))] + _row) if _multi else _row)
             html.append(
                 "<tr>"
                 f"<td style='border:1px solid #B9C6D6'>{r.get('DOC_NUMBER','')}</td>"
@@ -903,6 +934,9 @@ def shortage_email_text(docs_info: list[dict[str, Any]], short: pd.DataFrame,
                 f"{_n(r.get('AVAILABLE'))}</td>"
                 f"<td style='border:1px solid #B9C6D6;color:#FF365B' align='right'>"
                 f"<b>{_n(r.get('SHORT'))}</b></td></tr>")
+        _head = ["Ln", "Item", "Req", "Free", "On pick", "Short"]
+        lines += (_ascii_table(["Document"] + _head, _rows, right={1, 3, 4, 5, 6})
+                  if _multi else _ascii_table(_head, _rows, right={0, 2, 3, 4, 5}))
         html.append("</table>")
 
     html.append("<p style='margin:14px 0 4px'><b>Item details</b></p>"
@@ -946,7 +980,15 @@ def build_eml(to: Any, subject: str, body: str, html: str = "", cc: Any = None,
         msg["From"] = sender
     msg["X-Unsent"] = "1"
     msg["Date"] = datetime.now().strftime("%a, %d %b %Y %H:%M:%S %z") or ""
+    # Some clients (Outlook in particular) render text/plain in a proportional
+    # font, which pulls fixed-width tables apart. Ask for a monospace face —
+    # clients that honour format=flowed/fixed will keep the columns straight.
     msg.set_content(body)
+    try:
+        msg.replace_header("Content-Type",
+                           'text/plain; charset="utf-8"; format=fixed')
+    except KeyError:
+        pass
     if html:
         msg.add_alternative(html, subtype="html")
         if inline_png:

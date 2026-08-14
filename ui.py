@@ -243,6 +243,12 @@ code, kbd{{ font-family:var(--mono); font-size:.86em; color:inherit;
   color:inherit; }}
 .stTextInput input:focus, .stTextArea textarea:focus{{ border-color:var(--info);
   box-shadow:0 0 0 3px color-mix(in srgb, {INFO} 22%, transparent); }}
+/* The mail body holds fixed-width tables — a proportional font makes the columns
+   look broken even when the text itself is perfectly aligned. Streamlit puts a
+   `st-key-<key>` class on any keyed widget, so this hits only those two. */
+.st-key-mail_body textarea, .st-key-sh_body textarea{{
+  font-family:var(--mono); font-size:.79rem; line-height:1.45;
+  white-space:pre; overflow-x:auto; }}
 [data-baseweb="select"]>div{{ border-radius:7px; border-color:var(--line-2); }}
 [data-baseweb="tag"] span:not([data-testid]):not([translate="no"]){{
   font-family:var(--mono); font-size:.76rem; }}
