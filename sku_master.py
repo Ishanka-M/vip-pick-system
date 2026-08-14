@@ -72,7 +72,7 @@ def normalize(df: pd.DataFrame, source: str = "", user: str = "") -> pd.DataFram
     d = d.rename(columns=_colmap(d))
 
     if "ITEM_NUMBER" not in d.columns:
-        raise ValueError("'Item Number' column එකක් හම්බුණේ නෑ.")
+        raise ValueError("No 'Item Number' column found in this file.")
     if "ITEM_DESCRIPTION" not in d.columns:
         d["ITEM_DESCRIPTION"] = ""
 

@@ -392,13 +392,13 @@ def run_pick(
         if num in seen_batch:
             rejected.append({"DOC_NUMBER": num, "DOC_TYPE": doc.doc_type,
                              "REASON": "DUPLICATE (batch)",
-                             "DETAIL": "මේ upload එකේම එකම number එක ආපහු — එකක් විතරක් ගත්තා",
+                             "DETAIL": "Same number appears twice in this upload - kept the first one",
                              "SOURCE_FILE": doc.source_file})
             continue
         if num in processed_docs:
             rejected.append({"DOC_NUMBER": num, "DOC_TYPE": doc.doc_type,
                              "REASON": "DUPLICATE (already processed)",
-                             "DETAIL": "කලින් run එකක pick කරලා තියෙනවා",
+                             "DETAIL": "Already picked in an earlier run",
                              "SOURCE_FILE": doc.source_file})
             continue
         seen_batch.add(num)
@@ -472,7 +472,7 @@ def run_pick(
                 f"have {s['AVAILABLE']:g})" for s in doc_short
             )
             rejected.append({"DOC_NUMBER": num, "DOC_TYPE": doc.doc_type,
-                             "REASON": "STOCK SHORT — pick කළේ නෑ",
+                             "REASON": "STOCK SHORT - not picked",
                              "DETAIL": miss, "SOURCE_FILE": doc.source_file})
             continue
 
@@ -841,6 +841,6 @@ def build_report_excel(res: dict[str, Any]) -> bytes:
             if key == "basis" and df is not None and len(df):
                 df = df[df["MODE"] != "NEW"]          # ledger history තියෙන ඒවා විතරයි
             if df is None or not len(df):
-                df = pd.DataFrame({"info": ["— කිසිවක් නෑ —"]})
+                df = pd.DataFrame({"info": ["- nothing to show -"]})
             df.to_excel(xw, sheet_name=name[:31], index=False)
     return buf.getvalue()

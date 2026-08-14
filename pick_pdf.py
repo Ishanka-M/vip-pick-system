@@ -676,12 +676,13 @@ def shortage_email_text(docs_info: list[dict[str, Any]], short: pd.DataFrame,
                + (f" +{len(nums) - 3}" if len(nums) > 3 else ""))
 
     lines = ["Hi,", "",
-             "Below document(s) could NOT be picked - stock is short.",
-             "Full document qty නැති නිසා pick කරලා නෑ (partial pick කරන්නේ නෑ).", ""]
+             "The document(s) below could NOT be picked - stock is short.",
+             "Nothing was picked for them: an order is only picked when the full "
+             "document quantity is available (no partial picking).", ""]
     html = ["<div style='font-family:Segoe UI,Arial,sans-serif;font-size:13px;"
             "color:#0F1F33'><p>Hi,</p><p><b style='color:#FF365B'>Stock shortage</b> - "
-            "below document(s) could not be picked. Full document qty නැති නිසා "
-            "pick කරලා නෑ.</p>"]
+            "the document(s) below could not be picked. An order is only picked when "
+            "the full document quantity is available, so nothing was picked.</p>"]
 
     for d in docs_info:
         num = d.get("DOC_NUMBER", "")

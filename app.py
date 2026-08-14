@@ -83,29 +83,30 @@ with st.sidebar:
             "Strategy",
             options=["FIFO", "SINGLE_PALLET_FIRST", "LEAST_PALLETS"],
             format_func=lambda s: {
-                "FIFO": "FIFO — පරණ stock මුලින්",
-                "SINGLE_PALLET_FIRST": "Single pallet first — හැකි නම් එක pallet එකෙන්",
-                "LEAST_PALLETS": "Least pallets — ලොකු pallet මුලින්",
+                "FIFO": "FIFO - oldest stock first",
+                "SINGLE_PALLET_FIRST": "Single pallet first - fewest pallet touches",
+                "LEAST_PALLETS": "Least pallets - largest pallet first",
             }[s],
         )
         statuses = st.multiselect("Inventory status", ["Available", "Hold", "Damage", "QC"],
                                   default=["Available"])
         exact_first = st.checkbox("Exact item number first", value=True,
-                                  help="Base ID එක ගැලපුනත්, document එකේ තියෙන "
-                                       "full item number එකට මුලින් priority.")
+                                  help="When several item numbers share a base ID, the "
+                                       "one printed on the document is picked first.")
         use_ledger = st.checkbox("Ledger balance logic", value=True,
-                                 help="Pallet එකේ Actual Qty == ledger QTY_BEFORE නම් → "
-                                      "QTY_BALANCE එකෙන් pick. වෙනස් නම් → Inventory "
-                                      "Actual Qty එක අලුත් QTY_BEFORE එක විදිහට අරගෙන pick.")
+                                 help="If a pallet's Actual Qty equals the ledger "
+                                      "QTY_BEFORE, the report is stale and the pick comes "
+                                      "out of QTY_BALANCE. If it differs, the WMS has "
+                                      "moved on and Actual Qty becomes the new baseline.")
         blank_fill = st.text_input("Blank attribute fill", value="TBC")
         fill_item_col = st.checkbox("Fill ITEM_NUMBER column", value=False)
         merge_lines = st.checkbox("Merge same-item lines", value=False)
         override = st.checkbox("Bypass document check", value=False,
-                               help="Total Quantity / Grand Total / S.No check එක fail වුණත් "
-                                    "pick කරනවා. Stock check එක bypass වෙන්නේ නෑ. "
-                                    "Registry එකේ 'MANUAL OVERRIDE' කියලා log වෙනවා.")
+                               help="Picks even when the Total Quantity / Grand Total / "
+                                    "S.No check fails. The stock check is never bypassed. "
+                                    "Logged in the registry as 'MANUAL OVERRIDE'.")
         if override:
-            st.warning("Completeness gate off — parse එක ඇස්සෙන් check කරන්න.")
+            st.warning("Completeness gate is off - check the parsed lines yourself.")
         pick_date = st.date_input("Pick date", value=datetime.now())
 
     with st.expander("Email", expanded=False):
@@ -159,7 +160,7 @@ with st.sidebar:
     st.divider()
     st.markdown("<div class='eyebrow'>Database</div>", unsafe_allow_html=True)
     USER = st.text_input("Your name", value=USER, key="user_name",
-                         help="Lock owner සහ SKU UPDATED_BY එකට යනවා.") or USER
+                         help="Used as the lock owner and as SKU UPDATED_BY.") or USER
     st.session_state["user_id"] = USER
     if gs_ready:
         st.caption(f"Connected · auto-save {'on' if autosave else 'off'}")
@@ -169,20 +170,20 @@ with st.sidebar:
                 r = gsheet.init_sheet(sa_info, sheet_key)
                 new = [k for k, v in r.items() if v is True]
                 st.success("Ready · " + (f"created {', '.join(new)}" if new
-                                         else "ඔක්කොම දැනටමත් තිබුණා"))
+                                         else "everything already existed"))
                 st.markdown(f"[Open the sheet]({r.get('url','')})")
             except Exception as ex:
                 st.error(f"Init error: {ex}")
     elif not sa_info:
-        st.warning("`[gcp_service_account]` secret නෑ. Download වැඩ කරනවා, "
-                   "ledger සහ duplicate check වැඩ කරන්නේ නෑ.")
+        st.warning("No `[gcp_service_account]` secret. Downloads still work, "
+                   "but the ledger and the duplicate check do not.")
     else:
-        st.warning("`[google_sheet] data_sheet` secret නෑ.")
+        st.warning("No `[google_sheet] data_sheet` secret.")
 
     with st.expander("API & multi-user"):
         ttl = st.slider("Read cache (seconds)", 0, 180, 45, 5,
-                        help="User කීපදෙනෙක් වැඩ කරද්දී Google API quota ඉතුරු වෙනවා. "
-                             "0 = cache නෑ (හැම වෙලේම fresh read).")
+                        help="Saves Google API quota when several people work at "
+                             "once. 0 = no cache, every read hits the API.")
         try:
             import gsheet
             gsheet.set_cache_ttl(ttl)
@@ -202,8 +203,8 @@ with st.sidebar:
                         h = gsheet.health(sa_info, sheet_key)
                         st.success(f"OK · {h['ms']} ms · {len(h['worksheets'])} worksheets")
                         if h["missing"]:
-                            st.warning(f"නැති ඒවා: {', '.join(h['missing'])} — "
-                                       "Initialize කරන්න.")
+                            st.warning(f"Missing: {', '.join(h['missing'])} - run "
+                                       "'Set up worksheets'.")
                     except Exception as ex:
                         st.error(f"{ex}")
                 if c2.button("Clear cache", width="stretch"):
@@ -211,7 +212,7 @@ with st.sidebar:
                     st.success("Cache clear ✅")
                 locks = gsheet.active_locks(sa_info, sheet_key)
                 if len(locks):
-                    st.warning(f"{len(locks)} active lock — තව කෙනෙක් save කරමින්")
+                    st.warning(f"{len(locks)} active lock - someone else is saving")
                     st.dataframe(locks, hide_index=True, width="stretch")
                     if st.button("Clear stale locks"):
                         st.success(f"{gsheet.clear_locks(sa_info, sheet_key)} clear ✅")
@@ -237,11 +238,11 @@ with st.sidebar:
                     st.session_state["reset_ok"] = True
                     st.rerun()
                 else:
-                    st.error("Password වැරදියි.")
+                    st.error("Wrong password.")
         else:
             st.caption("Unlocked")
             scope = st.multiselect(
-                "Clear කරන්නේ",
+                "What to clear",
                 ["outputs", "ledger", "registry", "rejected", "runlog", "sku", "settings"],
                 default=["outputs", "ledger", "registry", "rejected", "runlog"],
                 format_func=lambda s: {
@@ -254,28 +255,28 @@ with st.sidebar:
                     "settings": "APP_SETTINGS (email book)",
                 }[s],
             )
-            sure = st.checkbox("මට විශ්වාසයි — back ගන්න බෑ", key="reset_sure")
+            sure = st.checkbox("I am sure - this cannot be undone", key="reset_sure")
             r1, r2 = st.columns(2)
             if r1.button("Reset selected", width="stretch"):
                 if not gs_ready:
-                    st.error("Google Sheet connect වෙලා නෑ.")
+                    st.error("Google Sheet is not connected.")
                 elif not scope or not sure:
-                    st.warning("Scope select කරලා confirm කරන්න.")
+                    st.warning("Pick what to clear and tick the confirm box.")
                 else:
                     try:
                         import gsheet
                         done = gsheet.reset_data(sa_info, sheet_key, scope)
                         for k in ("result", "bundles", "bundle_key", "zipfile", "hist"):
                             st.session_state.pop(k, None)
-                        st.success(f"Reset වුණා ✅ {done}")
+                        st.success(f"Reset done · {done}")
                     except Exception as ex:
                         st.error(f"Reset error: {ex}")
             if r2.button("Reset everything", width="stretch",
                          type="primary"):
                 if not gs_ready:
-                    st.error("Google Sheet connect වෙලා නෑ.")
+                    st.error("Google Sheet is not connected.")
                 elif not sure:
-                    st.warning("Confirm checkbox එක tick කරන්න.")
+                    st.warning("Tick the confirm box first.")
                 else:
                     try:
                         import gsheet
@@ -285,7 +286,7 @@ with st.sidebar:
                             st.session_state.pop(k, None)
                         st.success(f"FULL RESET ✅ {r['count']} worksheets — "
                                    f"{', '.join(r['cleared'])}")
-                        st.caption("SKU master + email book ඉතුරු කළා.")
+                        st.caption("SKU master and the email book were kept.")
                     except Exception as ex:
                         st.error(f"Reset error: {ex}")
             if st.button("Lock again"):
@@ -335,7 +336,7 @@ def _draw_rail():
          "value": (f"{len(st.session_state['inv_raw']):,} rows" if inv_ok
                    else "Inventory report")},
         {"label": "Plant", "state": "done" if plants else ("now" if inv_ok else "todo"),
-         "value": ", ".join(plants) if plants else "confirm කරන්න"},
+         "value": ", ".join(plants) if plants else "confirm a plant"},
         {"label": "Pick", "state": "done" if res_now else
          ("now" if (docs_n and inv_ok and plants) else "todo"),
          "value": (f"{len(res_now['accepted'])} picked" if res_now else "not run")},
@@ -351,13 +352,13 @@ def _draw_rail():
 with tab_gen:
     SLOT_RAIL = st.empty()
     ui.section("Documents & inventory", "01",
-               "PDF කීයක් හරි එකවර දාන්න — invoice සහ DC මිශ්‍ර වුණත් කමක් නෑ")
+               "drop in as many PDFs as you like - invoices and DCs can be mixed")
     c1, c2 = st.columns(2)
     with c1:
         f_docs = st.file_uploader("Invoice / Delivery Challan (PDF)",
                                   type=["pdf"], accept_multiple_files=True,
-                                  help="Donaldson tax invoice හෝ delivery challan. "
-                                       "Multi-copy DC එකක් වුණත් copy එකක් විතරයි ගන්නේ.")
+                                  help="Donaldson tax invoice or delivery challan. A DC "
+                                       "printed in triplicate is read only once.")
     with c2:
         f_inv = st.file_uploader("Inventory report (Excel)", type=["xlsx", "xls"],
                                  help="Körber One pallet-level inventory export.")
@@ -369,7 +370,7 @@ with tab_gen:
         if st.session_state.get("doc_sig") != sig:
             parsed = []
             raw: dict[str, bytes] = {}
-            with st.spinner("PDF read කරනවා..."):
+            with st.spinner("Reading the PDFs..."):
                 for f in f_docs:
                     try:
                         data = f.getvalue()
@@ -398,15 +399,15 @@ with tab_gen:
                     f"{d.source_file}")
             if dup:
                 ui.doc_card(d.doc_number or "unreadable", meta, "warn", "duplicate",
-                            ["එකම number එක දෙපාරක් — පළවෙනි එක විතරයි process වෙන්නේ"])
+                            ["Same number twice - only the first one is processed"])
             elif ok:
                 ui.doc_card(d.doc_number or "unreadable", meta, "ok", "ready")
             else:
                 ui.doc_card(d.doc_number or "unreadable", meta, "stop", "blocked", probs)
 
-        with st.expander("Lines හදන්න — parse එක වැරදුනොත් විතරක්"):
-            st.caption("Base ID = match වෙන ID එක · row එකක් අයින් කරන්න `Use` "
-                       "uncheck කරන්න.")
+        with st.expander("Fix the lines - only if the parse went wrong"):
+            st.caption("Base ID is what the match runs on · untick `Use` to "
+                       "drop a row.")
             edited = st.data_editor(
                 st.session_state.get("doc_frame", pd.DataFrame()),
                 num_rows="dynamic", width="stretch", height=320,
@@ -421,14 +422,14 @@ with tab_gen:
                 st.session_state["docs"] = P.frame_to_docs(edited, docs)
                 st.session_state["doc_frame"] = P.docs_to_frame(st.session_state["docs"])
                 st.session_state.pop("result", None)
-                st.success("Apply වුණා ✅")
+                st.success("Changes applied")
                 st.rerun()
 
     # ---------------- inventory + plant confirm ---------------- #
     inv_raw = None
     if f_inv is not None:
         if st.session_state.get("inv_sig") != (f_inv.name, f_inv.size):
-            with st.spinner("Inventory read කරනවා..."):
+            with st.spinner("Reading the inventory..."):
                 st.session_state["inv_raw"] = pd.read_excel(f_inv, dtype=str)
             st.session_state["inv_sig"] = (f_inv.name, f_inv.size)
             st.session_state.pop("plants_ok", None)
@@ -438,7 +439,7 @@ with tab_gen:
     if inv_raw is not None:
         inv_norm = E.normalize_inventory(inv_raw)
         psum = E.plant_summary(inv_norm)
-        ui.section("Plant", "03", "මොන plant එකෙන්ද pick කරන්නේ?")
+        ui.section("Plant", "03", "which plant should this be picked from?")
         pc1, pc2 = st.columns([1.2, 1])
         with pc1:
             st.dataframe(psum, hide_index=True, width="stretch")
@@ -449,7 +450,7 @@ with tab_gen:
             )
             if st.button("Confirm plant", type="primary", width="stretch"):
                 if not choice:
-                    st.warning("Plant එකක් තෝරන්න.")
+                    st.warning("Select a plant first.")
                 else:
                     st.session_state["plants_ok"] = choice
                     st.session_state.pop("result", None)
@@ -472,7 +473,7 @@ with tab_gen:
             missing.append("Inventory report")
         if not st.session_state.get("plants_ok"):
             missing.append("Plant confirm")
-        ui.empty("තව ටිකක් ඉතුරුයි", " · ".join(missing), "📥")
+        ui.empty("Almost there", "Still needed: " + " · ".join(missing), "📥")
     else:
         cfg = E.EngineConfig(
             wh_id=wh_id, client_code=client_code, order_type=order_type,
@@ -486,7 +487,7 @@ with tab_gen:
                    f"{len(st.session_state['docs'])} documents · "
                    f"{', '.join(st.session_state['plants_ok'])} · {strategy}")
         gc1, gc2 = st.columns([2, 1])
-        note = gc1.text_input("Run note", placeholder="උදා: 13-Aug morning batch",
+        note = gc1.text_input("Run note", placeholder="e.g. 13-Aug morning batch",
                               label_visibility="collapsed")
         go = gc2.button("Generate pick", type="primary", width="stretch")
 
@@ -499,10 +500,10 @@ with tab_gen:
                     ledger = gsheet.read_ledger(sa_info, sheet_key)
                     done_docs = gsheet.read_processed_docs(sa_info, sheet_key)
                 except Exception as ex:
-                    st.warning(f"Google Sheet read කරන්න බැරි වුණා ({ex}) — "
-                               "ledger/duplicate check skip කළා.")
+                    st.warning(f"Could not read the Google Sheet ({ex}) - "
+                               "ledger and duplicate check were skipped.")
             try:
-                with st.status("Pick calculate කරනවා…", expanded=False) as sbox:
+                with st.status("Calculating the pick...", expanded=False) as sbox:
                     res = E.run_pick(st.session_state["docs"], inv_raw, cfg,
                                      ledger=ledger, processed_docs=done_docs,
                                      sku_desc=SKU.lookup(st.session_state.get("sku_df")))
@@ -513,22 +514,22 @@ with tab_gen:
                 st.session_state["result"] = res
                 st.toast(f"Pick generated · RUN {res['run_id']}", icon="✅")
             except Exception as ex:
-                st.error(f"Pick generate කරන්න බැරි වුණා — {ex}")
+                st.error(f"Could not generate the pick - {ex}")
                 st.session_state.pop("result", None)
 
             res = st.session_state.get("result")
             if res is not None and gs_ready and autosave and len(res["master"]):
                 try:
                     import gsheet
-                    with st.spinner("Google Sheet එකට save කරනවා..."):
+                    with st.spinner("Saving to the Google Sheet..."):
                         r = gsheet.save_run(sa_info, sheet_key, res, cfg, note=note,
                                             owner=USER)
-                    st.success(f"Sheet save වුණා ✅ master {r['master']} · detail {r['detail']} "
+                    st.success(f"Saved · master {r['master']} · detail {r['detail']} "
                                f"· ledger {r['ledger']} rows")
                     if r.get("skipped"):
-                        st.warning("තව user කෙනෙක් මේවා දැනටමත් දාලා තිබුණා — skip කළා: "
+                        st.warning("Another user had already saved these - skipped: "
                                    + ", ".join(r["skipped"]))
-                    st.markdown(f"🔗 [Sheet එක open කරන්න]({r['url']})")
+                    st.markdown(f"[Open the sheet]({r['url']})")
                     st.session_state["saved"] = res["run_id"]
                 except gsheet.LockBusy as ex:
                     st.warning(f"🔒 {ex}")
@@ -545,7 +546,7 @@ with tab_gen:
         ui.section("Result", "05", f"RUN {res['run_id']} · {res['pick_date']}")
         if len(acc) and not len(rej):
             st.markdown(ui.stamp("all picked", "ok") + " &nbsp;" +
-                        ui.muted("හැම document එකක්ම pick වුණා"),
+                        ui.muted("every document was picked"),
                         unsafe_allow_html=True)
         elif len(acc):
             st.markdown(ui.stamp(f"{len(acc)} picked", "ok") + " &nbsp;" +
@@ -553,7 +554,7 @@ with tab_gen:
                         unsafe_allow_html=True)
         else:
             st.markdown(ui.stamp("nothing picked", "stop") + " &nbsp;" +
-                        ui.muted("පහළ හේතුව බලන්න"), unsafe_allow_html=True)
+                        ui.muted("see the reason below"), unsafe_allow_html=True)
 
         m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Documents", len(acc))
@@ -568,9 +569,9 @@ with tab_gen:
         bad_v = vdf[vdf["STATUS"].astype(str).str.contains("MISMATCH")] if len(vdf) else vdf
         if len(vdf) and not len(bad_v):
             st.success("Quantity verified — line · document total · WMS file total "
-                       "තුනම Invoice / DC qty එකට හරියටම ගැලපෙනවා.")
+                       "all three match the Invoice / DC quantity exactly.")
         elif len(bad_v):
-            st.error("Quantity mismatch — මේ documents pick කළේ නෑ:")
+            st.error("Quantity mismatch - these documents were not picked:")
             st.dataframe(bad_v, hide_index=True, width="stretch")
 
         if len(rej):
@@ -581,12 +582,12 @@ with tab_gen:
                     st.dataframe(res["shortage"], hide_index=True, width="stretch")
 
         # ------------------------------------------------------------------ #
-        # Shortage — PDF (invoice එකත් එක්කම) + email
+        # Shortage — PDF (merged with the invoice) + email
         # ------------------------------------------------------------------ #
         sh = res.get("shortage", pd.DataFrame())
         if len(sh):
             st.divider()
-            ui.section("Shortage", "06", "stock මදි වුණ documents")
+            ui.section("Shortage", "06", "documents blocked by short stock")
             src_map0 = st.session_state.get("doc_bytes", {})
             doc_map = {d.doc_number: d for d in st.session_state.get("docs", [])}
             rej_map = {str(r["DOC_NUMBER"]): str(r.get("REASON", ""))
@@ -594,7 +595,7 @@ with tab_gen:
 
             sh_chart = PP.shortage_chart_png(sh)          # email + PDF (white)
             sh_nums = list(dict.fromkeys(sh["DOC_NUMBER"].astype(str)))
-            sh_att = st.checkbox("Shortage PDF එකට Invoice / DC pages එකතු කරන්න",
+            sh_att = st.checkbox("Add the Invoice / DC pages to the shortage PDF",
                                  value=True, key="sh_attach")
 
             sh_files: list[tuple[str, bytes]] = []
@@ -629,7 +630,7 @@ with tab_gen:
 
             if sh_chart:
                 st.image(PP.shortage_chart_png(sh, dark=(ui.theme_type() == "dark")),
-                         caption="Shortage by item — මේකම email එකටත් යනවා",
+                         caption="Shortage by item - the same chart goes into the email",
                          width="content")
 
             s_subj, s_body, s_html = PP.shortage_email_text(sh_infos, sh, mail_sign)
@@ -668,53 +669,54 @@ with tab_gen:
         with t2:
             st.dataframe(res["detail"], hide_index=True, width="stretch", height=380)
         with t3:
-            st.caption("කොයි pallet එකෙන් කීයද ගත්තේ — balance එකත් එක්කම.")
+            st.caption("Which pallet each unit came off, with the balance left behind.")
             st.dataframe(alloc, hide_index=True, width="stretch", height=380)
         with t4:
-            st.caption("QTY_BEFORE → QTY_PICKED → QTY_BALANCE. **MODE** එකෙන් පේනවා "
-                       "ledger balance එකෙන්ද, අලුත් inventory qty එකෙන්ද pick කරේ කියලා.")
+            st.caption("QTY_BEFORE → QTY_PICKED → QTY_BALANCE. **MODE** shows whether "
+                       "the pick came out of the ledger balance or a fresh "
+                       "inventory quantity.")
             st.dataframe(res["balance"], hide_index=True, width="stretch", height=380)
         with t7:
             bs = res.get("basis", pd.DataFrame())
-            st.caption("Pallet එකකට pick කරන්න පුළුවන් උපරිමය කොහොමද තීරණය වුණේ කියලා.")
+            st.caption("How the maximum pickable quantity was decided for each pallet.")
             if len(bs):
                 mc = bs["MODE"].value_counts()
                 b1, b2, b3 = st.columns(3)
-                b1.metric("NEW (ledger නෑ)", int(mc.get("NEW", 0)))
+                b1.metric("NEW (no ledger)", int(mc.get("NEW", 0)))
                 b2.metric("LEDGER BALANCE", int(mc.get("LEDGER BALANCE", 0)),
-                          help="Inventory එක refresh වෙලා නෑ — ledger balance එකෙන් pick")
+                          help="Inventory not refreshed yet - picked from the ledger balance")
                 b3.metric("NEW BASELINE", int(mc.get("NEW BASELINE", 0)),
-                          help="Inventory Actual Qty වෙනස් වෙලා — ඒක අලුත් QTY_BEFORE")
-                only = st.checkbox("Ledger එකේ තියෙන pallet විතරක්", value=True,
+                          help="Actual Qty changed - it becomes the new QTY_BEFORE")
+                only = st.checkbox("Only pallets with ledger history", value=True,
                                    key="basis_filter")
                 view = bs[bs["MODE"] != "NEW"] if only else bs
                 st.dataframe(view, hide_index=True, width="stretch", height=380)
             else:
-                st.info("Basis data නෑ.")
+                st.info("No basis data.")
         with t5:
-            st.caption("Invoice / DC එකේ Quantity එකට **හරියටම** ගැලපෙනවද — line by line, "
+            st.caption("Does it match the Invoice / DC quantity **exactly** - line by "
                        "document total, WMS file total.")
             st.dataframe(res["verify"], hide_index=True, width="stretch", height=380)
         with t6:
             st.dataframe(acc, hide_index=True, width="stretch", height=280)
 
         # ------------------------------------------------------------------ #
-        # Downloads — LOAD_ID එකෙන් save
+        # Downloads — one file set per LOAD_ID
         # ------------------------------------------------------------------ #
         st.divider()
-        ui.section("Files", "07", "හැම LOAD_ID එකකටම වෙන වෙනම")
+        ui.section("Files", "07", "a separate set for every LOAD_ID")
         ids = E.load_ids(res)
         src_map = st.session_state.get("doc_bytes", {})
 
         if not ids:
-            ui.empty("Download කරන්න දෙයක් නෑ", "Pick වුණ document එකක් නෑ.", "🗂️")
+            ui.empty("Nothing to download", "No document was picked.", "🗂️")
         else:
-            attach_src = st.checkbox("Pick sheet PDF එකට Invoice / DC pages එකතු කරන්න",
+            attach_src = st.checkbox("Add the Invoice / DC pages to the pick sheet PDF",
                                      value=True)
 
             cache_key = (res["run_id"], bool(attach_src))
             if st.session_state.get("bundle_key") != cache_key:
-                with st.spinner("PDF + Excel හදනවා..."):
+                with st.spinner("Building the PDFs and Excel files..."):
                     made = {}
                     zfiles: list[tuple[str, bytes]] = []
                     for lid in ids:
@@ -742,7 +744,7 @@ with tab_gen:
                                 f"{E._qty_str(float(i.get('TOTAL_QTY') or 0))} · "
                                 f"{i.get('PALLETS','')} pallets · {i.get('VERIFY','')}")
                     if b["safe"] != lid:
-                        h1.caption(f"File name: `{b['safe']}` (`/` filename වලට දාන්න බෑ)")
+                        h1.caption(f"Saved as `{b['safe']}` - a filename cannot contain `/`")
                     h2.download_button("WMS Excel", data=b["xlsx"],
                                        file_name=f"{b['safe']}.xlsx",
                                        mime="application/vnd.openxmlformats-officedocument."
@@ -753,7 +755,7 @@ with tab_gen:
                                        mime="application/pdf", width="stretch",
                                        key=f"p_{b['safe']}")
 
-            ui.eyebrow("සියල්ලම එකට")
+            ui.eyebrow("Everything together")
             z1, z2, z3 = st.columns(3)
             stamp = datetime.now().strftime("%Y%m%d_%H%M")
             z1.download_button("ZIP — every load",
@@ -791,7 +793,7 @@ with tab_gen:
                 to_list = PP._addr_list(mail_to)
                 cc_list = PP._addr_list(mail_cc)
                 if not to_list:
-                    st.warning("To address එකක් නෑ — sidebar → Email එකේ දාන්න.")
+                    st.warning("No To address - add one under sidebar → Email.")
                 st.caption(f"To: {', '.join(to_list) or '—'}"
                            + (f"  ·  Cc: {', '.join(cc_list)}" if cc_list else ""))
 
@@ -810,7 +812,7 @@ with tab_gen:
                                    PP.mailto_link(to_list, subject, body, cc_list),
                                    width="stretch",
                                    disabled=not to_list)
-                    st.caption("Body විතරයි යන්නේ — attachment යන්නේ නෑ.")
+                    st.caption("Carries the body only - no attachments.")
                 with mc2:
                     st.download_button(
                         "Download draft (.eml)",
@@ -820,10 +822,10 @@ with tab_gen:
                         file_name=f"PICK_{E.safe_name(pick_for_mail[0])}"
                                   f"{'_+' + str(len(pick_for_mail) - 1) if len(pick_for_mail) > 1 else ''}.eml",
                         mime="message/rfc822", width="stretch")
-                    st.caption("Double-click කරාම Outlook/Mail එකේ draft එකක් විදිහට "
-                               "attachment + chart එක්කම open වෙනවා.")
+                    st.caption("Double-click it and Outlook / Mail opens a draft with "
+                               "the attachments and the chart already in place.")
                 if pick_chart:
-                    with st.expander("Email එකට යන item chart එක", expanded=False):
+                    with st.expander("The item chart that goes into the email", expanded=False):
                         st.image(PP.pick_chart_png(m_alloc, "Picked qty by item",
                                                    dark=(ui.theme_type() == "dark")),
                                  width="content")
@@ -835,22 +837,22 @@ with tab_gen:
                     r = gsheet.save_run(sa_info, sheet_key, res, res["cfg"],
                                         note=res.get("note", ""), owner=USER)
                     st.session_state["saved"] = res["run_id"]
-                    st.success("Save වුණා ✅")
-                    st.markdown(f"🔗 [Sheet එක open කරන්න]({r['url']})")
+                    st.success("Saved")
+                    st.markdown(f"[Open the sheet]({r['url']})")
                 except Exception as ex:
                     st.error(f"Save error: {ex}")
 
 
 
 # =========================================================================== #
-# TAB — Loads (LOAD_ID එකෙන් download / delete)
+# TAB — Loads (download / delete by LOAD_ID)
 # =========================================================================== #
 with tab_loads:
-    ui.section("Load manager", hint="LOAD_ID එකෙන් බලන්න · download · delete")
+    ui.section("Load manager", hint="look up a LOAD_ID · download · delete")
 
     if not gs_ready:
-        ui.empty("Database එක connect වෙලා නෑ",
-                 "secrets.toml එකේ Google Sheet එක දාපුවම save කරපු loads මෙතන පේනවා.",
+        ui.empty("Database not connected",
+                 "Add the Google Sheet to secrets.toml and saved loads appear here.",
                  "🔌")
     else:
         import gsheet
@@ -864,7 +866,7 @@ with tab_loads:
             reg = pd.DataFrame()
             st.error(f"Registry read error: {ex}")
         opts = [""] + (reg["DOC_NUMBER"].astype(str).tolist() if len(reg) else [])
-        picked = lc2.selectbox("නැත්නම් list එකෙන් තෝරන්න", opts, key="load_sel")
+        picked = lc2.selectbox("or pick from the list", opts, key="load_sel")
         lc3.write("")
         if lc3.button("Refresh", width="stretch"):
             gsheet.cache_clear(sheet_key)
@@ -876,8 +878,8 @@ with tab_loads:
             if len(reg):
                 st.dataframe(reg, hide_index=True, width="stretch", height=300)
             else:
-                ui.empty("තාම load එකක් නෑ",
-                         "Pick tab එකෙන් document එකක් generate කරලා save කරන්න.", "🗂️")
+                ui.empty("No loads yet",
+                         "Generate a document on the Pick tab and save it.", "🗂️")
 
         if load_id:
             try:
@@ -892,8 +894,8 @@ with tab_loads:
             rg = data.get(gsheet.WS_REGISTRY, pd.DataFrame())
 
             if not len(m) and not len(d) and not len(led):
-                ui.empty(f"{load_id} — DB එකේ නෑ",
-                         "LOAD_ID එක check කරන්න, නැත්නම් list එකෙන් තෝරන්න.", "🔍")
+                ui.empty(f"{load_id} is not in the database",
+                         "Check the LOAD_ID, or choose one from the list.", "🔍")
             else:
                 info_row = rg.iloc[-1].to_dict() if len(rg) else {}
                 k1, k2, k3, k4, k5 = st.columns(5)
@@ -955,27 +957,27 @@ with tab_loads:
                                    data=led.to_csv(index=False).encode(),
                                    file_name=f"{safe}_pick_details.csv", mime="text/csv",
                                    width="stretch", disabled=not len(led))
-                st.caption("PDF එකේ තියෙන්නේ pick sheet එක විතරයි — original Invoice / DC "
-                           "PDF එක DB එකේ save වෙන්නේ නෑ.")
+                st.caption("This PDF holds the pick sheet only - the original Invoice / "
+                           "DC PDF is not stored in the database.")
 
                 ui.eyebrow("Delete")
-                st.caption("Delete කරාම ledger + registry එකෙන් අයින් වෙනවා — ඒ නිසා "
-                           "**pallet balance ආපහු එනවා**, ආපහු pick කරන්නත් පුළුවන්.")
+                st.caption("Deleting removes it from the ledger and the registry, so the "
+                           "**pallet balance comes back** and it can be picked again.")
                 if not st.session_state.get("reset_ok"):
-                    st.info("Delete කරන්න sidebar → Reset & undo → password එකෙන් "
-                            "unlock කරන්න.")
+                    st.info("To delete, unlock with the password under "
+                            "sidebar → Reset & undo.")
                 else:
                     dl1, dl2 = st.columns([2, 1])
-                    typed_id = dl1.text_input(f"Confirm — `{load_id}` ආපහු type කරන්න",
+                    typed_id = dl1.text_input(f"Type `{load_id}` again to confirm",
                                               key="del_confirm")
                     dl2.write("")
                     if dl2.button("Delete load", width="stretch",
                                   type="primary"):
                         if typed_id.strip() != load_id:
-                            st.error("LOAD_ID එක හරියටම match වෙන්නේ නෑ.")
+                            st.error("That does not match the LOAD_ID exactly.")
                         else:
                             try:
-                                with st.spinner("Delete කරනවා..."):
+                                with st.spinner("Deleting..."):
                                     r = gsheet.delete_load(sa_info, sheet_key, load_id,
                                                            owner=USER)
                                 st.toast(f"Deleted {load_id}", icon="🗑️")
@@ -991,7 +993,7 @@ with tab_loads:
 # =========================================================================== #
 with tab_sku:
     ui.section("SKU master",
-               hint="එකම item එකක් ආපහු දැම්මොත් update වෙනවා — අලුත් row එකක් නෑ")
+               hint="upload the same item again and it updates - no duplicate row")
 
     if "sku_df" not in st.session_state:
         base = pd.DataFrame(columns=SKU.CORE)
@@ -1014,7 +1016,7 @@ with tab_sku:
         try:
             import gsheet
             st.session_state["sku_df"] = gsheet.read_sku(sa_info, sheet_key, fresh=True)
-            st.success("Reload වුණා ✅")
+            st.success("Reloaded")
             st.rerun()
         except Exception as ex:
             st.error(f"Reload error: {ex}")
@@ -1044,7 +1046,7 @@ with tab_sku:
                 p3.metric("Unchanged", prev["unchanged"])
                 p4.metric("Total after save", len(prev["data"]))
                 if len(prev["changes"]):
-                    with st.expander("වෙනස් වෙන rows මොනවද", expanded=True):
+                    with st.expander("What will change", expanded=True):
                         cols = [c for c in ["ITEM_NUMBER", "ITEM_DESCRIPTION", "_STATUS",
                                             "_CHANGED"] if c in prev["changes"].columns]
                         st.dataframe(prev["changes"][cols], hide_index=True,
@@ -1055,7 +1057,7 @@ with tab_sku:
                     if gs_ready:
                         try:
                             import gsheet
-                            with st.spinner("Sheet එකට save කරනවා..."):
+                            with st.spinner("Saving to the sheet..."):
                                 r = gsheet.save_sku(sa_info, sheet_key, prev["data"],
                                                     owner=USER)
                             st.toast(f"Saved · {r['rows']} SKUs "
@@ -1066,7 +1068,7 @@ with tab_sku:
                         except Exception as ex:
                             st.error(f"Save error: {ex}")
                     else:
-                        st.info("Google Sheet නෑ — session එකේ විතරක් තියෙනවා.")
+                        st.info("No Google Sheet connected - kept in this session only.")
                     st.rerun()
             except Exception as ex:
                 st.error(f"File error: {ex}")
@@ -1076,13 +1078,13 @@ with tab_sku:
         q = st.text_input("🔍 Item number / base ID / description",
                           placeholder="07011636   ·   07011636-000-440   ·   gasket epdm",
                           key="sku_q")
-        base_on = st.checkbox("Base ID match — suffix නැතුව හොයන්න", value=True)
+        base_on = st.checkbox("Base ID match - search without the suffix", value=True)
         if not len(master):
-            ui.empty("SKU master හිස්", "Upload tab එකෙන් file එකක් දාන්න.", "🏷️")
+            ui.empty("SKU master is empty", "Add a file on the Upload tab.", "🏷️")
         elif q.strip():
             hit = SKU.search(master, q, base_match=base_on)
             if not len(hit):
-                st.warning(f"'{q}' — හම්බුණේ නෑ. Base ID එකෙන් try කරන්න.")
+                st.warning(f"'{q}' not found. Try the base ID on its own.")
             else:
                 st.caption(f"{len(hit)} rows")
                 st.dataframe(hit, hide_index=True, width="stretch", height=420)
@@ -1092,12 +1094,12 @@ with tab_sku:
         else:
             st.dataframe(master.head(200), hide_index=True, width="stretch",
                          height=420)
-            st.caption(f"මුල් 200 rows පෙන්නනවා ({len(master)} total).")
+            st.caption(f"Showing the first 200 rows of {len(master)}.")
 
     # ---------------- edit ----------------
     with sku_edit:
-        st.caption("කෙලින්ම edit කරන්න / අලුත් row එකක් add කරන්න. "
-                   "Save කරද්දී duplicate check එක ආපහු වෙනවා.")
+        st.caption("Edit in place or add a row. The duplicate check runs "
+                   "again on save.")
         show = master if len(master) else pd.DataFrame(columns=SKU.CORE)
         ed = st.data_editor(show, num_rows="dynamic", width="stretch",
                             height=420, key="sku_editor",
@@ -1117,9 +1119,9 @@ with tab_sku:
                 if gs_ready:
                     import gsheet
                     r = gsheet.save_sku(sa_info, sheet_key, clean, owner=USER)
-                    st.success(f"Save වුණා ✅ {r['rows']} rows")
+                    st.success(f"Saved · {r['rows']} rows")
                 else:
-                    st.success(f"Save වුණා ✅ {len(clean)} rows (session)")
+                    st.success(f"Saved · {len(clean)} rows (session only)")
                 st.rerun()
             except Exception as ex:
                 st.error(f"Save error: {ex}")
@@ -1134,9 +1136,9 @@ with tab_sku:
 # =========================================================================== #
 with tab_search:
     ui.section("Search everything",
-               hint="word කීපයක් දුන්නොත් ඔක්කොම තියෙන rows විතරයි")
+               hint="give several words and only rows holding all of them come back")
 
-    q = st.text_input("🔍", placeholder="උදා:  P550945   ·   333262712337   ·   "
+    q = st.text_input("🔍", placeholder="e.g.  P550945   ·   333262712337   ·   "
                                        "IMDS01 P502639   ·   DONAL130826",
                       label_visibility="collapsed", key="global_q")
 
@@ -1152,7 +1154,7 @@ with tab_search:
         frames["⛔ Rejected"] = res_s["rejected"]
 
     src = st.multiselect(
-        "කොහෙන්ද හොයන්නේ",
+        "Where to search",
         options=["Current run", "Inventory (stock)", "Google Sheet — ledger",
                  "Google Sheet — registry", "Google Sheet — detail"],
         default=["Current run", "Inventory (stock)"],
@@ -1188,17 +1190,17 @@ with tab_search:
             st.warning(f"Google Sheet read error: {ex}")
 
     if not q.strip():
-        ui.empty("හොයන්න ඕන දේ type කරන්න",
+        ui.empty("Type what you are looking for",
                  "Item code · LOAD ID · pallet · location · GRN · lot · plant", "🔎")
     elif not frames:
-        ui.empty("Search කරන්න data නෑ", "Pick tab එකෙන් file දාන්න.", "📭")
+        ui.empty("Nothing to search yet", "Upload a file on the Pick tab.", "📭")
     else:
         hits = E.search_frames(q, frames)
         total = sum(len(v) for v in hits.values())
         if not total:
-            st.warning(f"'{q}' — කිසිම තැනක නෑ.")
+            st.warning(f"'{q}' is not anywhere.")
         else:
-            st.caption(f"{total} rows · {len(hits)} තැනක")
+            st.caption(f"{total} rows across {len(hits)} places")
             for name, df in hits.items():
                 with st.expander(f"{name} — {len(df)} rows", expanded=len(hits) <= 2):
                     st.dataframe(df, hide_index=True, width="stretch",
@@ -1213,10 +1215,10 @@ with tab_search:
 # =========================================================================== #
 with tab_bal:
     ui.section("Pallet stock",
-               hint="MODE එකෙන් පේනවා ledger balance ද අලුත් inventory qty ද කියලා")
+               hint="MODE shows whether the balance came from the ledger or a fresh count")
     inv_raw = st.session_state.get("inv_raw")
     if inv_raw is None:
-        ui.empty("Inventory report එකක් නෑ", "Pick tab එකෙන් upload කරන්න.", "📦")
+        ui.empty("No inventory report", "Upload one on the Pick tab.", "📦")
     else:
         ledger = None
         if gs_ready:
@@ -1231,7 +1233,7 @@ with tab_bal:
         plants = f2.multiselect("Plant", sorted(view["PLANT"].dropna().unique().tolist()))
         modes = f3.multiselect("Mode", ["NEW", "LEDGER BALANCE", "NEW BASELINE"])
         f4.write("")
-        only_bal = f4.checkbox("Balance > 0 විතරක්", value=True)
+        only_bal = f4.checkbox("Balance > 0 only", value=True)
 
         v = view
         if q.strip():
@@ -1257,10 +1259,10 @@ with tab_bal:
 # TAB 3 — History
 # =========================================================================== #
 with tab_hist:
-    ui.section("History", hint="DB එකේ තියෙන raw worksheets")
+    ui.section("History", hint="the raw worksheets behind the app")
     if not gs_ready:
-        ui.empty("Database එක connect වෙලා නෑ",
-                 "secrets.toml එකේ Google Sheet එක දාන්න.", "🔌")
+        ui.empty("Database not connected",
+                 "Add the Google Sheet to secrets.toml.", "🔌")
     else:
         import gsheet
         which = st.selectbox("Worksheet", [gsheet.WS_RUNLOG, gsheet.WS_REGISTRY,
@@ -1282,55 +1284,117 @@ with tab_hist:
 # =========================================================================== #
 with tab_help:
     ui.section("How it works", hint="quick reference")
-    st.markdown("""
-**Flow**
-1. Invoice / Delivery Challan **PDF** ටික + **Inventory Report** Excel එක upload කරන්න.
-2. App එක PDF එකෙන් line items කියවලා, **completeness check** එකක් කරනවා
-   (S.No sequence · Total Quantity · Grand Total amount). හරියන්නේ නැත්නම් ⛔ — pick කරන්නේ නෑ.
-3. Inventory එකේ තියෙන **Plant** ටික පෙන්නලා confirm ගන්නවා.
-4. Item match වෙන්නේ **base ID** එකෙන් විතරයි:
-   `P162400-000-140` → **`P162400`**.
-   Inventory එකේ `P162400-016-140` තිබ්බත් ගැලපෙනවා.
-5. හැම line එකකටම stock තිබ්බොත් විතරයි pick කරන්නේ — **එක line එකක් මදි වුණත් මුළු
-   document එකම reject** වෙනවා (`STOCK SHORT`).
-6. එකම Invoice / DC number එකක් **දෙපාරක් process වෙන්නේ නෑ** (DOC_REGISTRY gate).
-7. Pallet level එකෙන් `QTY_BEFORE → QTY_PICKED → QTY_BALANCE` ledger එකට save වෙනවා.
+    g1, g2, g3 = st.tabs(["The pick", "Output files", "Setup"])
 
-**Output — `OutBound_Upload_*.xlsx`** (හැම cell එකක්ම **text**)
+    with g1:
+        st.markdown("""
+**The flow**
 
-*OutBound MASTER* — `DISPLAY_ORDER_NUMBER`, `STORE_ORDER_NUMBER`, `CUSTOMER_PO_NUMBER`,
-`LOAD_ID` හතරටම Invoice No / DC No. අනිත් ඔක්කොම template එකේ විදිහටම.
+1. Upload the **Invoice / Delivery Challan PDFs** and the **Inventory Report**.
+2. Each document is parsed and put through a **completeness check** — S.No
+   sequence, `Total Quantity`, `Grand Total` amount. Anything that fails is
+   marked `blocked` and is not picked.
+3. The plants found in the inventory are listed. **Confirm one** before the
+   pick can run.
+4. Items match on the **base ID** only:
+   `P162400-000-140` → **`P162400`**, so inventory holding `P162400-016-140`
+   still matches. A suffix only counts as a suffix when every part after the
+   first is three digits — `05-47174` stays whole.
+5. A document is picked **only if every line can be filled**. One short line
+   blocks the whole document (`STOCK SHORT`) — there is no partial picking.
+6. The same Invoice / DC number is **never processed twice** (`DOC_REGISTRY`).
+7. Every pallet touched is written to the ledger as
+   `QTY_BEFORE → QTY_PICKED → QTY_BALANCE`, and a pallet can never go negative.
+
+**Where the balance comes from**
+
+| Situation | Meaning | Picked from |
+|---|---|---|
+| Pallet not in the ledger | new pallet | `NEW` → Actual Qty |
+| Actual Qty **=** ledger QTY_BEFORE | inventory report is stale | `LEDGER BALANCE` → QTY_BALANCE |
+| Actual Qty **≠** ledger QTY_BEFORE | WMS has been updated | `NEW BASELINE` → Actual Qty |
+
+**Quantity verification**
+
+Line by line, document total, and the total inside the generated file — all
+three must equal the Invoice / DC quantity. Any mismatch blocks the document.
+""")
+
+    with g2:
+        st.markdown("""
+**`<LOAD_ID>.xlsx`** — the WMS upload file. Every cell is **text**, empty cells
+stay truly empty.
+
+*OutBound MASTER* — `DISPLAY_ORDER_NUMBER`, `STORE_ORDER_NUMBER`,
+`CUSTOMER_PO_NUMBER` and `LOAD_ID` all carry the Invoice No / DC No. Everything
+else follows the template.
 
 *OutBound Detail*
 
-| Column | එන්නේ කොහෙන්ද |
+| Column | Source |
 |---|---|
 | DISPLAY_ORDER_NUMBER | Invoice No / DC No |
 | LINE_NUMBER | 1, 2, 3, … |
-| DISPLAY_ITEM_NUMBER | Inventory **Item Number** |
+| DISPLAY_ITEM_NUMBER | Inventory **Item Number**, exactly as stored |
 | LOT_NUMBER | Inventory Lot Number |
-| QTY | Invoice / DC Quantity |
+| QTY | Invoice / DC quantity |
 | ORDER_UOM | Inventory Uom |
 | GEN_ATTRIBUTE_VALUE1–11 | Color · Size · Style · Supplier · **Plant** · Client So · Client So Line · Po Cust Dec · Customer Ref Number · Item Id · Invoice Number 1 |
 
-**secrets.toml**
+**`<LOAD_ID>.pdf`** — pick sheet with a LOAD_ID QR, the pallet-by-pallet pick
+list, the quantity verification and a sign-off block, followed by the pages of
+the original Invoice / DC.
+
+**`SHORT_<LOAD_ID>.pdf`** — raised when stock is short: the short lines,
+required vs available vs short, a chart, and the full document lines.
+
+**`Pick_Report_*.xlsx`** — Doc Summary · Qty Verification · Pallet Allocation ·
+Pallet Balance · Stock Basis · Shortage · Rejected Docs.
+
+A DC number such as `333/26-27/62` is saved as `333-26-27-62` because a filename
+cannot hold a slash. The LOAD_ID inside the file and the QR is the real one.
+""")
+
+    with g3:
+        st.markdown("""
+**`.streamlit/secrets.toml`**
+
 ```toml
 [gcp_service_account]
-type = "service_account"
-project_id = "..."
+type           = "service_account"
+project_id     = "..."
 private_key_id = "..."
-private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
-client_email = "xxx@yyy.iam.gserviceaccount.com"
-client_id = "..."
-token_uri = "https://oauth2.googleapis.com/token"
+private_key    = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
+client_email   = "xxx@yyy.iam.gserviceaccount.com"
+client_id      = "..."
+token_uri      = "https://oauth2.googleapis.com/token"
 
 [google_sheet]
-data_sheet = "https://docs.google.com/spreadsheets/d/<KEY>/edit"
-auto_save  = true
+data_sheet  = "https://docs.google.com/spreadsheets/d/<KEY>/edit"
+auto_save   = true
 wh_id       = "INMM01"
 client_code = "INM0DONA"
+mail_to     = "stores@example.com"
+mail_from   = "you@example.com"
+
+[app]
+reset_password = "..."      # optional, overrides the built-in one
 ```
-Service-account email එකට Sheet එක **Editor** විදිහට share කරන්න ඕන.
+
+Share the sheet with the **service-account email as an Editor**, then press
+**Set up worksheets** in the sidebar once.
+
+**Worksheets**
+
+`OUTBOUND_MASTER` · `OUTBOUND_DETAIL` · `PALLET_LEDGER` · `DOC_REGISTRY` ·
+`REJECTED_LOG` · `RUN_LOG` · `SKU_MASTER` · `APP_SETTINGS` · `_LOCKS`
+
+**Several people at once**
+
+Reads are cached, writes take a lock, and the duplicate check runs again inside
+that lock — so two people saving the same invoice at the same moment still
+produce one order. Failed API calls back off and retry. Watch it under
+sidebar → **API & multi-user**.
 """)
 
 with SLOT_TOPBAR.container():

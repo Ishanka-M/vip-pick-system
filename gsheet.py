@@ -319,7 +319,7 @@ class sheet_lock:
 
     def __enter__(self):
         if not self.acquire():
-            raise LockBusy("තව කෙනෙක් දැන් save කරමින් ඉන්නවා — විනාඩියකින් try කරන්න.")
+            raise LockBusy("Someone else is saving right now - try again in a minute.")
         return self
 
     def __exit__(self, *exc):
@@ -396,7 +396,7 @@ def save_run(sa_info: dict, sheet_key: str, res: dict, cfg: E.EngineConfig,
                     alloc = alloc[~alloc["DOC_NUMBER"].astype(str).isin(clash)]
                 rej = pd.concat([rej, pd.DataFrame([{
                     "DOC_NUMBER": d, "DOC_TYPE": "", "REASON": "DUPLICATE (other user)",
-                    "DETAIL": "Save කරද්දී තව කෙනෙක් මේක දාලා තිබුණා",
+                    "DETAIL": "Another user saved this document while this run was in progress",
                     "SOURCE_FILE": ""} for d in clash])], ignore_index=True)
         out["skipped"] = clash
 

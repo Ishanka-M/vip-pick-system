@@ -100,19 +100,19 @@ class ParsedDoc:
         """(ok, problems) — problem එකක් තිබ්බොත් මේ doc එක pick කරන්නේ නෑ."""
         p: list[str] = []
         if not self.doc_number:
-            p.append("Document number කියවගන්න බැරි වුණා")
+            p.append("Document number could not be read")
         if not self.lines:
-            p.append("Line items හම්බුණේ නෑ")
+            p.append("No line items found")
 
         for ln in self.lines:
             if not ln.item_code:
-                p.append(f"Line {ln.line_no}: Item code නෑ")
+                p.append(f"Line {ln.line_no}: no item code")
             if not ln.qty or ln.qty <= 0:
-                p.append(f"Line {ln.line_no}: Qty නෑ / 0")
+                p.append(f"Line {ln.line_no}: qty missing or zero")
 
         nos = [ln.line_no for ln in self.lines]
         if nos and sorted(nos) != list(range(1, len(nos) + 1)):
-            p.append(f"S.No sequence කැඩිලා ({sorted(nos)}) — line එකක් missing වෙන්න පුළුවන්")
+            p.append(f"S.No sequence is broken ({sorted(nos)}) - a line may be missing)")
 
         if self.declared_qty is not None:
             tot = sum(ln.qty for ln in self.lines)
@@ -405,9 +405,9 @@ def parse_pdf(data: bytes, filename: str = "") -> ParsedDoc:
             doc = _parse_challan(pdf, filename)
             if not doc.lines:
                 doc = _parse_invoice(pdf, filename)
-            doc.notes.append("Document type auto-detect වුණේ නෑ — fallback parser use කළා")
+            doc.notes.append("Document type not detected - used the fallback parser")
     if not doc.lines:
-        doc.notes.append("Line items parse කරගන්න බැරි වුණා — review table එකේ manually add කරන්න")
+        doc.notes.append("Could not parse line items - add them in the review table")
     return doc
 
 
