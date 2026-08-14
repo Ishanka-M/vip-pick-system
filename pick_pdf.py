@@ -481,14 +481,17 @@ def build_shortage_sheet(info: dict[str, Any], short: pd.DataFrame,
     rows = []
     for _, r in short.iterrows():
         rows.append([str(r.get("DOC_LINE", "")), str(r.get("DOC_ITEM_CODE", "")),
-                     str(r.get("BASE_ID", "")), str(r.get("DESCRIPTION", ""))[:46],
-                     _n(r.get("REQUIRED")), _n(r.get("AVAILABLE")), _n(r.get("SHORT")),
+                     str(r.get("BASE_ID", "")), str(r.get("DESCRIPTION", ""))[:42],
+                     _n(r.get("REQUIRED")), _n(r.get("AVAILABLE")),
+                     _n(r.get("ON_PICK_TASK")), _n(r.get("SHORT")),
                      str(r.get("REASON", ""))])
-    widths = [11, 32, 26, 60, 20, 20, 18, 34]
+    widths = [11, 32, 26, 54, 19, 19, 20, 17, 40]
     sc = W / sum(widths)
     story.append(_grid(["Ln", "Doc Item Code", "Base ID", "Description", "Required",
-                        "Available", "SHORT", "Reason"], rows, [w * sc for w in widths],
-                       aligns={0: "CENTER", 4: "RIGHT", 5: "RIGHT", 6: "RIGHT"}))
+                        "Free", "On pick task", "SHORT", "Reason"], rows,
+                       [w * sc for w in widths],
+                       aligns={0: "CENTER", 4: "RIGHT", 5: "RIGHT", 6: "RIGHT",
+                               7: "RIGHT"}))
     story.append(Spacer(1, 8))
 
     if chart:

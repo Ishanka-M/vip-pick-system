@@ -113,6 +113,7 @@ INV_ALIASES: dict[str, list[str]] = {
     "unavailable_qty": ["unavailable qty", "unavailable"],
     "uom": ["uom", "unit of measure"],
     "status": ["status"],
+    "pick_id": ["pick id", "pickid", "pick task id", "pick task"],
     "stored_attribute_id": ["stored attribute id"],
     "fifo_date": ["fifo date"],
     "grn_number": ["grn number", "grn"],
@@ -177,6 +178,13 @@ def normalize_inventory(df: pd.DataFrame) -> pd.DataFrame:
     for c in ("pallet", "location_id", "lot_number", "plant", "uom", "status",
               "stored_attribute_id"):
         out[c] = out[c].astype(str).replace({"nan": "", "None": "", "NaT": ""}).str.strip()
+
+    # Pick Id — 0 කියන්නේ free. 0 නොවන එකක් තියෙනවා නම් ඒ pallet එක දැනටමත්
+    # WMS එකේ pick task එකකට allocate වෙලා (Status එක තාම 'Available' වුණත්).
+    out["pick_id"] = (out["pick_id"].astype(str).str.strip()
+                      .str.replace(r"\.0$", "", regex=True)
+                      .replace({"nan": "", "None": "", "NaT": "", "-": ""}))
+    out["pick_free"] = out["pick_id"].isin(["", "0"])
     out["row_key"] = (
         out["pallet"] + "|" + out["location_id"] + "|" + out["item_number"] + "|"
         + out["lot_number"] + "|" + out["stored_attribute_id"].astype(str)
@@ -187,11 +195,16 @@ def normalize_inventory(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def plant_summary(inv: pd.DataFrame) -> pd.DataFrame:
-    g = (inv.groupby("plant", dropna=False)
-           .agg(Pallets=("pallet", "nunique"), Items=("item_number", "nunique"),
-                Qty=("free_qty", "sum"))
-           .reset_index().rename(columns={"plant": "Plant"}))
+    free = inv[inv["pick_free"]] if "pick_free" in inv.columns else inv
+    g = (free.groupby("plant", dropna=False)
+             .agg(Pallets=("pallet", "nunique"), Items=("item_number", "nunique"),
+                  Qty=("free_qty", "sum"))
+             .reset_index().rename(columns={"plant": "Plant"}))
     g["Qty"] = g["Qty"].astype(int)
+    if "pick_free" in inv.columns:
+        lock = (inv[~inv["pick_free"]].groupby("plant")["free_qty"].sum()
+                .rename("On pick task"))
+        g["On pick task"] = (g["Plant"].map(lock).fillna(0).astype(int))
     return g.sort_values("Qty", ascending=False).reset_index(drop=True)
 
 
@@ -201,8 +214,8 @@ def plant_summary(inv: pd.DataFrame) -> pd.DataFrame:
 QTY_TOL = 1e-6
 
 BASIS_COLS = ["PALLET", "LOCATION_ID", "ITEM_NUMBER", "BASE_ID", "LOT_NUMBER", "PLANT",
-              "UOM", "INV_ACTUAL_QTY", "LEDGER_BEFORE", "LEDGER_PICKED", "LEDGER_BALANCE",
-              "MODE", "AVAILABLE", "ROW_KEY"]
+              "UOM", "PICK_ID", "PICK_STATUS", "INV_ACTUAL_QTY", "LEDGER_BEFORE",
+              "LEDGER_PICKED", "LEDGER_BALANCE", "MODE", "AVAILABLE", "ROW_KEY"]
 
 
 def _soft_key(pallet: Any, item: Any, lot: Any) -> str:
@@ -280,11 +293,14 @@ def stock_basis(inv: pd.DataFrame, ledger: pd.DataFrame | None = None,
             else:
                 mode, avail = "NEW BASELINE", actual      # inventory update වෙලා
 
+        free = bool(r.get("pick_free", True))
         rows.append({
             "PALLET": r["pallet"], "LOCATION_ID": r["location_id"],
             "ITEM_NUMBER": r["item_number_raw"] or r["item_number"],
             "BASE_ID": r["base_id"], "LOT_NUMBER": r["lot_number"], "PLANT": r["plant"],
-            "UOM": r["uom"], "INV_ACTUAL_QTY": actual,
+            "UOM": r["uom"], "PICK_ID": r.get("pick_id", ""),
+            "PICK_STATUS": "FREE" if free else "ON PICK TASK",
+            "INV_ACTUAL_QTY": actual,
             "LEDGER_BEFORE": lb, "LEDGER_PICKED": lp, "LEDGER_BALANCE": lbal,
             "MODE": mode, "AVAILABLE": max(0.0, float(avail)), "ROW_KEY": key,
         })
@@ -306,6 +322,7 @@ class EngineConfig:
     order_type: str = "Sales Orders"
     plants: list[str] = field(default_factory=list)
     statuses: list[str] = field(default_factory=lambda: ["Available"])
+    pick_id_zero_only: bool = True       # Pick Id 0 විතරක් — 0 නොවන එක locked
     strategy: str = "FIFO"              # FIFO | LEAST_PALLETS | SINGLE_PALLET_FIRST
     exact_item_first: bool = True
     use_ledger: bool = True             # pallet balance එකට ledger එක බලනවද
@@ -369,6 +386,14 @@ def run_pick(
     if cfg.plants:
         inv = inv[inv["plant"].isin(cfg.plants)]
 
+    # ---- Pick Id — 0 නොවන pallet දැනටමත් pick task එකකට allocate වෙලා ----
+    locked = inv[~inv["pick_free"]].copy() if cfg.pick_id_zero_only else inv.iloc[0:0].copy()
+    if cfg.pick_id_zero_only:
+        inv = inv[inv["pick_free"]]
+    locked_qty = (locked.groupby("base_id")["free_qty"].sum().to_dict() if len(locked) else {})
+    locked_ids = ({b: ", ".join(sorted({str(x) for x in g})[:4])
+                   for b, g in locked.groupby("base_id")["pick_id"]} if len(locked) else {})
+
     # ---- pallet level stock basis (QTY_BEFORE same ද කියලා බලලා) ----
     inv, basis = stock_basis(inv, ledger, use_ledger=cfg.use_ledger)
     remaining: dict[str, float] = dict(zip(basis["ROW_KEY"], basis["AVAILABLE"].astype(float)))
@@ -428,13 +453,24 @@ def run_pick(
             have = float(pool["avail"].sum())
 
             if pool.empty or have + 1e-9 < need:
+                lock_q = float(locked_qty.get(ln.base, 0.0))
+                if pool.empty and not lock_q:
+                    why = "Item not in inventory / plant"
+                elif lock_q and have + lock_q + 1e-9 >= need:
+                    why = (f"On another pick task — {_qty_str(lock_q)} locked "
+                           f"(Pick Id {locked_ids.get(ln.base, '')})")
+                elif lock_q:
+                    why = (f"Stock short · {_qty_str(lock_q)} also locked to a pick task "
+                           f"(Pick Id {locked_ids.get(ln.base, '')})")
+                else:
+                    why = "Stock short"
                 doc_short.append({
                     "DOC_NUMBER": num, "DOC_TYPE": doc.doc_type, "DOC_LINE": ln.line_no,
                     "DOC_ITEM_CODE": ln.item_code, "BASE_ID": ln.base,
                     "DESCRIPTION": _desc("", ln.item_code, ln.description),
-                    "REQUIRED": need,
-                    "AVAILABLE": have, "SHORT": max(0.0, need - have),
-                    "REASON": "Item not in inventory/plant" if pool.empty else "Stock short",
+                    "REQUIRED": need, "AVAILABLE": have,
+                    "ON_PICK_TASK": lock_q, "SHORT": max(0.0, need - have),
+                    "REASON": why,
                 })
                 continue
 
@@ -583,6 +619,7 @@ def run_pick(
         "shortage": pd.DataFrame(shortages),
         "verify": pd.DataFrame(verify_rows, columns=VERIFY_COLS),
         "basis": basis,
+        "locked": _locked_view(locked),
         "accepted": pd.DataFrame(accepted),
         "balance": pallet_balance(basis, alloc_df, cap),
         "cfg": cfg,
@@ -784,6 +821,23 @@ def pallet_balance(basis: pd.DataFrame, alloc_df: pd.DataFrame,
     return pd.DataFrame(out, columns=cols).sort_values("PALLET").reset_index(drop=True)
 
 
+LOCKED_COLS = ["PALLET", "LOCATION_ID", "ITEM_NUMBER", "BASE_ID", "DESCRIPTION",
+               "LOT_NUMBER", "PLANT", "UOM", "QTY", "PICK_ID", "STATUS"]
+
+
+def _locked_view(locked: pd.DataFrame) -> pd.DataFrame:
+    """Pick Id 0 නොවන නිසා අයින් කරපු stock — කොහෙද, කීයද, මොන pick task එකේද."""
+    if locked is None or not len(locked):
+        return pd.DataFrame(columns=LOCKED_COLS)
+    d = locked.rename(columns={
+        "pallet": "PALLET", "location_id": "LOCATION_ID", "base_id": "BASE_ID",
+        "description": "DESCRIPTION", "lot_number": "LOT_NUMBER", "plant": "PLANT",
+        "uom": "UOM", "free_qty": "QTY", "pick_id": "PICK_ID", "status": "STATUS"}).copy()
+    d["ITEM_NUMBER"] = d["item_number_raw"].where(d["item_number_raw"].astype(bool),
+                                                  d["item_number"])
+    return (d[LOCKED_COLS].sort_values(["BASE_ID", "PALLET"]).reset_index(drop=True))
+
+
 def stock_view(inv_raw: pd.DataFrame, ledger: pd.DataFrame | None = None,
                use_ledger: bool = True) -> pd.DataFrame:
     """
@@ -797,9 +851,11 @@ def stock_view(inv_raw: pd.DataFrame, ledger: pd.DataFrame | None = None,
     b["DESCRIPTION"] = b["ROW_KEY"].map(desc).fillna("")
     b = b.rename(columns={"INV_ACTUAL_QTY": "ACTUAL_QTY", "LEDGER_PICKED": "PICKED_BEFORE",
                           "AVAILABLE": "BALANCE"})
+    b.loc[b["PICK_STATUS"] != "FREE", "BALANCE"] = 0.0     # locked = pick කරන්න බෑ
     return b[["PALLET", "LOCATION_ID", "ITEM_NUMBER", "BASE_ID", "DESCRIPTION",
-              "LOT_NUMBER", "PLANT", "UOM", "ACTUAL_QTY", "LEDGER_BEFORE",
-              "PICKED_BEFORE", "LEDGER_BALANCE", "MODE", "BALANCE", "ROW_KEY"]]
+              "LOT_NUMBER", "PLANT", "UOM", "PICK_ID", "PICK_STATUS", "ACTUAL_QTY",
+              "LEDGER_BEFORE", "PICKED_BEFORE", "LEDGER_BALANCE", "MODE", "BALANCE",
+              "ROW_KEY"]]
 
 
 # --------------------------------------------------------------------------- #
@@ -836,7 +892,8 @@ def build_report_excel(res: dict[str, Any]) -> bytes:
         for name, key in [("Doc Summary", "accepted"), ("Qty Verification", "verify"),
                           ("Pallet Allocation", "allocations"),
                           ("Pallet Balance", "balance"), ("Stock Basis", "basis"),
-                          ("Shortage", "shortage"), ("Rejected Docs", "rejected")]:
+                          ("Shortage", "shortage"), ("On Pick Task", "locked"),
+                          ("Rejected Docs", "rejected")]:
             df = res.get(key)
             if key == "basis" and df is not None and len(df):
                 df = df[df["MODE"] != "NEW"]          # ledger history තියෙන ඒවා විතරයි

@@ -90,6 +90,11 @@ with st.sidebar:
         )
         statuses = st.multiselect("Inventory status", ["Available", "Hold", "Damage", "QC"],
                                   default=["Available"])
+        pick_id_gate = st.checkbox("Pick Id = 0 only", value=True,
+                                   help="A pallet with a non-zero Pick Id is already "
+                                        "allocated to a pick task in the WMS — its Status "
+                                        "still reads 'Available', so it has to be excluded "
+                                        "here or the same stock gets picked twice.")
         exact_first = st.checkbox("Exact item number first", value=True,
                                   help="When several item numbers share a base ID, the "
                                        "one printed on the document is picked first.")
@@ -443,6 +448,14 @@ with tab_gen:
         pc1, pc2 = st.columns([1.2, 1])
         with pc1:
             st.dataframe(psum, hide_index=True, width="stretch")
+            if "On pick task" in psum.columns and psum["On pick task"].sum():
+                st.caption(f"**Qty** counts only pallets with `Pick Id = 0`. "
+                           f"{int(psum['On pick task'].sum()):,} units sit on pallets "
+                           f"already allocated to a pick task and are left alone."
+                           if pick_id_gate else
+                           f"`Pick Id = 0 only` is off — "
+                           f"{int(psum['On pick task'].sum()):,} units allocated to a "
+                           f"pick task will also be picked.")
         with pc2:
             choice = st.multiselect(
                 "Plant(s)", options=psum["Plant"].tolist(),
@@ -478,7 +491,8 @@ with tab_gen:
         cfg = E.EngineConfig(
             wh_id=wh_id, client_code=client_code, order_type=order_type,
             plants=st.session_state["plants_ok"], statuses=statuses, strategy=strategy,
-            exact_item_first=exact_first, use_ledger=use_ledger, blank_fill=blank_fill,
+            exact_item_first=exact_first, use_ledger=use_ledger,
+            pick_id_zero_only=pick_id_gate, blank_fill=blank_fill,
             fill_item_number_col=fill_item_col, merge_same_item_lines=merge_lines,
             override_doc_check=override,
             pick_date=datetime.combine(pick_date, datetime.now().time()),
@@ -584,6 +598,15 @@ with tab_gen:
         # ------------------------------------------------------------------ #
         # Shortage — PDF (merged with the invoice) + email
         # ------------------------------------------------------------------ #
+        lk = res.get("locked", pd.DataFrame())
+        if len(lk):
+            with st.expander(f"On a pick task — excluded ({len(lk)} pallets · "
+                             f"{E._qty_str(float(pd.to_numeric(lk['QTY'], errors='coerce').sum()))} units)"):
+                st.caption("These pallets carry a non-zero `Pick Id`, so the WMS has "
+                           "already committed them to another pick. Nothing was taken "
+                           "off them.")
+                st.dataframe(lk, hide_index=True, width="stretch")
+
         sh = res.get("shortage", pd.DataFrame())
         if len(sh):
             st.divider()
@@ -1151,6 +1174,8 @@ with tab_search:
         frames["📋 OutBound Detail"] = res_s["detail"]
         frames["🧾 OutBound MASTER"] = res_s["master"]
         frames["🔢 Qty Verify"] = res_s.get("verify", pd.DataFrame())
+        frames["📊 Stock Basis"] = res_s.get("basis", pd.DataFrame())
+        frames["🔒 On Pick Task"] = res_s.get("locked", pd.DataFrame())
         frames["⛔ Rejected"] = res_s["rejected"]
 
     src = st.multiselect(
@@ -1172,7 +1197,8 @@ with tab_search:
                                                        use_ledger=use_ledger)
     if "Current run" not in src:
         for k in ["🎯 Pallet Allocation", "📋 OutBound Detail", "🧾 OutBound MASTER",
-                  "🔢 Qty Verify", "📊 Stock Basis", "⛔ Rejected", "📄 Document lines"]:
+                  "🔢 Qty Verify", "📊 Stock Basis", "🔒 On Pick Task", "⛔ Rejected",
+                  "📄 Document lines"]:
             frames.pop(k, None)
     if gs_ready:
         try:
@@ -1228,12 +1254,13 @@ with tab_bal:
             except Exception as ex:
                 st.warning(f"Ledger read error: {ex}")
         view = E.stock_view(inv_raw, ledger, use_ledger=use_ledger)
-        f1, f2, f3, f4 = st.columns([1.4, 1, 1, 1])
+        f1, f2, f3, f4, f5 = st.columns([1.5, 1, 1, 1, .9])
         q = f1.text_input("Item / Base ID / Pallet search", placeholder="P550945")
         plants = f2.multiselect("Plant", sorted(view["PLANT"].dropna().unique().tolist()))
         modes = f3.multiselect("Mode", ["NEW", "LEDGER BALANCE", "NEW BASELINE"])
-        f4.write("")
-        only_bal = f4.checkbox("Balance > 0 only", value=True)
+        pstat = f4.multiselect("Pick Id", ["FREE", "ON PICK TASK"])
+        f5.write("")
+        only_bal = f5.checkbox("Balance > 0", value=True)
 
         v = view
         if q.strip():
@@ -1245,14 +1272,20 @@ with tab_bal:
             v = v[v["PLANT"].isin(plants)]
         if modes:
             v = v[v["MODE"].isin(modes)]
+        if pstat:
+            v = v[v["PICK_STATUS"].isin(pstat)]
         if only_bal:
             v = v[v["BALANCE"] > 0]
 
-        a, b, c, dcol = st.columns(4)
+        a, b, c, dcol, ecol = st.columns(5)
         a.metric("Rows", len(v))
         b.metric("Pallets", int(v["PALLET"].nunique()) if len(v) else 0)
         c.metric("Actual Qty", f"{v['ACTUAL_QTY'].sum():g}" if len(v) else "0")
         dcol.metric("Pickable Balance", f"{v['BALANCE'].sum():g}" if len(v) else "0")
+        ecol.metric("On Pick Task",
+                    f"{v.loc[v['PICK_STATUS'] != 'FREE', 'ACTUAL_QTY'].sum():g}"
+                    if len(v) else "0",
+                    help="Non-zero Pick Id — balance is forced to 0 for these.")
         st.dataframe(v, hide_index=True, width="stretch", height=520)
 
 # =========================================================================== #
@@ -1300,16 +1333,23 @@ with tab_help:
    `P162400-000-140` → **`P162400`**, so inventory holding `P162400-016-140`
    still matches. A suffix only counts as a suffix when every part after the
    first is three digits — `05-47174` stays whole.
-5. A document is picked **only if every line can be filled**. One short line
+5. Only pallets with **`Pick Id = 0`** are pickable. A non-zero Pick Id means the
+   WMS has already committed that pallet to another pick task — its `Status` still
+   reads `Available`, so without this gate the same stock would be picked twice.
+   Whatever is skipped shows up under **On a pick task** with its Pick Id.
+6. A document is picked **only if every line can be filled**. One short line
    blocks the whole document (`STOCK SHORT`) — there is no partial picking.
-6. The same Invoice / DC number is **never processed twice** (`DOC_REGISTRY`).
-7. Every pallet touched is written to the ledger as
+   When the missing quantity does exist but is locked, the reason says so:
+   *"On another pick task — 128 locked (Pick Id 1282815, …)"*.
+7. The same Invoice / DC number is **never processed twice** (`DOC_REGISTRY`).
+8. Every pallet touched is written to the ledger as
    `QTY_BEFORE → QTY_PICKED → QTY_BALANCE`, and a pallet can never go negative.
 
 **Where the balance comes from**
 
 | Situation | Meaning | Picked from |
 |---|---|---|
+| Pick Id ≠ 0 | on another pick task | nothing — excluded |
 | Pallet not in the ledger | new pallet | `NEW` → Actual Qty |
 | Actual Qty **=** ledger QTY_BEFORE | inventory report is stale | `LEDGER BALANCE` → QTY_BALANCE |
 | Actual Qty **≠** ledger QTY_BEFORE | WMS has been updated | `NEW BASELINE` → Actual Qty |
@@ -1349,7 +1389,7 @@ the original Invoice / DC.
 required vs available vs short, a chart, and the full document lines.
 
 **`Pick_Report_*.xlsx`** — Doc Summary · Qty Verification · Pallet Allocation ·
-Pallet Balance · Stock Basis · Shortage · Rejected Docs.
+Pallet Balance · Stock Basis · Shortage · **On Pick Task** · Rejected Docs.
 
 A DC number such as `333/26-27/62` is saved as `333-26-27-62` because a filename
 cannot hold a slash. The LOAD_ID inside the file and the QR is the real one.

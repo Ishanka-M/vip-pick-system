@@ -73,6 +73,7 @@ Google Sheet නැතුවත් app එක වැඩ කරනවා — Exce
 
 | Rule | Implementation |
 |---|---|
+| **Pick Id gate** | `Pick Id = 0` pallet විතරයි pick කරන්නේ. 0 නොවන එකක් = WMS එකේ pick task එකකට allocate වෙලා (Status එක තාම `Available`) → අයින් කරනවා |
 | Item match — base ID විතරයි | `P162400-000-140` → `P162400`. Inventory `P162400-016-140` ගැලපෙනවා |
 | Exact item priority | Base ID එක ගැලපුනත් full item number එකට මුල් තැන (option) |
 | Plant | Confirm කරපු plant(s) එකෙන් විතරයි |
@@ -445,3 +446,51 @@ span[translate="no"], .material-icons, .material-symbols-rounded {
 එකක් ඇතුලේ icon එකක් තිබ්බත් මේකෙන් රැකෙනවා. අලුත් CSS ලියද්දී **bare `span`
 selector වලට font එකක් දාන්න එපා** — element එකට direct කරන්න
 (`summary p`, `[data-testid="stMarkdownContainer"]` වගේ).
+
+### Top padding — Streamlit header එක fixed
+
+Streamlit එකේ header එක (Share · ⭐ · Manage app) **fixed**, උස `3.75rem`.
+Content ඒක යටින් scroll වෙනවා. ඒගොල්ලන්ගේ default `padding-top` එක `6rem`
+වෙන්නේ ඒකයි.
+
+`.block-container` එකේ top padding එක `3.75rem` ට වඩා අඩු කරොත් app bar එකේ
+උඩ කොටස header එක යටට ගිහින් **කැපෙනවා**. දැන් `4.6rem` — default එකට වඩා
+තදයි, ඒත් header එක clear වෙනවා.
+
+```css
+.block-container, [data-testid="stMainBlockContainer"]{ padding-top:4.6rem; }
+```
+
+---
+
+## 19. Pick Id — දැනටමත් pick task එකකට ගිය stock
+
+Inventory report එකේ **`Pick Id`** column එක:
+
+| Pick Id | තේරුම | App එක කරන දේ |
+|---|---|---|
+| `0` | free | pick කරනවා |
+| `0` නොවන එකක් | WMS එකේ pick task එකකට allocate වෙලා | **අයින් කරනවා** |
+
+**මේක ඇයි වැදගත්:** allocate වුණ pallet වල `Status` එකත් තාම **`Available`**.
+ඒ නිසා status filter එකෙන් ඒවා අල්ලන්නේ නෑ — gate එක නැත්නම් **එකම stock එක
+දෙපාරක් pick වෙනවා**. Test file එකේ pallet 9ක් (151 units) මේ තත්වයේ තියෙනවා.
+
+* Sidebar → *Pick options* → **Pick Id = 0 only** (default on)
+* Plant table එකේ **On pick task** column එකෙන් කීයද අයින් වුණේ කියලා පේනවා
+* Result එකේ **On a pick task — excluded** expander එකේ pallet · location · qty ·
+  Pick Id ඔක්කොම
+* Stock tab එකේ **Pick Id** filter (`FREE` / `ON PICK TASK`) — locked row වල
+  `BALANCE` එක 0 කරලා තියෙනවා
+* Pick Report එකේ **On Pick Task** sheet එකක්
+
+**Shortage reason එකේ වෙනස:** stock එක ඇත්තටම තියෙනවා ඒත් locked නම්, ඒක
+කියනවා —
+
+```
+On another pick task — 128 locked (Pick Id 1282815, 1284491, 1284501, 1284542)
+Stock short · 128 also locked to a pick task (Pick Id …)
+```
+
+Shortage PDF එකේත් **On pick task** column එකක් තියෙනවා. එතකොට "stock නෑ" කියලා
+හොයන්න යන්නේ නැතුව, කවුරු හරි ඒක pick task එකකට දාලා තියෙනවා කියලා වහාම පේනවා.
