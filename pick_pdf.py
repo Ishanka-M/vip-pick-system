@@ -30,6 +30,10 @@ from reportlab.lib.utils import ImageReader
 from reportlab.platypus import (Image, KeepTogether, Paragraph, SimpleDocTemplate,
                                 Spacer, Table, TableStyle)
 
+# Bumped whenever this module's public surface changes; app.py refuses to run
+# against a stale copy instead of dying with a redacted TypeError.
+API = 4
+
 # --------------------------------------------------------------------------- #
 # palette
 # --------------------------------------------------------------------------- #

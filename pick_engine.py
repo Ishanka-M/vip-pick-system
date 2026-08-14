@@ -23,6 +23,10 @@ from openpyxl.utils import get_column_letter
 
 from doc_parser import ParsedDoc, base_item, clean_item
 
+# Bumped whenever this module's public surface changes; app.py refuses to run
+# against a stale copy instead of dying with a redacted TypeError.
+API = 4
+
 # --------------------------------------------------------------------------- #
 # WMS templates
 # --------------------------------------------------------------------------- #

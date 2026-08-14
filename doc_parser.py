@@ -18,6 +18,10 @@ from typing import Any
 import pandas as pd
 import pdfplumber
 
+# Bumped whenever this module's public surface changes; app.py refuses to run
+# against a stale copy instead of dying with a redacted TypeError.
+API = 2
+
 # --------------------------------------------------------------------------- #
 # Item-code helpers
 # --------------------------------------------------------------------------- #

@@ -28,6 +28,27 @@ st.set_page_config(
     menu_items={"about": "OutBound Pick Generator — EFL / Donaldson · Körber One"},
 )
 
+# --------------------------------------------------------------------------- #
+# Module version gate
+# --------------------------------------------------------------------------- #
+# Streamlit Cloud redacts exception text, so a half-updated deploy used to die
+# with an unreadable TypeError. Every module carries an API number; refuse to
+# run against a stale one and say exactly which file to replace.
+_NEEDS = {"pick_engine.py": (E, 4), "doc_parser.py": (P, 2), "pick_pdf.py": (PP, 4),
+          "sku_master.py": (SKU, 2), "ui.py": (ui, 2)}
+_STALE = [(f, getattr(m, "API", 0), n) for f, (m, n) in _NEEDS.items()
+          if getattr(m, "API", 0) < n]
+if _STALE:
+    st.error(
+        "**These files are out of date — replace them and redeploy.**\n\n"
+        + "\n".join(f"- `{f}` — found API {have or 'none'}, needs {need}"
+                     for f, have, need in _STALE)
+        + "\n\nEvery module in this app has to come from the same release. "
+          "Updating `app.py` on its own leaves the engine without the fields it "
+          "is being handed."
+    )
+    st.stop()
+
 ui.inject()
 
 
@@ -494,7 +515,7 @@ with tab_gen:
             missing.append("Plant confirm")
         ui.empty("Almost there", "Still needed: " + " · ".join(missing), "📥")
     else:
-        cfg = E.EngineConfig(
+        _cfg_kw = dict(
             wh_id=wh_id, client_code=client_code, order_type=order_type,
             plants=st.session_state["plants_ok"], statuses=statuses, strategy=strategy,
             exact_item_first=exact_first, use_ledger=use_ledger,
@@ -505,6 +526,13 @@ with tab_gen:
             override_doc_check=override,
             pick_date=datetime.combine(pick_date, datetime.now().time()),
         )
+        try:
+            cfg = E.EngineConfig(**_cfg_kw)
+        except TypeError as ex:
+            st.error(f"`pick_engine.py` does not match this `app.py` — {ex}. "
+                     "Replace `pick_engine.py` with the copy from the same release "
+                     "and redeploy.")
+            st.stop()
         ui.section("Generate", "04",
                    f"{len(st.session_state['docs'])} documents · "
                    f"{', '.join(st.session_state['plants_ok'])} · {strategy}")

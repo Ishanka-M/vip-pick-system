@@ -23,6 +23,19 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+> **හැම file එකක්ම එකම release එකෙන් ගන්න.** `app.py` විතරක් update කරොත්
+> engine එකට තේරෙන්නේ නැති field එකක් යවනවා → Streamlit Cloud එකේ
+> `TypeError` එකක්, ඒත් **message එක redact වෙනවා** නිසා මොකක්ද කියලා පේන්නේ නෑ.
+> ඒ නිසා හැම module එකකම `API` number එකක් තියෙනවා, mismatch එකක් තිබ්බොත්
+> app එක **run වෙන්නේ නෑ** — කොයි file එකද පරණ කියලා නමින්ම කියනවා.
+
+| File | API |
+|---|---|
+| `pick_engine.py` | 4 |
+| `pick_pdf.py` | 4 |
+| `gsheet.py` | 3 |
+| `doc_parser.py` · `sku_master.py` · `ui.py` | 2 |
+
 **`.streamlit/config.toml` එක repo එකට push කරන්න අමතක කරන්න එපා.** Dropdown ·
 date picker · `st.dataframe` (canvas එකක් — CSS එකට ළඟා වෙන්න බෑ) වගේ widget වල
 ඇතුලත colour එන්නේ ඒකෙන් තමයි. ඒක නැත්නම් app එක Streamlit default theme එකට

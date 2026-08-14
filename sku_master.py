@@ -16,6 +16,10 @@ import pandas as pd
 
 from doc_parser import base_item, clean_item
 
+# Bumped whenever this module's public surface changes; app.py refuses to run
+# against a stale copy instead of dying with a redacted TypeError.
+API = 2
+
 CORE = ["ITEM_NUMBER", "BASE_ID", "MATCH_KEY", "ITEM_DESCRIPTION"]
 AUDIT = ["UPDATED_AT", "UPDATED_BY", "SOURCE"]
 
