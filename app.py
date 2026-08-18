@@ -37,7 +37,7 @@ st.set_page_config(
 # run against a stale one and say exactly which file to replace.
 _NEEDS = {"pick_engine.py": (E, 4), "doc_parser.py": (P, 3), "pick_pdf.py": (PP, 4),
           "sku_master.py": (SKU, 2), "ui.py": (ui, 2),
-          "invoice_register.py": (R, 3)}
+          "invoice_register.py": (R, 4)}
 _STALE = [(f, getattr(m, "API", 0), n) for f, (m, n) in _NEEDS.items()
           if getattr(m, "API", 0) < n]
 if _STALE:
@@ -97,11 +97,68 @@ def _mrp_contacts():
 def _gs_ready() -> bool:
     return bool(get_sa() and str(gs_conf().get("data_sheet", "")).strip())
 
+
+def _inv_norm(inv_raw):
+    """
+    normalize_inventory is 80 ms and plant_summary another 47 ms on a 2 000-row
+    report — that used to run on every checkbox click. Key it to the uploaded
+    file instead.
+    """
+    sig = st.session_state.get("inv_sig")
+    hit = st.session_state.get("_inv_norm")
+    if hit and hit[0] == sig:
+        return hit[1], hit[2]
+    norm = E.normalize_inventory(inv_raw)
+    psum = E.plant_summary(norm)
+    st.session_state["_inv_norm"] = (sig, norm, psum)
+    return norm, psum
+
+
+def _stock_view(inv_raw, ledger, use_ledger: bool):
+    """stock_view is 300 ms — cache it against the file and the ledger size."""
+    key = (st.session_state.get("inv_sig"), use_ledger,
+           len(ledger) if ledger is not None else 0)
+    hit = st.session_state.get("_stock_view")
+    if hit and hit[0] == key:
+        return hit[1]
+    view = E.stock_view(inv_raw, ledger, use_ledger=use_ledger)
+    st.session_state["_stock_view"] = (key, view)
+    return view
+
 if "user_id" not in st.session_state:
     import uuid as _uuid
     st.session_state["user_id"] = f"user-{_uuid.uuid4().hex[:6]}"
 USER = st.session_state["user_id"]
 MRP_CONTACTS = _mrp_contacts()
+
+
+def _fkey(*frames) -> str:
+    """Cheap content signature for a set of DataFrames."""
+    parts = []
+    for f in frames:
+        if f is None or not len(f):
+            parts.append("0")
+            continue
+        try:
+            parts.append(f"{len(f)}:{int(pd.util.hash_pandas_object(f, index=False).sum())}")
+        except Exception:
+            parts.append(str(len(f)))
+    return "|".join(parts)
+
+
+def _bytes(key: str, fn, *args):
+    """
+    Build a download payload once.
+
+    st.download_button needs the bytes up front, so every Excel on screen was
+    being rebuilt on every rerun — four of them cost about 170 ms per click.
+    """
+    box = st.session_state.setdefault("_dl_cache", {})
+    if key not in box:
+        if len(box) > 24:
+            box.clear()
+        box[key] = fn(*args)
+    return box[key]
 
 
 # --------------------------------------------------------------------------- #
@@ -238,16 +295,29 @@ with st.sidebar:
         ttl = st.slider("Read cache (seconds)", 0, 180, 45, 5,
                         help="Saves Google API quota when several people work at "
                              "once. 0 = no cache, every read hits the API.")
+        rate = st.slider("Requests per minute", 20, 60, 55, 5,
+                         help="Google allows 60 read and 60 write requests per "
+                              "minute. Calls are paced to stay under this instead "
+                              "of hitting a 429 and backing off for seconds.")
         try:
             import gsheet
             gsheet.set_cache_ttl(ttl)
+            gsheet.RATE_LIMIT = int(rate)
             stt = gsheet.STATS
+            used = gsheet.quota_used()
+            st.progress(min(1.0, used / max(1, rate)),
+                        text=f"Quota {used}/{rate} in the last minute")
             a1, a2 = st.columns(2)
             a1.metric("API calls", stt["calls"])
             a2.metric("Cache hits", stt["cache_hits"])
             b1, b2 = st.columns(2)
-            b1.metric("Retries", stt["retries"])
-            b2.metric("Errors", stt["errors"], delta_color="inverse")
+            b1.metric("Saved by batching", stt["batched"],
+                      help="Requests avoided by reading several worksheets at once.")
+            b2.metric("Retries", stt["retries"])
+            c0, c00 = st.columns(2)
+            c0.metric("Errors", stt["errors"], delta_color="inverse")
+            c00.metric("Paced", f"{stt['throttled']:.0f}s",
+                       help="Time spent waiting to stay inside the quota.")
             if stt["last_error"]:
                 st.caption(f"⚠️ {stt['last_error'][:120]}")
             if gs_ready:
@@ -494,8 +564,7 @@ with tab_gen:
     inv_raw = st.session_state.get("inv_raw")
 
     if inv_raw is not None:
-        inv_norm = E.normalize_inventory(inv_raw)
-        psum = E.plant_summary(inv_norm)
+        inv_norm, psum = _inv_norm(inv_raw)
         ui.section("Plant", "03", "which plant should this be picked from?")
         pc1, pc2 = st.columns([1.2, 1])
         with pc1:
@@ -573,8 +642,7 @@ with tab_gen:
             if gs_ready:
                 try:
                     import gsheet
-                    ledger = gsheet.read_ledger(sa_info, sheet_key)
-                    done_docs = gsheet.read_processed_docs(sa_info, sheet_key)
+                    ledger, done_docs = gsheet.read_for_run(sa_info, sheet_key)
                 except Exception as ex:
                     st.warning(f"Could not read the Google Sheet ({ex}) - "
                                "ledger and duplicate check were skipped.")
@@ -601,7 +669,11 @@ with tab_gen:
                                      user=USER,
                                      plant=", ".join(st.session_state["plants_ok"]))
                 st.session_state["reg_run"] = (_sum, _det)
-                if gs_ready:
+                _dups = _sum.attrs.get("skipped_duplicates", [])
+                if _dups:
+                    st.caption(f"Already picked earlier, left out of the register and "
+                               f"the dashboard: {', '.join(_dups)}")
+                if gs_ready and (len(_sum) or len(_det)):
                     try:
                         import gsheet
                         rr = gsheet.save_register(sa_info, sheet_key, _sum, _det,
@@ -609,6 +681,8 @@ with tab_gen:
                         st.session_state.pop("reg_cache", None)
                         st.caption(f"Register · {rr['new']} new, {rr['updated']} updated "
                                    f"— {rr['summary_rows']} invoices on file")
+                    except gsheet.LockBusy as ex:
+                        st.warning(f"Register: {ex}")
                     except Exception as ex:
                         st.warning(f"Register not saved: {ex}")
 
@@ -923,11 +997,14 @@ with tab_gen:
                                file_name=f"OutBound_{stamp}.zip",
                                mime="application/zip", width="stretch")
             z2.download_button("One Excel — all docs",
-                               data=E.build_wms_excel(res["master"], res["detail"]),
+                               data=_bytes(f"all{res['run_id']}", E.build_wms_excel,
+                                           res["master"], res["detail"]),
                                file_name=f"OutBound_Upload_{stamp}.xlsx",
                                mime="application/vnd.openxmlformats-officedocument."
                                     "spreadsheetml.sheet", width="stretch")
-            z3.download_button("Pick report", data=E.build_report_excel(res),
+            z3.download_button("Pick report",
+                               data=_bytes(f"rep{res['run_id']}", E.build_report_excel,
+                                           res),
                                file_name=f"Pick_Report_{stamp}.xlsx",
                                mime="application/vnd.openxmlformats-officedocument."
                                     "spreadsheetml.sheet", width="stretch")
@@ -1053,6 +1130,9 @@ with tab_dash:
                                      key="dash_types")
         dash = R.dashboard(d_sum, d_from, d_to, d_types or None)
         k = dash["kpi"]
+        if dash.get("duplicates"):
+            st.caption(f"{dash['duplicates']} duplicate row(s) left out — a duplicate "
+                       "is an invoice that was already picked, not outstanding work.")
 
         # ---- the answer, first ----
         pct = k["pct"] / 100.0
@@ -1107,13 +1187,17 @@ with tab_dash:
         pend = dash["pending"]
 
         q1, q2, q3, q4 = st.columns(4)
-        q1.download_button("Summary report (Excel)", data=R.summary_excel(dash_sum),
+        q1.download_button("Summary report (Excel)",
+                           data=_bytes(f"ds{_fkey(dash_sum)}", R.summary_excel, dash_sum),
                            file_name=f"Invoice_Summary_{d_stamp}.xlsx", mime=XL,
                            width="stretch", key="dash_sum_xl")
-        q2.download_button("Details report (Excel)", data=R.details_excel(dash_det),
+        q2.download_button("Details report (Excel)",
+                           data=_bytes(f"dd{_fkey(dash_det)}", R.details_excel, dash_det),
                            file_name=f"Invoice_Details_{d_stamp}.xlsx", mime=XL,
                            width="stretch", key="dash_det_xl")
-        q3.download_button("Pending report (Excel)", data=R.pending_excel(dash),
+        q3.download_button("Pending report (Excel)",
+                           data=_bytes(f"dp{_fkey(dash['pending'], dash_sum)}",
+                                       R.pending_excel, dash),
                            file_name=f"Pending_{d_stamp}.xlsx", mime=XL,
                            width="stretch", key="dash_pend_xl",
                            disabled=not k["pending"])
@@ -1178,11 +1262,13 @@ with tab_reg:
         ui.eyebrow("Download")
         stamp2 = datetime.now().strftime("%Y%m%d_%H%M")
         dl1, dl2 = st.columns(2)
-        dl1.download_button("Summary report (Excel)", data=R.summary_excel(vs),
+        dl1.download_button("Summary report (Excel)",
+                            data=_bytes(f"rs{_fkey(vs)}", R.summary_excel, vs),
                             file_name=f"Invoice_Summary_{stamp2}.xlsx",
                             mime="application/vnd.openxmlformats-officedocument."
                                  "spreadsheetml.sheet", width="stretch")
-        dl2.download_button("Details report (Excel)", data=R.details_excel(vd),
+        dl2.download_button("Details report (Excel)",
+                            data=_bytes(f"rd{_fkey(vd)}", R.details_excel, vd),
                             file_name=f"Invoice_Details_{stamp2}.xlsx",
                             mime="application/vnd.openxmlformats-officedocument."
                                  "spreadsheetml.sheet", width="stretch")
@@ -1536,7 +1622,8 @@ with tab_sku:
                 st.rerun()
             except Exception as ex:
                 st.error(f"Save error: {ex}")
-        e2.download_button("Download all", data=SKU.to_excel(master),
+        e2.download_button("Download all",
+                           data=_bytes(f"sku{_fkey(master)}", SKU.to_excel, master),
                            file_name="SKU_Master.xlsx",
                            mime="application/vnd.openxmlformats-officedocument."
                                 "spreadsheetml.sheet", width="stretch",
@@ -1581,8 +1668,8 @@ with tab_search:
                 led = gsheet.read_ledger(sa_info, sheet_key)
             except Exception:
                 led = None
-        frames["📦 Inventory / balance"] = E.stock_view(st.session_state["inv_raw"], led,
-                                                       use_ledger=use_ledger)
+        frames["📦 Inventory / balance"] = _stock_view(st.session_state["inv_raw"], led,
+                                                      use_ledger)
     if "Current run" not in src:
         for k in ["🎯 Pallet Allocation", "📋 OutBound Detail", "🧾 OutBound MASTER",
                   "🔢 Qty Verify", "📊 Stock Basis", "🔒 On Pick Task", "⛔ Rejected",
@@ -1641,7 +1728,7 @@ with tab_bal:
                 ledger = gsheet.read_ledger(sa_info, sheet_key)
             except Exception as ex:
                 st.warning(f"Ledger read error: {ex}")
-        view = E.stock_view(inv_raw, ledger, use_ledger=use_ledger)
+        view = _stock_view(inv_raw, ledger, use_ledger)
         f1, f2, f3, f4, f5 = st.columns([1.5, 1, 1, 1, .9])
         q = f1.text_input("Item / Base ID / Pallet search", placeholder="P550945")
         plants = f2.multiselect("Plant", sorted(view["PLANT"].dropna().unique().tolist()))

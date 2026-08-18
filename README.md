@@ -32,9 +32,10 @@ streamlit run app.py
 
 | File | API |
 |---|---|
-| `pick_engine.py` · `pick_pdf.py` · `gsheet.py` | 4 |
-| `doc_parser.py` · `sku_master.py` · `ui.py` | 3 / 2 / 2 |
-| `invoice_register.py` | 3 |
+| `gsheet.py` | 5 |
+| `pick_engine.py` · `pick_pdf.py` · `invoice_register.py` | 4 |
+| `doc_parser.py` | 3 |
+| `sku_master.py` · `ui.py` | 2 |
 
 **`.streamlit/config.toml` එක repo එකට push කරන්න අමතක කරන්න එපා.** Dropdown ·
 date picker · `st.dataframe` (canvas එකක් — CSS එකට ළඟා වෙන්න බෑ) වගේ widget වල
@@ -686,3 +687,60 @@ Date range + document type filter එක **හතරටම** apply වෙනව�
 
 Pending invoice එකක් **තනියම clear වෙනවා** — Pick tab එකෙන් ආපහු upload කරලා
 pick වුණාම register එක `Yes` කරනවා, dashboard එකෙන් අයින් වෙනවා.
+
+---
+
+## 24. Duplicates · API quota · multi-user · speed
+
+### Duplicate කිසිම තැනකට යන්නේ නෑ
+
+Invoice එකක් කලින් pick වෙලා තියෙද්දී ආපහු upload කරොත් — ඒක **pending වැඩක්
+නෙවෙයි**, ඉවර වුණ වැඩක්. ඒ නිසා:
+
+* `R.build()` එකේදීම **register row එකක් හැදෙන්නේ නෑ** (කලින් `No` + remark
+  එකක් හැදිලා, ඒක permanent pending එකක් විදිහට dashboard එකේ ඉරිලා තිබුණා)
+* Screen එකේ පේනවා: *"Already picked earlier, left out of the register and the
+  dashboard: 333262712337"*
+* කලින් save වෙලා තියෙන legacy duplicate row තිබ්බත් **dashboard එකේ හැම
+  number එකකින්ම අයින්** — KPI · chart · pending list · download හතරම.
+  කීයක් අයින් කළාද කියලා caption එකකින් කියනවා.
+
+### API quota
+
+| | |
+|---|---|
+| **Token bucket** | Google දෙන්නේ මිනිත්තුවකට request 60ක්. දැන් calls **pace** වෙනවා (default 55/min) — 429 එකක් කාලා seconds ගාණක් backoff වෙනවට වඩා ගොඩක් ලාබයි |
+| **Batch read** | `values_batch_get` — worksheet 5ක් කියවන්න **request 1යි**. `read_load` 5 → 1, register 2 → 1, pick run එකේ ledger+registry 2 → 1 |
+| **Worksheet list cache** | 5 විනාඩියක් — batch read එකක් සම්පූර්ණයෙන්ම request 1ක් වෙනවා |
+| **Single-request write** | `clear()` + `update()` = request 2ක්, ඒ අතරේ sheet එක **හිස්**. දැන් අලුත් rows + පරණ ඒවා ආවරණය වෙන්න blank padding එකක් එකයි `update` එකකින් — atomic, request භාගයක් |
+| **Gauge** | Sidebar → API & multi-user: *Quota 12/55 in the last minute* · calls · cache hits · **saved by batching** · retries · errors · paced seconds |
+
+Rate limit එක slider එකෙන් 20–60 අතර වෙනස් කරන්නත් පුළුවන් (user ගොඩක්
+එකවර නම් අඩු කරන්න).
+
+### Multiple users
+
+* `_LOCKS` worksheet එකේ lock එක දැන් **request 1කින්** ගන්නවා (කලින් clear +
+  update = 2). Lock එකක් ගන්න request 2ක් ඕන නම්, ඒ අතරමැද දෙන්නෙක්ම lock එක
+  තමන්ට කියලා හිතන්න පුළුවන් — ඒ window එක වැහුණා
+* Register save එකේ merge එක **lock එක ඇතුලේ, fresh read එකකට එරෙහිව** —
+  දෙන්නෙක් වෙනස් invoice දෙකක් එකවර pick කරොත් දෙකම register එකට යනවා
+* Duplicate re-check එකත් lock එක ඇතුලේම — එකම invoice එක දෙන්නෙක් දැම්මොත්
+  එකයි යන්නේ
+* Throttle එක **thread-safe** (`threading.Lock`), ඒ නිසා user ගොඩක් එකවර
+  වැඩ කරද්දීත් quota එක එකතුවෙන් manage වෙනවා
+
+### Speed — rerun එකකට 1.51s → 0.69s (**2.2×**)
+
+Streamlit එකේ **හැම click එකකටම මුළු script එකම ආපහු run වෙනවා**. ඒ නිසා
+rerun එකකට වැය වෙන එක තමයි ඇත්ත speed එක.
+
+| වැඩේ | කලින් | දැන් |
+|---|---|---|
+| `normalize_inventory` + `plant_summary` | හැම rerun එකකම 127 ms | file එකකට එක පාරයි |
+| `stock_view` (2 000 rows) | හැම rerun එකකම 302 ms | file + ledger එකට එක පාරයි |
+| Excel download 4ක් build කිරීම | හැම rerun එකකම ~170 ms | content signature එකකට එක පාරයි |
+| Google Sheet reads | worksheet එකකට request එකක් | batch — 5 → 1 |
+
+Download cache එකේ key එක frame එකේ **content hash** එකක් — data වෙනස් වුණාම
+තනියම rebuild වෙනවා, පරණ file එකක් කවදාවත් යන්නේ නෑ.

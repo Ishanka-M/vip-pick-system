@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import random
 import re
+import threading
 import time
 import uuid
+from collections import deque
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
@@ -27,7 +29,7 @@ import pick_engine as E
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 4
+API = 5
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -85,11 +87,43 @@ _LOAD_COL = {
 # API manager — retry · cache · stats
 # --------------------------------------------------------------------------- #
 STATS: dict[str, Any] = {"calls": 0, "retries": 0, "cache_hits": 0, "errors": 0,
-                         "last_error": "", "last_call": ""}
+                         "batched": 0, "throttled": 0.0, "last_error": "",
+                         "last_call": ""}
 
 _CACHE: dict[tuple, tuple[float, Any]] = {}
 _CACHE_TTL = 45.0
 MAX_RETRY = 5
+
+# Google allows 60 read + 60 write requests per minute per user. Staying a few
+# under and *pacing* is far cheaper than getting a 429 and backing off for
+# seconds — especially with several people on the app at once.
+RATE_LIMIT = 55
+_WINDOW: deque = deque()
+_RATE_LOCK = threading.Lock()
+
+
+def _throttle() -> None:
+    """Block just long enough to keep the last 60 s under RATE_LIMIT calls."""
+    while True:
+        with _RATE_LOCK:
+            now = time.time()
+            while _WINDOW and now - _WINDOW[0] > 60.0:
+                _WINDOW.popleft()
+            if len(_WINDOW) < RATE_LIMIT:
+                _WINDOW.append(now)
+                return
+            wait = 60.0 - (now - _WINDOW[0]) + 0.05
+        STATS["throttled"] = round(STATS["throttled"] + wait, 2)
+        time.sleep(min(wait, 5.0))
+
+
+def quota_used() -> int:
+    """Calls in the last 60 seconds."""
+    now = time.time()
+    with _RATE_LOCK:
+        while _WINDOW and now - _WINDOW[0] > 60.0:
+            _WINDOW.popleft()
+        return len(_WINDOW)
 
 
 def _key(sheet_key: str) -> str:
@@ -101,7 +135,9 @@ def _key(sheet_key: str) -> str:
 def cache_clear(sheet_key: str | None = None) -> None:
     if sheet_key is None:
         _CACHE.clear()
+        _TITLES.clear()
         return
+    _TITLES.pop(_key(sheet_key), None)
     for k in [k for k in _CACHE if k[0] == _key(sheet_key)]:
         _CACHE.pop(k, None)
 
@@ -126,6 +162,7 @@ def api(fn: Callable, *a, **kw):
     delay = 1.0
     for attempt in range(MAX_RETRY):
         try:
+            _throttle()
             STATS["calls"] += 1
             STATS["last_call"] = datetime.now().strftime("%H:%M:%S")
             return fn(*a, **kw)
@@ -165,13 +202,14 @@ def _ensure(book, title: str, header: list[str]):
 
 def init_sheet(sa_info: dict, sheet_key: str) -> dict[str, Any]:
     book = open_book(sa_info, sheet_key)
-    have = {w.title for w in api(book.worksheets)}
+    have = _titles(book, sheet_key)
     made: dict[str, Any] = {}
     for title, header in _SHEETS.items():
         _ensure(book, title, header)
         made[title] = title not in have
     made["url"] = book.url
     cache_clear(sheet_key)
+    _titles(book, sheet_key)
     return made
 
 
@@ -182,7 +220,8 @@ def health(sa_info: dict, sheet_key: str) -> dict[str, Any]:
     return {"ok": True, "ms": int((time.time() - t0) * 1000), "url": book.url,
             "worksheets": sheets, "missing": [t for t in _SHEETS if t not in sheets],
             "cached": len([k for k in _CACHE if k[0] == _key(sheet_key)]),
-            "ttl": _CACHE_TTL, **STATS}
+            "ttl": _CACHE_TTL, "quota_used": quota_used(), "quota_limit": RATE_LIMIT,
+            **STATS}
 
 
 # --------------------------------------------------------------------------- #
@@ -204,16 +243,79 @@ def read_ws(sa_info: dict, sheet_key: str, title: str, use_cache: bool = True,
     except Exception:
         df = pd.DataFrame()
     else:
-        rows = api(ws.get_all_values)
-        if not rows:
-            df = pd.DataFrame()
-        else:
-            head, *body = rows
-            head = [h if h else f"COL{i}" for i, h in enumerate(head)]
-            body = [r + [""] * (len(head) - len(r)) for r in body]
-            df = pd.DataFrame([r[:len(head)] for r in body], columns=head)
+        df = _frame(api(ws.get_all_values))
     _CACHE[ck] = (time.time(), df.copy())
     return df
+
+
+_TITLES: dict[str, tuple[float, set[str]]] = {}
+
+
+def _titles(book, sheet_key: str, ttl: float = 300.0) -> set[str]:
+    """Worksheet names, cached — this list changes about once a year."""
+    ck = _key(sheet_key)
+    hit = _TITLES.get(ck)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    names = {w.title for w in api(book.worksheets)}
+    _TITLES[ck] = (time.time(), names)
+    return names
+
+
+def _frame(rows: list[list[str]]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame()
+    head, *body = rows
+    head = [h if h else f"COL{i}" for i, h in enumerate(head)]
+    body = [r + [""] * (len(head) - len(r)) for r in body]
+    return pd.DataFrame([r[:len(head)] for r in body], columns=head)
+
+
+def read_many(sa_info: dict, sheet_key: str, titles: list[str],
+              use_cache: bool = True, ttl: float | None = None
+              ) -> dict[str, pd.DataFrame]:
+    """
+    Several worksheets in a single request.
+
+    Reading six sheets one at a time is six requests against a 60/minute quota;
+    values_batch_get makes it one. Anything already cached is not asked for.
+    """
+    life = _CACHE_TTL if ttl is None else ttl
+    out: dict[str, pd.DataFrame] = {}
+    want: list[str] = []
+    for t in titles:
+        ck = (_key(sheet_key), t)
+        if use_cache and ck in _CACHE and time.time() - _CACHE[ck][0] < life:
+            STATS["cache_hits"] += 1
+            out[t] = _CACHE[ck][1].copy()
+        else:
+            want.append(t)
+    if not want:
+        return out
+
+    book = open_book(sa_info, sheet_key)
+    have = _titles(book, sheet_key)
+    ask = [t for t in want if t in have]
+    for t in want:
+        if t not in have:
+            out[t] = pd.DataFrame()
+            _CACHE[(_key(sheet_key), t)] = (time.time(), pd.DataFrame())
+    if ask:
+        try:
+            res = api(book.values_batch_get, [f"'{t}'" for t in ask]) or {}
+            ranges = res.get("valueRanges", []) if isinstance(res, dict) else []
+        except Exception:
+            ranges = []                       # fall back to one read per sheet
+        if len(ranges) == len(ask):
+            STATS["batched"] += max(0, len(ask) - 1)
+            for t, vr in zip(ask, ranges):
+                df = _frame((vr or {}).get("values") or [])
+                out[t] = df
+                _CACHE[(_key(sheet_key), t)] = (time.time(), df.copy())
+        else:
+            for t in ask:
+                out[t] = read_ws(sa_info, sheet_key, t, use_cache=False)
+    return out
 
 
 def read_ledger(sa_info: dict, sheet_key: str) -> pd.DataFrame:
@@ -242,8 +344,8 @@ def save_setting(sa_info: dict, sheet_key: str, key: str, value: str) -> None:
     head = rows[0] if rows else _SHEETS[WS_SETTINGS]
     body = [r for r in rows[1:] if (r[0] if r else "") != str(key)]
     body.append([str(key), str(value), datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
-    api(ws.clear)
-    api(ws.update, values=[head] + body, range_name="A1", value_input_option="RAW")
+    write_table(book, WS_SETTINGS, head, pd.DataFrame(body, columns=head),
+                prev_rows=len(rows) - 1 if rows else 0)
     cache_clear(sheet_key)
 
 
@@ -269,6 +371,7 @@ class sheet_lock:
         self.wait, self.hold = wait, hold
         self.ws = None
         self.got = False
+        self._last = 8
 
     def _rows(self):
         rows = api(self.ws.get_all_values)
@@ -276,8 +379,13 @@ class sheet_lock:
         return head, [r + [""] * (len(head) - len(r)) for r in rows[1:]]
 
     def _write(self, head, body):
-        api(self.ws.clear)
-        api(self.ws.update, values=[head] + body, range_name="A1", value_input_option="RAW")
+        # one request, padded over the old rows — a lock that needs two requests
+        # to take is a lock that two people can both think they hold
+        n = max(len(body) + 1, self._last + 1)
+        rows = [head] + body + [[""] * len(head) for _ in range(n - len(body) - 1)]
+        self._last = len(body)
+        api(self.ws.update, values=rows,
+            range_name=f"A1:{_a1(len(head))}{len(rows)}", value_input_option="RAW")
 
     def acquire(self) -> bool:
         book = open_book(self.sa, self.key)
@@ -355,8 +463,8 @@ def clear_locks(sa_info: dict, sheet_key: str) -> int:
     book = open_book(sa_info, sheet_key)
     ws = _ensure(book, WS_LOCK, LOCK_COLS)
     n = max(0, len(api(ws.get_all_values)) - 1)
-    api(ws.clear)
-    api(ws.update, values=[LOCK_COLS], range_name="A1", value_input_option="RAW")
+    write_table(book, WS_LOCK, LOCK_COLS, pd.DataFrame(columns=LOCK_COLS),
+                prev_rows=n)
     cache_clear(sheet_key)
     return n
 
@@ -364,6 +472,41 @@ def clear_locks(sa_info: dict, sheet_key: str) -> int:
 # --------------------------------------------------------------------------- #
 # write
 # --------------------------------------------------------------------------- #
+def _a1(n_cols: int) -> str:
+    col, x = "", n_cols
+    while x:
+        x, r = divmod(x - 1, 26)
+        col = chr(65 + r) + col
+    return col
+
+
+def write_table(book, title: str, header: list[str], df: pd.DataFrame,
+                prev_rows: int | None = None) -> int:
+    """
+    Replace a worksheet's contents in **one** request.
+
+    `clear()` followed by `update()` is two requests and leaves a window where
+    the sheet is empty — if anything fails in between, the data is gone. Writing
+    the new rows plus enough blank padding to cover the old ones does the same
+    job atomically and halves the request count.
+    """
+    ws = _ensure(book, title, header)
+    rows = [header]
+    if df is not None and len(df):
+        rows += [["" if pd.isna(v) else str(v) for v in r]
+                 for r in df.reindex(columns=header).values.tolist()]
+    n_new = len(rows)
+    old = prev_rows if prev_rows is not None else max(0, ws.row_count - 1)
+    pad = max(0, (old + 1) - n_new)
+    blank = [""] * len(header)
+    body = rows + [list(blank) for _ in range(pad)]
+    if ws.row_count < len(body):
+        api(ws.resize, rows=len(body) + 50, cols=max(ws.col_count, len(header)))
+    api(ws.update, values=body, range_name=f"A1:{_a1(len(header))}{len(body)}",
+        value_input_option="RAW")
+    return n_new - 1
+
+
 def _append(ws, df: pd.DataFrame, header: list[str]) -> int:
     if df is None or not len(df):
         return 0
@@ -464,8 +607,9 @@ def read_load(sa_info: dict, sheet_key: str, load_id: str,
     """LOAD_ID එකකට අදාල ඔක්කොම rows — master · detail · ledger · registry · rejected."""
     lid = str(load_id).strip()
     out: dict[str, pd.DataFrame] = {}
+    got = read_many(sa_info, sheet_key, list(_LOAD_COL), use_cache=not fresh)
     for title, col in _LOAD_COL.items():
-        df = read_ws(sa_info, sheet_key, title, use_cache=not fresh)
+        df = got.get(title, pd.DataFrame())
         if df is None or not len(df) or col not in df.columns:
             out[title] = pd.DataFrame()
             continue
@@ -500,9 +644,8 @@ def delete_load(sa_info: dict, sheet_key: str, load_id: str,
             n = len(body) - len(keep)
             removed[title] = n
             if n:
-                api(ws.clear)
-                api(ws.update, values=[head] + keep, range_name="A1",
-                    value_input_option="RAW")
+                write_table(book, title, head, pd.DataFrame(keep, columns=head),
+                            prev_rows=len(body))
         # the register must stop claiming this invoice was picked
         cur = read_ws(sa_info, sheet_key, WS_INV_SUM, use_cache=False)
         if cur is not None and len(cur):
@@ -531,8 +674,8 @@ def delete_run(sa_info: dict, sheet_key: str, run_id: str) -> dict[str, int]:
             i = head.index("RUN_ID")
             keep = [r for r in body if (r[i] if i < len(r) else "") != run_id]
             removed[title] = len(body) - len(keep)
-            api(ws.clear)
-            api(ws.update, values=[head] + keep, range_name="A1", value_input_option="RAW")
+            write_table(book, title, head, pd.DataFrame(keep, columns=head),
+                        prev_rows=len(body))
     cache_clear(sheet_key)
     return removed
 
@@ -548,19 +691,11 @@ def save_sku(sa_info: dict, sheet_key: str, master: pd.DataFrame,
              owner: str = "") -> dict[str, Any]:
     """SKU master full replace (upsert එක app එකේ කරලා එවනවා) — lock එකක් ඇතුලේ."""
     head = list(master.columns) if (master is not None and len(master)) else SKU_COLS
-    values = [head]
-    if master is not None and len(master):
-        values += [["" if pd.isna(v) else str(v) for v in row]
-                   for row in master.reindex(columns=head).values.tolist()]
     with sheet_lock(sa_info, sheet_key, "SKU", owner=owner):
         book = open_book(sa_info, sheet_key)
-        ws = _ensure(book, WS_SKU, head)
-        api(ws.clear)
-        for i in range(0, len(values), 2000):
-            api(ws.update, values=values[i:i + 2000], range_name=f"A{i + 1}",
-                value_input_option="RAW")
+        n = write_table(book, WS_SKU, head, master)
     cache_clear(sheet_key)
-    return {"rows": len(values) - 1}
+    return {"rows": n}
 
 
 # --------------------------------------------------------------------------- #
@@ -568,21 +703,22 @@ def save_sku(sa_info: dict, sheet_key: str, master: pd.DataFrame,
 # --------------------------------------------------------------------------- #
 def read_register(sa_info: dict, sheet_key: str,
                   fresh: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
-    return (read_ws(sa_info, sheet_key, WS_INV_SUM, use_cache=not fresh),
-            read_ws(sa_info, sheet_key, WS_INV_DET, use_cache=not fresh))
+    got = read_many(sa_info, sheet_key, [WS_INV_SUM, WS_INV_DET], use_cache=not fresh)
+    return got.get(WS_INV_SUM, pd.DataFrame()), got.get(WS_INV_DET, pd.DataFrame())
 
 
-def _replace_ws(book, title: str, header: list[str], df: pd.DataFrame) -> int:
-    ws = _ensure(book, title, header)
-    values = [header]
-    if df is not None and len(df):
-        values += [["" if pd.isna(v) else str(v) for v in row]
-                   for row in df.reindex(columns=header).values.tolist()]
-    api(ws.clear)
-    for i in range(0, len(values), 2000):
-        api(ws.update, values=values[i:i + 2000], range_name=f"A{i + 1}",
-            value_input_option="RAW")
-    return len(values) - 1
+def read_for_run(sa_info: dict, sheet_key: str) -> tuple[pd.DataFrame, set[str]]:
+    """Ledger + processed-document list in one request."""
+    got = read_many(sa_info, sheet_key, [WS_LEDGER, WS_REGISTRY])
+    reg = got.get(WS_REGISTRY, pd.DataFrame())
+    done = ({str(x).strip() for x in reg["DOC_NUMBER"] if str(x).strip()}
+            if len(reg) and "DOC_NUMBER" in reg.columns else set())
+    return got.get(WS_LEDGER, pd.DataFrame()), done
+
+
+def _replace_ws(book, title: str, header: list[str], df: pd.DataFrame,
+                prev_rows: int | None = None) -> int:
+    return write_table(book, title, header, df, prev_rows)
 
 
 def save_register(sa_info: dict, sheet_key: str, summary: pd.DataFrame,
@@ -597,8 +733,9 @@ def save_register(sa_info: dict, sheet_key: str, summary: pd.DataFrame,
         old_d = read_ws(sa_info, sheet_key, WS_INV_DET, use_cache=False)
         merged = R.merge_summary(old_s if len(old_s) else None, summary)
         det = R.merge_details(old_d if len(old_d) else None, details)
-        n_s = _replace_ws(book, WS_INV_SUM, R.SUMMARY_COLS, merged["data"])
-        n_d = _replace_ws(book, WS_INV_DET, R.DETAIL_COLS, det)
+        n_s = write_table(book, WS_INV_SUM, R.SUMMARY_COLS, merged["data"],
+                          prev_rows=len(old_s))
+        n_d = write_table(book, WS_INV_DET, R.DETAIL_COLS, det, prev_rows=len(old_d))
     cache_clear(sheet_key)
     return {"summary_rows": n_s, "detail_rows": n_d, "new": merged["new"],
             "updated": merged["updated"], "picked_now": merged["picked_now"],
@@ -646,6 +783,7 @@ def reset_data(sa_info: dict, sheet_key: str, scope: list[str]) -> list[str]:
             api(ws.clear)
             api(ws.update, values=[_SHEETS[title]], range_name="A1",
                 value_input_option="RAW")
+            _CACHE.pop((_key(sheet_key), title), None)
             done.append(title)
     cache_clear(sheet_key)
     return done

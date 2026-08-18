@@ -24,7 +24,7 @@ from doc_parser import ParsedDoc, base_item, clean_item
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 3
+API = 4
 
 SUMMARY_COLS = [
     "TAX_INVOICE_DATE", "TAX_INVOICE_NO", "AR_INVOICE_NO", "CUSTOMER_NAME", "QTY",
@@ -42,6 +42,11 @@ DETAIL_COLS = [
 ]
 
 DEFAULT_MRP = [{"NAME": "Sharma, Rahul", "EMAIL": "rahul.sharma1@donaldson.com"}]
+
+# A duplicate is not a pending job — the invoice was already picked in an earlier
+# run and is already sitting in the register as Yes. Registering it again would
+# invent a second, permanently-pending copy of work that is finished.
+DUPLICATE_PAT = r"duplicate"
 
 
 # --------------------------------------------------------------------------- #
@@ -126,12 +131,16 @@ def build(docs: list[ParsedDoc], res: dict[str, Any], contacts: list[dict],
     srows: list[dict] = []
     drows: list[dict] = []
     seen: set[str] = set()
+    skipped: list[str] = []
 
     for doc in docs:
         num = str(doc.doc_number).strip()
         if not num or num in seen:
             continue
         seen.add(num)
+        if num not in picked and re.search(DUPLICATE_PAT, reasons.get(num, ""), re.I):
+            skipped.append(num)          # already in the register from its real run
+            continue
         is_inv = doc.doc_type.upper().startswith("INVOICE")
         ok = num in picked
         remark = "" if ok else reasons.get(num, "Not picked")
@@ -181,8 +190,11 @@ def build(docs: list[ParsedDoc], res: dict[str, Any], contacts: list[dict],
                 "UPDATED_AT": now,
             })
 
-    return (pd.DataFrame(srows, columns=SUMMARY_COLS),
-            pd.DataFrame(drows, columns=DETAIL_COLS))
+    out_s = pd.DataFrame(srows, columns=SUMMARY_COLS)
+    out_d = pd.DataFrame(drows, columns=DETAIL_COLS)
+    out_s.attrs["skipped_duplicates"] = skipped
+    out_d.attrs["skipped_duplicates"] = skipped
+    return out_s, out_d
 
 
 # --------------------------------------------------------------------------- #
@@ -283,7 +295,6 @@ _REASONS: list[tuple[str, str]] = [
     ("Pallet over-pick", r"over-pick"),
     ("Qty verify failed", r"qty verify"),
     ("Document incomplete", r"incomplete document"),
-    ("Duplicate", r"duplicate"),
     ("Load deleted", r"load deleted"),
 ]
 
@@ -321,7 +332,8 @@ def dashboard(summary: pd.DataFrame, date_from: Any = None, date_to: Any = None,
              "by_customer": pd.DataFrame(columns=["CUSTOMER_NAME", "INVOICES", "QTY"]),
              "pending": pd.DataFrame(columns=PENDING_COLS),
              "picked": pd.DataFrame(columns=PENDING_COLS),
-             "summary": pd.DataFrame(columns=SUMMARY_COLS), "invoices": []}
+             "summary": pd.DataFrame(columns=SUMMARY_COLS), "invoices": [],
+             "duplicates": 0}
     if summary is None or not len(summary):
         return empty
 
@@ -337,8 +349,13 @@ def dashboard(summary: pd.DataFrame, date_from: Any = None, date_to: Any = None,
         d = d[d["_DATE"].isna() | (d["_DATE"] >= pd.Timestamp(date_from))]
     if date_to is not None:
         d = d[d["_DATE"].isna() | (d["_DATE"] <= pd.Timestamp(date_to))]
+    # Legacy rows written before duplicates were excluded — out of every number.
+    dup = d["REMARK"].astype(str).str.contains(DUPLICATE_PAT, case=False, na=False) & \
+        (d["KORBER_PICK"] != "Yes")
+    n_dup = int(dup.sum())
+    d = d[~dup]
     if not len(d):
-        return empty
+        return {**empty, "duplicates": n_dup}
 
     today = pd.Timestamp(datetime.now().date())
     d["DAYS"] = (today - d["_DATE"]).dt.days
@@ -375,7 +392,8 @@ def dashboard(summary: pd.DataFrame, date_from: Any = None, date_to: Any = None,
     return {"kpi": kpi, "by_reason": by_reason, "by_customer": by_customer,
             "pending": _tidy(pend), "picked": _tidy(done),
             "summary": d.reindex(columns=SUMMARY_COLS).reset_index(drop=True),
-            "invoices": [str(x) for x in d["TAX_INVOICE_NO"]]}
+            "invoices": [str(x) for x in d["TAX_INVOICE_NO"]],
+            "duplicates": n_dup}
 
 
 def details_for(details: pd.DataFrame, invoices: list[str]) -> pd.DataFrame:
