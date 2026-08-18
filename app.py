@@ -37,7 +37,7 @@ st.set_page_config(
 # run against a stale one and say exactly which file to replace.
 _NEEDS = {"pick_engine.py": (E, 4), "doc_parser.py": (P, 4), "pick_pdf.py": (PP, 4),
           "sku_master.py": (SKU, 2), "ui.py": (ui, 3),
-          "invoice_register.py": (R, 6)}
+          "invoice_register.py": (R, 7)}
 _STALE = [(f, getattr(m, "API", 0), n) for f, (m, n) in _NEEDS.items()
           if getattr(m, "API", 0) < n]
 if _STALE:
@@ -359,8 +359,11 @@ def _status_update_ui(reg_s: pd.DataFrame, reg_d: pd.DataFrame) -> None:
 
     with c2:
         st.markdown("##### Invoice sales report")
-        st.caption("Matched on Tax Invoice No. + Item Code / Customer Item + Qty. "
-                   "A line whose quantity matches exactly confirms Picking.")
+        st.caption("Checked against the actual WMS output — **OUTBOUND_MASTER** "
+                   "(was this invoice really picked and pushed to the WMS?) + "
+                   "**OUTBOUND_DETAIL** (item + qty actually sent), matched on "
+                   "Tax Invoice No. + Item Code / Customer Item + Qty. Falls back "
+                   "to the invoice's own quantity if no pick has been saved yet.")
         f_sales = st.file_uploader("Invoice sales report (Excel)", type=["xlsx", "xls"],
                                    key="sales_report_up")
         if f_sales is not None and st.button("Apply sales report", width="stretch",
@@ -375,6 +378,10 @@ def _status_update_ui(reg_s: pd.DataFrame, reg_d: pd.DataFrame) -> None:
                     st.session_state.pop("reg_cache", None)
                     st.success(f"{res['matched']} line(s) matched · Picking marked Completed "
                               f"on {res['invoices_completed']} whole invoice(s).")
+                    st.caption("Checked against OUTBOUND_MASTER / OUTBOUND_DETAIL."
+                              if res.get("used_wms") else
+                              "⚠️ No WMS output saved yet — checked against the invoice's "
+                              "own quantity instead. Run a pick first for the real check.")
                     with st.expander("Reconciliation, line by line"):
                         st.dataframe(res["report"], hide_index=True, width="stretch",
                                     height=340)

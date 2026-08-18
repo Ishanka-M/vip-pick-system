@@ -29,7 +29,7 @@ import pick_engine as E
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 6
+API = 7
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -797,11 +797,20 @@ def scan_packing(sa_info: dict, sheet_key: str, load_id: str,
 
 def apply_sales_report(sa_info: dict, sheet_key: str, sales_df,
                        owner: str = "") -> dict[str, Any]:
+    """
+    Checked against the real WMS output, not the invoice register — reads
+    OUTBOUND_MASTER (was this invoice actually picked and pushed to the WMS?)
+    and OUTBOUND_DETAIL (item + qty actually sent) alongside the register.
+    """
     with sheet_lock(sa_info, sheet_key, "REGISTER", owner=owner):
         book = open_book(sa_info, sheet_key)
-        cur_s = read_ws(sa_info, sheet_key, WS_INV_SUM, use_cache=False)
-        cur_d = read_ws(sa_info, sheet_key, WS_INV_DET, use_cache=False)
-        res = R.apply_sales_report(cur_s, cur_d, sales_df)
+        got = read_many(sa_info, sheet_key,
+                        [WS_INV_SUM, WS_INV_DET, WS_MASTER, WS_DETAIL], use_cache=False)
+        cur_s = got.get(WS_INV_SUM, pd.DataFrame())
+        cur_d = got.get(WS_INV_DET, pd.DataFrame())
+        wms_m = got.get(WS_MASTER, pd.DataFrame())
+        wms_d = got.get(WS_DETAIL, pd.DataFrame())
+        res = R.apply_sales_report(cur_s, cur_d, sales_df, wms_master=wms_m, wms_detail=wms_d)
         if not res.get("error"):
             write_table(book, WS_INV_SUM, R.SUMMARY_COLS, res["summary"],
                         prev_rows=len(cur_s))
