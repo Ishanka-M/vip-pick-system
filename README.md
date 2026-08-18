@@ -33,7 +33,7 @@ streamlit run app.py
 | File | API |
 |---|---|
 | `gsheet.py` | 7 |
-| `invoice_register.py` | 7 |
+| `invoice_register.py` | 8 |
 | `pick_engine.py` · `pick_pdf.py` | 4 |
 | `doc_parser.py` | 4 |
 | `ui.py` | 3 |
@@ -811,16 +811,21 @@ match වෙනවා):
 * **Invoice sales report** (ERP export) — `Tax Invoice No.`, `Item Code` /
   `Customer Item`, `QTY` columns ඕන. Check වෙන්නේ **ඇත්තටම WMS එකට ගිය data
   එකෙන්ම** — invoice PDF එකෙන් කියෙව්ව qty එකෙන් නෙවෙයි:
-  * **`OUTBOUND_MASTER`** → `DISPLAY_ORDER_NUMBER` == Tax Invoice No. —
-    මේ invoice එක ඇත්තටම pick වෙලා WMS එකට push වෙලාද කියලා. නැත්නම්
-    *"Not in OUTBOUND_MASTER — not picked yet"*
+  * **`OUTBOUND_MASTER`** → `LOAD_ID` == Tax Invoice No. — මේ invoice එක
+    ඇත්තටම pick වෙලා WMS එකට push වෙලාද කියලා. නැත්නම් *"Not in
+    OUTBOUND_MASTER — not picked yet"*
   * **`OUTBOUND_DETAIL`** → `DISPLAY_ITEM_NUMBER` (base-ID matched) + `QTY` —
-    ඇත්තටම යැව්ව qty එකට sales report qty එක **හරියටම** ගැලපුනොත් ඒ line එකට
-    Picking confirm, invoice එකේ line ඔක්කොම confirm වුණාම invoice එකටම
-    Picking = Completed
+    ඇත්තටම යැව්ව qty එකට upload කරන report එකේ Customer Item / Item Code +
+    QTY එක **හරියටම** ගැලපුනොත් ඒ line එකට Picking confirm, invoice එකේ line
+    ඔක්කොම confirm වුණාම invoice එකටම Picking = Completed
   * තාම pick එකක් save වෙලා නැත්නම් (`OUTBOUND_MASTER` හිස්) — invoice එකේම
     qty එකට check කරන පරණ විදිහට වැටෙනවා (degraded mode, screen එකේ
     warning එකක් එනවා)
+
+දෙකෙන්ම apply කළාට පස්සේ **row-by-row reconciliation report** එක screen එකේම
+(expander එකක) පේනවා, සහ **Excel download button** එකකින් ගන්නත් පුළුවන්
+(`Sales_Reconciliation_*.xlsx` · `Pick_Live_Status_Report_*.xlsx`) — apply
+කරන හැම එකකටම වෙනම.
 
 Admin සහ Dashboard role දෙකටම මේ upload දෙක Register tab එකේ තියෙනවා.
 

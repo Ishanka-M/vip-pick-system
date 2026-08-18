@@ -24,7 +24,7 @@ from doc_parser import ParsedDoc, base_item, clean_item
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 7
+API = 8
 
 # Warehouse execution status — independent of KORBER_PICK (this app's own pallet
 # allocation). These three track the physical pick / pack / dispatch, driven by
@@ -528,17 +528,17 @@ def apply_sales_report(summary: pd.DataFrame, details: pd.DataFrame,
     """
     Invoice sales report -> confirms Picking is really done.
 
-    Checked against the **actual WMS output** — `OUTBOUND_MASTER`
-    (`DISPLAY_ORDER_NUMBER`, was this invoice actually picked and pushed to
-    the WMS at all?) and `OUTBOUND_DETAIL` (`DISPLAY_ITEM_NUMBER` / `QTY`,
-    what was actually sent) — not against what the invoice PDF itself said.
-    `INVOICE_DETAIL` exists for every uploaded document whether or not it was
-    ever picked, so it is not proof of anything by itself.
+    Checked against the **actual WMS output** — `OUTBOUND_MASTER.LOAD_ID`
+    (was this invoice actually picked and pushed to the WMS at all?) and
+    `OUTBOUND_DETAIL.DISPLAY_ITEM_NUMBER` / `QTY` (what was actually sent) —
+    not against what the invoice PDF itself said. `INVOICE_DETAIL` exists for
+    every uploaded document whether or not it was ever picked, so it is not
+    proof of anything by itself.
 
-    Matched on Tax Invoice No. == `OUTBOUND_MASTER.DISPLAY_ORDER_NUMBER`, then
-    item (Item Code / Customer Item, base-ID matched like everywhere else in
-    this app) + Qty against `OUTBOUND_DETAIL` for that same order. A line
-    whose sales-report quantity exactly matches the WMS quantity is
+    Matched on Tax Invoice No. == `OUTBOUND_MASTER.LOAD_ID`, then item
+    (Item Code / Customer Item, base-ID matched like everywhere else in this
+    app) + Qty against `OUTBOUND_DETAIL` for that same order. A line whose
+    sales-report quantity exactly matches the WMS quantity is
     picking-confirmed; once every line of an invoice is confirmed, the
     invoice itself is marked Picking = Completed.
 
@@ -575,20 +575,25 @@ def apply_sales_report(summary: pd.DataFrame, details: pd.DataFrame,
         sales_qty[key] = sales_qty.get(key, 0.0) + qty
 
     # ---- what the WMS actually received, if it has been saved ----
-    use_wms = (wms_master is not None and len(wms_master)
-               and wms_detail is not None and len(wms_detail)
-               and "DISPLAY_ORDER_NUMBER" in wms_master.columns
-               and "DISPLAY_ORDER_NUMBER" in wms_detail.columns
-               and "DISPLAY_ITEM_NUMBER" in wms_detail.columns)
-    out["used_wms"] = bool(use_wms)
+    # OUTBOUND_MASTER carries both LOAD_ID and DISPLAY_ORDER_NUMBER — they are
+    # the same Invoice / DC No, but LOAD_ID is the one asked for here.
+    c_master_inv = _find_col(wms_master, "LOAD_ID", "DISPLAY_ORDER_NUMBER")
+    c_wd_inv = _find_col(wms_detail, "DISPLAY_ORDER_NUMBER", "LOAD_ID")
+    c_wd_item = _find_col(wms_detail, "DISPLAY_ITEM_NUMBER")
+    c_wd_qty = _find_col(wms_detail, "QTY")
+    use_wms = bool(wms_master is not None and len(wms_master) and c_master_inv
+                   and wms_detail is not None and len(wms_detail)
+                   and c_wd_inv and c_wd_item)
+    out["used_wms"] = use_wms
     sent_invoices: set[str] = set()
     wms_qty: dict[tuple[str, str], float] = {}
     if use_wms:
-        sent_invoices = {str(x).strip() for x in wms_master["DISPLAY_ORDER_NUMBER"]}
+        sent_invoices = {_id_str(x).strip() for x in wms_master[c_master_inv]}
         wd = wms_detail.copy()
-        wd["_INV"] = wd["DISPLAY_ORDER_NUMBER"].astype(str).str.strip()
-        wd["_BASE"] = wd["DISPLAY_ITEM_NUMBER"].map(base_item)
-        wd["_QTY"] = pd.to_numeric(wd.get("QTY"), errors="coerce").fillna(0.0)
+        wd["_INV"] = wd[c_wd_inv].map(_id_str).str.strip()
+        wd["_BASE"] = wd[c_wd_item].map(base_item)
+        wd["_QTY"] = pd.to_numeric(wd[c_wd_qty], errors="coerce").fillna(0.0) if c_wd_qty \
+            else 0.0
         for (inv, base), grp in wd.groupby(["_INV", "_BASE"]):
             wms_qty[(inv, base)] = wms_qty.get((inv, base), 0.0) + float(grp["_QTY"].sum())
 
@@ -825,6 +830,14 @@ def summary_excel(df: pd.DataFrame) -> bytes:
 
 def details_excel(df: pd.DataFrame) -> bytes:
     return to_excel(df, "Invoice Details", DETAIL_COLS)
+
+
+def sales_reconciliation_excel(df: pd.DataFrame) -> bytes:
+    return to_excel(df, "Reconciliation", SALES_REPORT_COLS)
+
+
+def live_status_excel(df: pd.DataFrame) -> bytes:
+    return to_excel(df, "Pick Live Status", LIVE_STATUS_REPORT_COLS)
 
 
 def search(df: pd.DataFrame, query: str) -> pd.DataFrame:

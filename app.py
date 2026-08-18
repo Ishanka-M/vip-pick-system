@@ -37,7 +37,7 @@ st.set_page_config(
 # run against a stale one and say exactly which file to replace.
 _NEEDS = {"pick_engine.py": (E, 4), "doc_parser.py": (P, 4), "pick_pdf.py": (PP, 4),
           "sku_master.py": (SKU, 2), "ui.py": (ui, 3),
-          "invoice_register.py": (R, 7)}
+          "invoice_register.py": (R, 8)}
 _STALE = [(f, getattr(m, "API", 0), n) for f, (m, n) in _NEEDS.items()
           if getattr(m, "API", 0) < n]
 if _STALE:
@@ -327,6 +327,9 @@ def _status_update_ui(reg_s: pd.DataFrame, reg_d: pd.DataFrame) -> None:
         st.warning("No database connected — status updates cannot be saved.")
         return
 
+    XL = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    stamp3 = datetime.now().strftime("%Y%m%d_%H%M")
+
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("##### Pick_Live_status")
@@ -344,22 +347,31 @@ def _status_update_ui(reg_s: pd.DataFrame, reg_d: pd.DataFrame) -> None:
                     st.error(res["error"])
                 else:
                     st.session_state.pop("reg_cache", None)
-                    st.success(f"Picking marked Completed on {res['picking_done']} row(s) · "
-                              f"Dispatch on {res['dispatch_done']} row(s).")
-                    if res["unmatched"]:
-                        shown = ", ".join(res["unmatched"][:15])
-                        st.caption(f"{len(res['unmatched'])} Load Id(s) in the file were not "
-                                  f"found in the register: {shown}"
-                                  + (" …" if len(res["unmatched"]) > 15 else ""))
-                    with st.expander("What the file said, row by row"):
-                        st.dataframe(res["report"], hide_index=True, width="stretch")
+                    st.session_state["live_status_result"] = res
                     st.rerun()
             except Exception as ex:
                 st.error(f"Could not read/apply that file: {ex}")
 
+        lres = st.session_state.get("live_status_result")
+        if lres is not None:
+            st.success(f"Picking marked Completed on {lres['picking_done']} row(s) · "
+                      f"Dispatch on {lres['dispatch_done']} row(s).")
+            if lres["unmatched"]:
+                shown = ", ".join(lres["unmatched"][:15])
+                st.caption(f"{len(lres['unmatched'])} Load Id(s) in the file were not "
+                          f"found in the register: {shown}"
+                          + (" …" if len(lres["unmatched"]) > 15 else ""))
+            with st.expander("What the file said, row by row"):
+                st.dataframe(lres["report"], hide_index=True, width="stretch")
+            st.download_button("Live status report (Excel)",
+                               data=_bytes(f"lst{_fkey(lres['report'])}",
+                                           R.live_status_excel, lres["report"]),
+                               file_name=f"Pick_Live_Status_Report_{stamp3}.xlsx",
+                               mime=XL, width="stretch", key="live_status_dl")
+
     with c2:
         st.markdown("##### Invoice sales report")
-        st.caption("Checked against the actual WMS output — **OUTBOUND_MASTER** "
+        st.caption("Checked against the actual WMS output — **OUTBOUND_MASTER.LOAD_ID** "
                    "(was this invoice really picked and pushed to the WMS?) + "
                    "**OUTBOUND_DETAIL** (item + qty actually sent), matched on "
                    "Tax Invoice No. + Item Code / Customer Item + Qty. Falls back "
@@ -376,18 +388,27 @@ def _status_update_ui(reg_s: pd.DataFrame, reg_d: pd.DataFrame) -> None:
                     st.error(res["error"])
                 else:
                     st.session_state.pop("reg_cache", None)
-                    st.success(f"{res['matched']} line(s) matched · Picking marked Completed "
-                              f"on {res['invoices_completed']} whole invoice(s).")
-                    st.caption("Checked against OUTBOUND_MASTER / OUTBOUND_DETAIL."
-                              if res.get("used_wms") else
-                              "⚠️ No WMS output saved yet — checked against the invoice's "
-                              "own quantity instead. Run a pick first for the real check.")
-                    with st.expander("Reconciliation, line by line"):
-                        st.dataframe(res["report"], hide_index=True, width="stretch",
-                                    height=340)
+                    st.session_state["sales_report_result"] = res
                     st.rerun()
             except Exception as ex:
                 st.error(f"Could not read/apply that file: {ex}")
+
+        sres = st.session_state.get("sales_report_result")
+        if sres is not None:
+            st.success(f"{sres['matched']} line(s) matched · Picking marked Completed "
+                      f"on {sres['invoices_completed']} whole invoice(s).")
+            st.caption("Checked against OUTBOUND_MASTER / OUTBOUND_DETAIL."
+                      if sres.get("used_wms") else
+                      "⚠️ No WMS output saved yet — checked against the invoice's "
+                      "own quantity instead. Run a pick first for the real check.")
+            with st.expander("Reconciliation, line by line"):
+                st.dataframe(sres["report"], hide_index=True, width="stretch",
+                            height=340)
+            st.download_button("Reconciliation report (Excel)",
+                               data=_bytes(f"src{_fkey(sres['report'])}",
+                                           R.sales_reconciliation_excel, sres["report"]),
+                               file_name=f"Sales_Reconciliation_{stamp3}.xlsx",
+                               mime=XL, width="stretch", key="sales_recon_dl")
 
 
 def _register_tab_body() -> None:
