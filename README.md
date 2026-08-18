@@ -33,7 +33,7 @@ streamlit run app.py
 | File | API |
 |---|---|
 | `gsheet.py` | 7 |
-| `invoice_register.py` | 8 |
+| `invoice_register.py` | 9 |
 | `pick_engine.py` · `pick_pdf.py` | 4 |
 | `doc_parser.py` | 4 |
 | `ui.py` | 3 |

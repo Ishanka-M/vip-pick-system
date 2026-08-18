@@ -24,7 +24,7 @@ from doc_parser import ParsedDoc, base_item, clean_item
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 8
+API = 9
 
 # Warehouse execution status — independent of KORBER_PICK (this app's own pallet
 # allocation). These three track the physical pick / pack / dispatch, driven by
@@ -560,19 +560,25 @@ def apply_sales_report(summary: pd.DataFrame, details: pd.DataFrame,
         out["error"] = "Could not find Tax Invoice No. / Item Code / QTY columns."
         return out
 
+    # Register under *every* candidate base, not just one preferred column —
+    # this ERP export sometimes puts "P601560 710" (a space, not a hyphen) in
+    # Item Code, which base_item() can't split, while Customer Item ("P601560")
+    # is already clean. Whichever one actually matches the WMS side wins; the
+    # other key is simply never looked up, so this never double-counts.
     sales_qty: dict[tuple[str, str], float] = {}
     for _, r in sales_df.iterrows():
         inv = _id_str(r.get(c_inv, "")).strip()
         if not inv:
             continue
-        base = base_item(r.get(c_item)) if c_item else ""
-        if not base and c_citem:
-            base = base_item(r.get(c_citem))
-        if not base:
+        b1 = base_item(r.get(c_item)) if c_item else ""
+        b2 = base_item(r.get(c_citem)) if c_citem else ""
+        bases = {b for b in (b1, b2) if b}
+        if not bases:
             continue
         qty = _to_num(r.get(c_qty)) or 0.0
-        key = (inv, base)
-        sales_qty[key] = sales_qty.get(key, 0.0) + qty
+        for base in bases:
+            key = (inv, base)
+            sales_qty[key] = sales_qty.get(key, 0.0) + qty
 
     # ---- what the WMS actually received, if it has been saved ----
     # OUTBOUND_MASTER carries both LOAD_ID and DISPLAY_ORDER_NUMBER — they are

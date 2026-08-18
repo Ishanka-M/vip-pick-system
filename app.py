@@ -37,7 +37,7 @@ st.set_page_config(
 # run against a stale one and say exactly which file to replace.
 _NEEDS = {"pick_engine.py": (E, 4), "doc_parser.py": (P, 4), "pick_pdf.py": (PP, 4),
           "sku_master.py": (SKU, 2), "ui.py": (ui, 3),
-          "invoice_register.py": (R, 8)}
+          "invoice_register.py": (R, 9)}
 _STALE = [(f, getattr(m, "API", 0), n) for f, (m, n) in _NEEDS.items()
           if getattr(m, "API", 0) < n]
 if _STALE:
