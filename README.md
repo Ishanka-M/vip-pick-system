@@ -11,6 +11,7 @@ doc_parser.py   Donaldson Invoice + Delivery Challan PDF parser
 pick_engine.py  matching · allocation · qty verify · WMS output · Excel · search
 pick_pdf.py     Pick sheet + Shortage PDF (QR) · charts · email (.eml / mailto)
 sku_master.py   SKU master — dedupe upsert · base-ID search
+invoice_register.py  every uploaded invoice — summary + details reports
 gsheet.py       Google Sheet DB + API manager (retry · cache · lock · load delete)
 ```
 
@@ -31,10 +32,9 @@ streamlit run app.py
 
 | File | API |
 |---|---|
-| `pick_engine.py` | 4 |
-| `pick_pdf.py` | 4 |
-| `gsheet.py` | 3 |
-| `doc_parser.py` · `sku_master.py` · `ui.py` | 2 |
+| `pick_engine.py` · `pick_pdf.py` · `gsheet.py` | 4 |
+| `doc_parser.py` · `sku_master.py` · `ui.py` | 3 / 2 / 2 |
+| `invoice_register.py` | 1 |
 
 **`.streamlit/config.toml` එක repo එකට push කරන්න අමතක කරන්න එපා.** Dropdown ·
 date picker · `st.dataframe` (canvas එකක් — CSS එකට ළඟා වෙන්න බෑ) වගේ widget වල
@@ -588,3 +588,61 @@ REQUIRED` හැම line එකකටම හරි ගියොත් විත�
 
 Result එකේ **Undo the release** button එකෙන් ආපහු ගන්නත් පුළුවන් — release එක
 අයින් වෙලා pick එක ආපහු run වෙනවා.
+
+---
+
+## 22. Invoice register
+
+Upload කරන **හැම document එකක්ම** register වෙනවා — pick වුණත් නැතත්,
+invoice එකකට **row එකයි**, ස්ථිරවම. Tab: **Register**.
+
+### Summary
+
+| Column | කොහෙන්ද |
+|---|---|
+| Tax Invoice Date | `Invoice Date` / `Delivery Challan Date` |
+| Tax Invoice No. | `Invoice No.` / `Delivery Challan no.` |
+| AR Invoice No. | `AR Invoice No.` (invoice වලට විතරයි) |
+| Name of Customer | `Ship To / Consignee` · challan එකේ `Name of Consignee(Shipped To)` |
+| Qty | මුළු document qty |
+| Körber Pick | pick වුණා නම් **Yes** · නැත්නම් **No** + හේතුව remark එකට |
+| MRP | Contact Person / Email එක MRP contact එකක් නම් **Yes** |
+
+> Invoice එකේ header එක **column 5ක්** පැත්තට පැත්ත තියෙනවා, ඒ නිසා flat text
+> එකේ ඒවා මිශ්‍ර වෙනවා (`438567 438549 Email: …`). Consignee එක Bill To එකෙන්
+> වෙන් කරගන්න **x-coordinate band** එකෙන් කියවනවා. Email එකත් line 2කට කැඩිලා
+> තියෙනවා (`rahul.sharma1@donaldso` + `n.com`) — ඒක join කරනවා.
+
+### Details
+
+Document line එකකට row එකයි — item · qty · picked qty · **pallet · location ·
+lot** ඔක්කොම.
+
+### Körber Pick වෙනස් වෙන විදිහ
+
+```
+මුල් upload එක, stock මදි   →  No   + "STOCK SHORT — L2 X006252 (need 999, have 6)"
+පස්සේ pick වුණා            →  Yes  + remark එක automatic අයින් වෙනවා (එකම row එක)
+Loads tab එකෙන් delete කළා  →  No   + "Load deleted · <time>"
+```
+
+**Yes** එකක් duplicate skip එකකින් හොරෙන් **No** වෙන්නේ නෑ — load එක delete
+කරොත් විතරයි.
+
+### MRP rule එක වෙනස් කරන්නේ කොහෙන්ද
+
+Register tab → **MRP contacts — the rule behind the Yes / No**.
+Default එක `Sharma, Rahul` / `rahul.sharma1@donaldson.com`. Row එකතු කරන්න /
+වෙනස් කරන්න පුළුවන් — `APP_SETTINGS` එකේ save වෙනවා, ඊළඟ run එකේ ඉඳන් apply වෙනවා.
+Name එක `Sharma, Rahul` හෝ `rahul sharma` — order එකයි punctuation එකයි ගණන් නෑ.
+Document එකේ email එකක් තිබ්බොත් email එකට මුල් තැන.
+
+### Download
+
+**Summary** සහ **Details** — **වෙන වෙනම Excel file 2ක්**
+(`Invoice_Summary_*.xlsx` · `Invoice_Details_*.xlsx`).
+Screen එකේ දාන filter ටික download වෙන file වලටත් apply වෙනවා.
+Freeze pane + auto-filter දාලා තියෙනවා.
+
+Worksheets: `INVOICE_SUMMARY` · `INVOICE_DETAIL`. **FULL DB RESET එකෙන් register
+එක clear වෙන්නේ නෑ** — scope එකෙන් `register` තෝරොත් විතරයි.

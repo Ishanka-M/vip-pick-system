@@ -22,11 +22,12 @@ from typing import Any, Callable
 
 import pandas as pd
 
+import invoice_register as R
 import pick_engine as E
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 3
+API = 4
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -41,6 +42,8 @@ WS_REJECT = "REJECTED_LOG"
 WS_RUNLOG = "RUN_LOG"
 WS_SETTINGS = "APP_SETTINGS"
 WS_SKU = "SKU_MASTER"
+WS_INV_SUM = "INVOICE_SUMMARY"
+WS_INV_DET = "INVOICE_DETAIL"
 WS_LOCK = "_LOCKS"
 
 LEDGER_COLS = E.ALLOC_COLS
@@ -63,6 +66,8 @@ _SHEETS = {
     WS_REJECT: REJECT_COLS,
     WS_RUNLOG: RUNLOG_COLS,
     WS_SKU: SKU_COLS,
+    WS_INV_SUM: R.SUMMARY_COLS,
+    WS_INV_DET: R.DETAIL_COLS,
     WS_SETTINGS: ["KEY", "VALUE", "UPDATED_AT"],
     WS_LOCK: LOCK_COLS,
 }
@@ -498,6 +503,11 @@ def delete_load(sa_info: dict, sheet_key: str, load_id: str,
                 api(ws.clear)
                 api(ws.update, values=[head] + keep, range_name="A1",
                     value_input_option="RAW")
+        # the register must stop claiming this invoice was picked
+        cur = read_ws(sa_info, sheet_key, WS_INV_SUM, use_cache=False)
+        if cur is not None and len(cur):
+            _replace_ws(book, WS_INV_SUM, R.SUMMARY_COLS,
+                        R.mark_unpicked(cur, lid, "Load deleted"))
     cache_clear(sheet_key)
     return removed
 
@@ -554,6 +564,62 @@ def save_sku(sa_info: dict, sheet_key: str, master: pd.DataFrame,
 
 
 # --------------------------------------------------------------------------- #
+# Invoice register
+# --------------------------------------------------------------------------- #
+def read_register(sa_info: dict, sheet_key: str,
+                  fresh: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
+    return (read_ws(sa_info, sheet_key, WS_INV_SUM, use_cache=not fresh),
+            read_ws(sa_info, sheet_key, WS_INV_DET, use_cache=not fresh))
+
+
+def _replace_ws(book, title: str, header: list[str], df: pd.DataFrame) -> int:
+    ws = _ensure(book, title, header)
+    values = [header]
+    if df is not None and len(df):
+        values += [["" if pd.isna(v) else str(v) for v in row]
+                   for row in df.reindex(columns=header).values.tolist()]
+    api(ws.clear)
+    for i in range(0, len(values), 2000):
+        api(ws.update, values=values[i:i + 2000], range_name=f"A{i + 1}",
+            value_input_option="RAW")
+    return len(values) - 1
+
+
+def save_register(sa_info: dict, sheet_key: str, summary: pd.DataFrame,
+                  details: pd.DataFrame, owner: str = "") -> dict[str, Any]:
+    """
+    Merge happens inside the lock against a fresh read — two people picking
+    different invoices at the same time both end up in the register.
+    """
+    with sheet_lock(sa_info, sheet_key, "REGISTER", owner=owner):
+        book = open_book(sa_info, sheet_key)
+        old_s = read_ws(sa_info, sheet_key, WS_INV_SUM, use_cache=False)
+        old_d = read_ws(sa_info, sheet_key, WS_INV_DET, use_cache=False)
+        merged = R.merge_summary(old_s if len(old_s) else None, summary)
+        det = R.merge_details(old_d if len(old_d) else None, details)
+        n_s = _replace_ws(book, WS_INV_SUM, R.SUMMARY_COLS, merged["data"])
+        n_d = _replace_ws(book, WS_INV_DET, R.DETAIL_COLS, det)
+    cache_clear(sheet_key)
+    return {"summary_rows": n_s, "detail_rows": n_d, "new": merged["new"],
+            "updated": merged["updated"], "picked_now": merged["picked_now"],
+            "summary": merged["data"], "details": det}
+
+
+def register_unpick(sa_info: dict, sheet_key: str, invoice_no: str,
+                    remark: str = "Load deleted", owner: str = "") -> int:
+    """A deleted load has to show as not picked again."""
+    with sheet_lock(sa_info, sheet_key, "REGISTER", owner=owner):
+        book = open_book(sa_info, sheet_key)
+        cur = read_ws(sa_info, sheet_key, WS_INV_SUM, use_cache=False)
+        if cur is None or not len(cur):
+            return 0
+        upd = R.mark_unpicked(cur, invoice_no, remark)
+        n = _replace_ws(book, WS_INV_SUM, R.SUMMARY_COLS, upd)
+    cache_clear(sheet_key)
+    return n
+
+
+# --------------------------------------------------------------------------- #
 # reset
 # --------------------------------------------------------------------------- #
 RESET_SCOPES = {
@@ -563,6 +629,7 @@ RESET_SCOPES = {
     "rejected": [WS_REJECT],
     "runlog": [WS_RUNLOG],
     "sku": [WS_SKU],
+    "register": [WS_INV_SUM, WS_INV_DET],
     "settings": [WS_SETTINGS],
 }
 
@@ -585,13 +652,15 @@ def reset_data(sa_info: dict, sheet_key: str, scope: list[str]) -> list[str]:
 
 
 def reset_all(sa_info: dict, sheet_key: str, keep_settings: bool = True,
-              keep_sku: bool = True) -> dict[str, Any]:
+              keep_sku: bool = True, keep_register: bool = True) -> dict[str, Any]:
     """⚠️ FULL DB RESET — header row එක විතරක් ඉතුරු වෙනවා."""
     skip = set()
     if keep_settings:
         skip.add("settings")
     if keep_sku:
         skip.add("sku")
+    if keep_register:
+        skip.add("register")
     done = reset_data(sa_info, sheet_key, [k for k in RESET_SCOPES if k not in skip])
     return {"cleared": done, "count": len(done),
             "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}

@@ -20,7 +20,7 @@ import pdfplumber
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 2
+API = 3
 
 # --------------------------------------------------------------------------- #
 # Item-code helpers
@@ -93,6 +93,10 @@ class ParsedDoc:
     ref_number: str = ""               # AR Invoice No / Order No
     delivery_number: str = ""
     customer_po: str = ""
+    customer: str = ""            # Ship To / Consignee  ·  Name of Consignee(Shipped To)
+    customer_code: str = ""
+    contact_person: str = ""
+    contact_email: str = ""
     source_file: str = ""
     lines: list[DocLine] = field(default_factory=list)
     declared_qty: float | None = None      # "Total Quantity"
@@ -180,6 +184,70 @@ def _bucket(row: list[dict], bounds: list[float]) -> list[str]:
     return cells
 
 
+def _band_lines(rows: list[list[dict]], x0: float, x1: float, top_after: float,
+                limit: int = 14) -> list[str]:
+    """
+    Text of one header column, read straight down.
+
+    The header of a Donaldson invoice is five columns side by side, so the flat
+    text mixes them ("438567 438549 Email: ..."). Reading by x band keeps
+    Ship To / Consignee separate from Bill To and from Contact Person.
+    """
+    out: list[str] = []
+    for row in rows:
+        top = min(w["top"] for w in row)
+        if top <= top_after + 0.5:
+            continue
+        words = [w for w in row if x0 - 0.5 <= (w["x0"] + w["x1"]) / 2 < x1]
+        if words:
+            out.append(" ".join(w["text"] for w in sorted(words, key=lambda w: w["x0"])))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _band_of(row: list[dict], label_words: tuple[str, ...], page_width: float,
+             gap: float = 18.0) -> tuple[float, float] | None:
+    """
+    x range of the column a label sits in.
+
+    The edge is the first *wide* gap on the row, not simply the next word —
+    "Contact Person: Sharma, Rahul" is all one column, and cutting at the next
+    word would have returned "Sharma," on its own.
+    """
+    for i, w in enumerate(row):
+        if w["text"] in label_words:
+            j, start = i, w["x0"]
+            while j > 0 and row[j]["x0"] - row[j - 1]["x1"] < 12:   # rest of the label
+                j -= 1
+                start = row[j]["x0"]
+            k = i
+            while k + 1 < len(row) and row[k + 1]["x0"] - row[k]["x1"] < gap:
+                k += 1
+            return start, (row[k + 1]["x0"] if k + 1 < len(row) else page_width)
+    return None
+
+
+_LABELS = re.compile(r"^(Phone|Email|Sales Contact|Cnee Contact|Contact Person|Fax)\b",
+                     re.I)
+
+
+def _clean_name(lines: list[str]) -> tuple[str, str]:
+    """(code, name) — the consignee block starts with an account code."""
+    code = ""
+    for ln in lines:
+        t = ln.strip()
+        if not t:
+            continue
+        if not code and re.fullmatch(r"\d{3,10}", t):
+            code = t
+            continue
+        if _LABELS.match(t) or re.fullmatch(r"[\d,\s.:/-]+", t):
+            continue
+        return code, t
+    return code, ""
+
+
 def _col(labels: list[str], *keys: str) -> int | None:
     """label list එකෙන් keyword ගැලපෙන column index එක."""
     norm = [re.sub(r"[^a-z]", "", l.lower()) for l in labels]
@@ -238,6 +306,9 @@ def _parse_invoice(pdf: pdfplumber.PDF, filename: str) -> ParsedDoc:
     for page in pdf.pages:
         words = page.extract_words(keep_blank_chars=False, use_text_flow=False)
         rows = _cluster_rows(words)
+
+        if not doc.customer:
+            _read_invoice_header(doc, rows, float(page.width))
 
         started = False
         for row in rows:
@@ -312,6 +383,58 @@ def _parse_invoice(pdf: pdfplumber.PDF, filename: str) -> ParsedDoc:
     return doc
 
 
+def _read_invoice_header(doc: ParsedDoc, rows: list[list[dict]], width: float) -> None:
+    """Ship To / Consignee  +  Contact Person / Email, by column band."""
+    anchor = None
+    for row in rows:
+        texts = [w["text"] for w in row]
+        if "Consignee:" in texts and ("Contact" in texts or "Person:" in texts):
+            anchor = row
+            break
+    if anchor is None:
+        return
+    top = min(w["top"] for w in anchor)
+
+    band = _band_of(anchor, ("Consignee:",), width)
+    if band:
+        doc.customer_code, doc.customer = _clean_name(
+            _band_lines(rows, band[0], band[1], top))
+
+    cband = _band_of(anchor, ("Person:",), width)
+    if not cband:
+        return
+    x0, x1 = cband
+    same = [w for w in anchor if x0 - 0.5 <= (w["x0"] + w["x1"]) / 2 < x1]
+    txt = " ".join(w["text"] for w in sorted(same, key=lambda w: w["x0"]))
+    m = re.search(r"Person:\s*(.+)$", txt)
+    if m:
+        doc.contact_person = m.group(1).strip()
+
+    # The email wraps mid-address ("rahul.sharma1@donaldso" / "n.com"), and the
+    # second Email: in this column belongs to Sales Contact — stop before it.
+    buf: list[str] = []
+    started = False
+    for ln in _band_lines(rows, x0, x1, top):
+        t = ln.strip()
+        if re.match(r"^Sales Contact\b|^Cnee\b", t, re.I):
+            break
+        if not started:
+            m = re.match(r"^Email:\s*(.*)$", t, re.I)
+            if m:
+                started = True
+                buf.append(m.group(1))
+            continue
+        if re.match(r"^(Phone|Email|Fax)\b", t, re.I):
+            break
+        buf.append(t)
+        if re.search(r"@[\w.-]+\.\w{2,}", "".join(buf)):
+            break
+    joined = "".join(x.replace(" ", "") for x in buf)
+    m = re.search(r"[\w.+-]+@[\w.-]+\.\w{2,}", joined)
+    if m:
+        doc.contact_email = m.group(0)
+
+
 # --------------------------------------------------------------------------- #
 # DELIVERY CHALLAN parser (ruled table)
 # --------------------------------------------------------------------------- #
@@ -342,6 +465,18 @@ def _parse_challan(pdf: pdfplumber.PDF, filename: str) -> ParsedDoc:
 
     seen: set[tuple] = set()
     for page in pdf.pages:
+        if not doc.customer:
+            rows = _cluster_rows(page.extract_words(keep_blank_chars=False))
+            for row in rows:
+                joined = " ".join(w["text"] for w in row)
+                if "Consignee(Shipped" in joined:
+                    band = _band_of(row, ("Consignee(Shipped", "To)"), float(page.width))
+                    if band:
+                        top = min(w["top"] for w in row)
+                        doc.customer_code, doc.customer = _clean_name(
+                            _band_lines(rows, band[0], band[1], top))
+                    break
+
         tables = page.extract_tables(_TS_LINES) or page.extract_tables(_TS_TEXT) or []
         for tbl in tables:
             if not tbl or len(tbl) < 2:

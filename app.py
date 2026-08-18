@@ -17,6 +17,7 @@ import streamlit as st
 import doc_parser as P
 import pick_engine as E
 import pick_pdf as PP
+import invoice_register as R
 import sku_master as SKU
 import ui
 
@@ -34,8 +35,9 @@ st.set_page_config(
 # Streamlit Cloud redacts exception text, so a half-updated deploy used to die
 # with an unreadable TypeError. Every module carries an API number; refuse to
 # run against a stale one and say exactly which file to replace.
-_NEEDS = {"pick_engine.py": (E, 4), "doc_parser.py": (P, 2), "pick_pdf.py": (PP, 4),
-          "sku_master.py": (SKU, 2), "ui.py": (ui, 2)}
+_NEEDS = {"pick_engine.py": (E, 4), "doc_parser.py": (P, 3), "pick_pdf.py": (PP, 4),
+          "sku_master.py": (SKU, 2), "ui.py": (ui, 2),
+          "invoice_register.py": (R, 1)}
 _STALE = [(f, getattr(m, "API", 0), n) for f, (m, n) in _NEEDS.items()
           if getattr(m, "API", 0) < n]
 if _STALE:
@@ -76,10 +78,30 @@ def _reset_pw() -> str:
 
 RESET_PASSWORD = _reset_pw()
 
+
+def _mrp_contacts():
+    """Who counts as MRP — stored in APP_SETTINGS, editable on the Register tab."""
+    if "mrp_contacts" not in st.session_state:
+        raw = ""
+        if _gs_ready():
+            try:
+                import gsheet
+                raw = gsheet.read_setting(get_sa(), str(gs_conf().get("data_sheet", "")),
+                                          "MRP_CONTACTS", "")
+            except Exception:
+                raw = ""
+        st.session_state["mrp_contacts"] = R.load_contacts(raw)
+    return st.session_state["mrp_contacts"]
+
+
+def _gs_ready() -> bool:
+    return bool(get_sa() and str(gs_conf().get("data_sheet", "")).strip())
+
 if "user_id" not in st.session_state:
     import uuid as _uuid
     st.session_state["user_id"] = f"user-{_uuid.uuid4().hex[:6]}"
 USER = st.session_state["user_id"]
+MRP_CONTACTS = _mrp_contacts()
 
 
 # --------------------------------------------------------------------------- #
@@ -275,7 +297,8 @@ with st.sidebar:
             st.caption("Unlocked")
             scope = st.multiselect(
                 "What to clear",
-                ["outputs", "ledger", "registry", "rejected", "runlog", "sku", "settings"],
+                ["outputs", "ledger", "registry", "rejected", "runlog", "sku",
+                 "register", "settings"],
                 default=["outputs", "ledger", "registry", "rejected", "runlog"],
                 format_func=lambda s: {
                     "outputs": "OUTBOUND_MASTER + DETAIL",
@@ -284,6 +307,7 @@ with st.sidebar:
                     "rejected": "REJECTED_LOG",
                     "runlog": "RUN_LOG",
                     "sku": "SKU_MASTER",
+                    "register": "INVOICE_SUMMARY + INVOICE_DETAIL",
                     "settings": "APP_SETTINGS (email book)",
                 }[s],
             )
@@ -313,12 +337,13 @@ with st.sidebar:
                     try:
                         import gsheet
                         r = gsheet.reset_all(sa_info, sheet_key, keep_settings=True,
-                                             keep_sku=True)
+                                             keep_sku=True, keep_register=True)
                         for k in ("result", "bundles", "bundle_key", "zipfile", "hist"):
                             st.session_state.pop(k, None)
                         st.success(f"FULL RESET ✅ {r['count']} worksheets — "
                                    f"{', '.join(r['cleared'])}")
-                        st.caption("SKU master and the email book were kept.")
+                        st.caption("SKU master, invoice register and the email "
+                                   "book were kept.")
                     except Exception as ex:
                         st.error(f"Reset error: {ex}")
             if st.button("Lock again"):
@@ -374,9 +399,9 @@ def _draw_rail():
          "value": (f"{len(res_now['accepted'])} picked" if res_now else "not run")},
     ])
 
-(tab_gen, tab_loads, tab_sku, tab_search, tab_bal, tab_hist, tab_help) = st.tabs(
-    ["Pick", "Loads", "SKU master", "Search", "Stock", "History", "Guide"]
-)
+(tab_gen, tab_reg, tab_loads, tab_sku, tab_search, tab_bal, tab_hist,
+ tab_help) = st.tabs(["Pick", "Register", "Loads", "SKU master", "Search", "Stock",
+                      "History", "Guide"])
 
 # =========================================================================== #
 # TAB 1 — Generate
@@ -569,6 +594,24 @@ with tab_gen:
                 st.session_state.pop("result", None)
 
             res = st.session_state.get("result")
+
+            # every uploaded document is registered, picked or not
+            if res is not None:
+                _sum, _det = R.build(st.session_state["docs"], res, MRP_CONTACTS,
+                                     user=USER,
+                                     plant=", ".join(st.session_state["plants_ok"]))
+                st.session_state["reg_run"] = (_sum, _det)
+                if gs_ready:
+                    try:
+                        import gsheet
+                        rr = gsheet.save_register(sa_info, sheet_key, _sum, _det,
+                                                  owner=USER)
+                        st.session_state.pop("reg_cache", None)
+                        st.caption(f"Register · {rr['new']} new, {rr['updated']} updated "
+                                   f"— {rr['summary_rows']} invoices on file")
+                    except Exception as ex:
+                        st.warning(f"Register not saved: {ex}")
+
             if res is not None and gs_ready and autosave and len(res["master"]):
                 try:
                     import gsheet
@@ -965,6 +1008,145 @@ with tab_gen:
 
 
 
+
+# =========================================================================== #
+# TAB — Invoice register
+# =========================================================================== #
+with tab_reg:
+    ui.section("Invoice register",
+               hint="every document that has been uploaded, picked or not")
+
+    reg_s = pd.DataFrame(columns=R.SUMMARY_COLS)
+    reg_d = pd.DataFrame(columns=R.DETAIL_COLS)
+    if gs_ready:
+        if "reg_cache" not in st.session_state:
+            try:
+                import gsheet
+                st.session_state["reg_cache"] = gsheet.read_register(sa_info, sheet_key)
+            except Exception as ex:
+                st.warning(f"Register read error: {ex}")
+                st.session_state["reg_cache"] = (reg_s, reg_d)
+        reg_s, reg_d = st.session_state["reg_cache"]
+    elif st.session_state.get("reg_run"):
+        reg_s, reg_d = st.session_state["reg_run"]
+        st.info("No database connected — showing this session's run only.")
+
+    reg_s = reg_s if reg_s is not None and len(reg_s) else pd.DataFrame(columns=R.SUMMARY_COLS)
+    reg_d = reg_d if reg_d is not None and len(reg_d) else pd.DataFrame(columns=R.DETAIL_COLS)
+
+    if not len(reg_s):
+        ui.empty("Nothing registered yet",
+                 "Generate a pick and every uploaded document lands here.", "🗒️")
+    else:
+        k1, k2, k3, k4 = st.columns(4)
+        yes = (reg_s["KORBER_PICK"].astype(str) == "Yes").sum()
+        k1.metric("Invoices", len(reg_s))
+        k2.metric("Körber picked", int(yes))
+        k3.metric("Not picked", int(len(reg_s) - yes), delta_color="inverse")
+        k4.metric("MRP", int((reg_s["MRP"].astype(str) == "Yes").sum()))
+
+        f1, f2, f3 = st.columns([2, 1, 1])
+        rq = f1.text_input("Search", placeholder="invoice no · customer · item · remark",
+                           key="reg_q")
+        fk = f2.multiselect("Körber Pick", ["Yes", "No"], key="reg_k")
+        fm = f3.multiselect("MRP", ["Yes", "No"], key="reg_m")
+
+        vs, vd = reg_s.copy(), reg_d.copy()
+        if fk:
+            vs = vs[vs["KORBER_PICK"].astype(str).isin(fk)]
+        if fm:
+            vs = vs[vs["MRP"].astype(str).isin(fm)]
+        if rq.strip():
+            vs = R.search(vs, rq)
+        vd = vd[vd["TAX_INVOICE_NO"].astype(str).isin(set(vs["TAX_INVOICE_NO"].astype(str)))]
+
+        t_sum, t_det = st.tabs(["Summary", "Details"])
+        with t_sum:
+            st.dataframe(vs[R.SUMMARY_COLS[:8]], hide_index=True, width="stretch",
+                         height=430)
+            with st.expander("All columns"):
+                st.dataframe(vs, hide_index=True, width="stretch", height=380)
+        with t_det:
+            st.caption("One row per document line, with the pallets it came off.")
+            st.dataframe(vd, hide_index=True, width="stretch", height=430)
+
+        ui.eyebrow("Download")
+        stamp2 = datetime.now().strftime("%Y%m%d_%H%M")
+        dl1, dl2 = st.columns(2)
+        dl1.download_button("Summary report (Excel)", data=R.summary_excel(vs),
+                            file_name=f"Invoice_Summary_{stamp2}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument."
+                                 "spreadsheetml.sheet", width="stretch")
+        dl2.download_button("Details report (Excel)", data=R.details_excel(vd),
+                            file_name=f"Invoice_Details_{stamp2}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument."
+                                 "spreadsheetml.sheet", width="stretch")
+        st.caption(f"Downloading {len(vs)} invoices and {len(vd)} lines — the filters "
+                   "above apply to both files.")
+
+        # ---- remarks are operational notes, so let them be edited ----
+        with st.expander("Edit remarks"):
+            st.caption("A remark on a picked invoice is kept; picking a `No` again "
+                       "clears it automatically.")
+            ed = st.data_editor(
+                vs[["TAX_INVOICE_NO", "CUSTOMER_NAME", "KORBER_PICK", "REMARK"]],
+                hide_index=True, width="stretch", height=280, key="reg_remark",
+                column_config={
+                    "TAX_INVOICE_NO": st.column_config.TextColumn(disabled=True),
+                    "CUSTOMER_NAME": st.column_config.TextColumn(disabled=True),
+                    "KORBER_PICK": st.column_config.TextColumn(disabled=True)})
+            if st.button("Save remarks", disabled=not gs_ready):
+                try:
+                    import gsheet
+                    upd = reg_s.copy()
+                    idx = {str(v): i for i, v in enumerate(upd["TAX_INVOICE_NO"])}
+                    for _, r in ed.iterrows():
+                        i = idx.get(str(r["TAX_INVOICE_NO"]))
+                        if i is not None:
+                            upd.iat[i, upd.columns.get_loc("REMARK")] = str(r["REMARK"])
+                    gsheet.save_register(sa_info, sheet_key, upd.head(0), reg_d.head(0),
+                                         owner=USER)
+                    book = gsheet.open_book(sa_info, sheet_key)
+                    gsheet._replace_ws(book, gsheet.WS_INV_SUM, R.SUMMARY_COLS, upd)
+                    gsheet.cache_clear(sheet_key)
+                    st.session_state.pop("reg_cache", None)
+                    st.toast("Remarks saved", icon="📝")
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"Save error: {ex}")
+
+    # ---- the MRP rule lives here ----
+    with st.expander("MRP contacts — the rule behind the Yes / No"):
+        st.caption("A document is **MRP = Yes** when its `Contact Person` / `Email` "
+                   "matches one of these. Email wins when the document carries one.")
+        mrp_ed = st.data_editor(pd.DataFrame(MRP_CONTACTS, columns=["NAME", "EMAIL"]),
+                                num_rows="dynamic", width="stretch", hide_index=True,
+                                key="mrp_editor")
+        m1, m2 = st.columns(2)
+        if m1.button("Save MRP contacts", type="primary", width="stretch"):
+            st.session_state["mrp_contacts"] = R.load_contacts(
+                mrp_ed.to_dict("records"))
+            if gs_ready:
+                try:
+                    import gsheet
+                    gsheet.save_setting(sa_info, sheet_key, "MRP_CONTACTS",
+                                        R.dump_contacts(mrp_ed))
+                except Exception as ex:
+                    st.error(f"Save error: {ex}")
+            st.toast("MRP contacts saved — re-run a pick to apply", icon="✅")
+            st.rerun()
+        if m2.button("Reset to default", width="stretch"):
+            st.session_state["mrp_contacts"] = R.load_contacts(None)
+            if gs_ready:
+                try:
+                    import gsheet
+                    gsheet.save_setting(sa_info, sheet_key, "MRP_CONTACTS", "")
+                except Exception:
+                    pass
+            st.rerun()
+        st.caption("Changing this does not rewrite invoices already in the register — "
+                   "it applies from the next pick run.")
+
 # =========================================================================== #
 # TAB — Loads (download / delete by LOAD_ID)
 # =========================================================================== #
@@ -1101,7 +1283,9 @@ with tab_loads:
                                 with st.spinner("Deleting..."):
                                     r = gsheet.delete_load(sa_info, sheet_key, load_id,
                                                            owner=USER)
-                                st.toast(f"Deleted {load_id}", icon="🗑️")
+                                st.session_state.pop("reg_cache", None)
+                                st.toast(f"Deleted {load_id} — register set to No",
+                                         icon="🗑️")
                                 st.rerun()
                             except gsheet.LockBusy as ex:
                                 st.warning(str(ex))
@@ -1415,7 +1599,7 @@ with tab_hist:
 # =========================================================================== #
 with tab_help:
     ui.section("How it works", hint="quick reference")
-    g1, g2, g3 = st.tabs(["The pick", "Output files", "Setup"])
+    g1, g2, g4, g3 = st.tabs(["The pick", "Output files", "Register", "Setup"])
 
     with g1:
         st.markdown("""
@@ -1497,6 +1681,43 @@ A DC number such as `333/26-27/62` is saved as `333-26-27-62` because a filename
 cannot hold a slash. The LOAD_ID inside the file and the QR is the real one.
 """)
 
+    with g4:
+        st.markdown("""
+Every document that is uploaded is written to the **Register**, whether it was
+picked or not, one row per invoice — for good.
+
+**Summary**
+
+| Column | Where it comes from |
+|---|---|
+| Tax Invoice Date | `Invoice Date` / `Delivery Challan Date` |
+| Tax Invoice No. | `Invoice No.` / `Delivery Challan no.` |
+| AR Invoice No. | `AR Invoice No.` (invoices only) |
+| Name of Customer | `Ship To / Consignee` · on a challan, `Name of Consignee(Shipped To)` |
+| Qty | total document quantity |
+| Körber Pick | **Yes** when the pick generated · **No** with the reason as the remark |
+| MRP | **Yes** when the document's Contact Person / Email is one of the MRP contacts |
+
+**Details** — one row per document line: item, quantity, and the pallets,
+locations and lots it came off.
+
+**How Körber Pick moves**
+
+* first upload, stock short → `No` + *"STOCK SHORT — L2 X006252 (need 999, have 6)"*
+* picked later → `Yes`, remark cleared automatically, same row
+* load deleted on the **Loads** tab → back to `No` + *"Load deleted · <time>"*
+
+A `Yes` is never quietly pushed back to `No` by a later run that skipped the
+invoice as a duplicate — only deleting the load does that.
+
+**MRP contacts** live under *MRP contacts — the rule behind the Yes / No* on the
+Register tab. The default is `Sharma, Rahul` / `rahul.sharma1@donaldson.com`;
+add or change rows there and it applies from the next run.
+
+Both reports download as **separate Excel files**, and the filters on screen
+apply to what you get.
+""")
+
     with g3:
         st.markdown("""
 **`.streamlit/secrets.toml`**
@@ -1529,7 +1750,8 @@ Share the sheet with the **service-account email as an Editor**, then press
 **Worksheets**
 
 `OUTBOUND_MASTER` · `OUTBOUND_DETAIL` · `PALLET_LEDGER` · `DOC_REGISTRY` ·
-`REJECTED_LOG` · `RUN_LOG` · `SKU_MASTER` · `APP_SETTINGS` · `_LOCKS`
+`REJECTED_LOG` · `RUN_LOG` · `SKU_MASTER` · `INVOICE_SUMMARY` ·
+`INVOICE_DETAIL` · `APP_SETTINGS` · `_LOCKS`
 
 **Several people at once**
 
