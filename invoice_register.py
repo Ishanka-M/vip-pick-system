@@ -24,7 +24,7 @@ from doc_parser import ParsedDoc, base_item, clean_item
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 9
+API = 10
 
 # Warehouse execution status — independent of KORBER_PICK (this app's own pallet
 # allocation). These three track the physical pick / pack / dispatch, driven by
@@ -519,37 +519,42 @@ def apply_packing_scan(summary: pd.DataFrame, details: pd.DataFrame, load_id: st
     return out
 
 
-SALES_REPORT_COLS = ["TAX_INVOICE_NO", "LINE", "ITEM_CODE", "DOC_QTY", "SALES_QTY", "STATUS"]
+SALES_REPORT_COLS = ["TAX_INVOICE_NO", "CUSTOMER_ITEM", "ITEM_CODE", "BASE_ID",
+                     "SALES_QTY", "IN_WMS_MASTER", "WMS_QTY", "STATUS"]
 
 
 def apply_sales_report(summary: pd.DataFrame, details: pd.DataFrame,
                        sales_df: pd.DataFrame, wms_master: pd.DataFrame | None = None,
                        wms_detail: pd.DataFrame | None = None) -> dict[str, Any]:
     """
-    Invoice sales report -> confirms Picking is really done.
+    Invoice sales report -> reconciled against the **actual WMS output**.
 
-    Checked against the **actual WMS output** — `OUTBOUND_MASTER.LOAD_ID`
-    (was this invoice actually picked and pushed to the WMS at all?) and
-    `OUTBOUND_DETAIL.DISPLAY_ITEM_NUMBER` / `QTY` (what was actually sent) —
-    not against what the invoice PDF itself said. `INVOICE_DETAIL` exists for
-    every uploaded document whether or not it was ever picked, so it is not
-    proof of anything by itself.
+    `OUTBOUND_MASTER.LOAD_ID` answers "was this invoice really picked and
+    pushed to the WMS at all?", and `OUTBOUND_DETAIL.DISPLAY_ITEM_NUMBER` /
+    `QTY` answers "what was actually sent". `INVOICE_DETAIL` exists for every
+    uploaded document whether or not it was ever picked, so it is not proof of
+    anything by itself.
 
-    Matched on Tax Invoice No. == `OUTBOUND_MASTER.LOAD_ID`, then item
+    **The report has one row per uploaded sales-report row**, not per register
+    line. The register only holds the invoices this app has parsed — typically
+    a fraction of what the ERP exports — so driving the report off the register
+    hid every invoice the ERP knows about but the register has not seen, which
+    is exactly the reconciliation the report exists to show.
+
+    Matching: Tax Invoice No. == `OUTBOUND_MASTER.LOAD_ID`, then item
     (Item Code / Customer Item, base-ID matched like everywhere else in this
-    app) + Qty against `OUTBOUND_DETAIL` for that same order. A line whose
-    sales-report quantity exactly matches the WMS quantity is
-    picking-confirmed; once every line of an invoice is confirmed, the
+    app) + Qty against `OUTBOUND_DETAIL` for that same order. Where the
+    quantities agree, the matching register line (if any) is marked
+    Picking = Completed; once every line of an invoice is confirmed, the
     invoice itself is marked Picking = Completed.
 
-    Falls back to comparing against the invoice's own `DOC_QTY` when no WMS
-    output has been saved yet (`wms_master` / `wms_detail` empty) — degraded,
-    but still useful before the first pick run.
+    Falls back to comparing against the register's own `DOC_QTY` when no WMS
+    output has been saved yet — degraded, but still useful before a pick run.
     """
     empty = pd.DataFrame(columns=SALES_REPORT_COLS)
     out = {"summary": summary, "details": details, "report": empty,
           "matched": 0, "invoices_completed": 0, "error": "", "used_wms": False}
-    if sales_df is None or not len(sales_df) or details is None or not len(details):
+    if sales_df is None or not len(sales_df):
         return out
 
     c_inv = _find_col(sales_df, "Tax Invoice No.", "Tax Invoice No")
@@ -570,15 +575,11 @@ def apply_sales_report(summary: pd.DataFrame, details: pd.DataFrame,
         inv = _id_str(r.get(c_inv, "")).strip()
         if not inv:
             continue
-        b1 = base_item(r.get(c_item)) if c_item else ""
-        b2 = base_item(r.get(c_citem)) if c_citem else ""
-        bases = {b for b in (b1, b2) if b}
-        if not bases:
-            continue
+        bases = {b for b in (base_item(r.get(c_item)) if c_item else "",
+                             base_item(r.get(c_citem)) if c_citem else "") if b}
         qty = _to_num(r.get(c_qty)) or 0.0
         for base in bases:
-            key = (inv, base)
-            sales_qty[key] = sales_qty.get(key, 0.0) + qty
+            sales_qty[(inv, base)] = sales_qty.get((inv, base), 0.0) + qty
 
     # ---- what the WMS actually received, if it has been saved ----
     # OUTBOUND_MASTER carries both LOAD_ID and DISPLAY_ORDER_NUMBER — they are
@@ -603,62 +604,105 @@ def apply_sales_report(summary: pd.DataFrame, details: pd.DataFrame,
         for (inv, base), grp in wd.groupby(["_INV", "_BASE"]):
             wms_qty[(inv, base)] = wms_qty.get((inv, base), 0.0) + float(grp["_QTY"].sum())
 
-    d = details.copy()
-    d["_BASE"] = d["ITEM_CODE"].map(base_item)
-    rep_rows = []
-    matched_mask = pd.Series(False, index=d.index)
-    for i, row in d.iterrows():
-        inv = str(row["TAX_INVOICE_NO"]).strip()
-        base = row["_BASE"]
-        sq = sales_qty.get((inv, base))
-        doc_qty = float(row["DOC_QTY"] or 0)
+    # the register's own quantities — only needed for the no-WMS fallback
+    doc_qty_by_key: dict[tuple[str, str], float] = {}
+    if not use_wms and details is not None and len(details):
+        for _, r in details.iterrows():
+            key = (str(r["TAX_INVOICE_NO"]).strip(), base_item(r["ITEM_CODE"]))
+            doc_qty_by_key[key] = doc_qty_by_key.get(key, 0.0) + \
+                (_to_num(r.get("DOC_QTY")) or 0.0)
+
+    # ---- one report row per uploaded sales-report row ----
+    rep_rows: list[dict] = []
+    matched_keys: set[tuple[str, str]] = set()
+    n_matched = 0
+    for _, r in sales_df.iterrows():
+        inv = _id_str(r.get(c_inv, "")).strip()
+        b1 = base_item(r.get(c_item)) if c_item else ""
+        b2 = base_item(r.get(c_citem)) if c_citem else ""
+        row = {"TAX_INVOICE_NO": inv,
+               "CUSTOMER_ITEM": str(r.get(c_citem, "") or "") if c_citem else "",
+               "ITEM_CODE": str(r.get(c_item, "") or "") if c_item else "",
+               "BASE_ID": "", "SALES_QTY": _to_num(r.get(c_qty)) or 0.0,
+               "IN_WMS_MASTER": "", "WMS_QTY": "", "STATUS": ""}
+
+        if not inv:
+            row["STATUS"] = "No Tax Invoice No."
+            rep_rows.append(row)
+            continue
+        if not (b1 or b2):
+            row["STATUS"] = "No item code"
+            rep_rows.append(row)
+            continue
 
         if use_wms:
-            if inv not in sent_invoices:
-                status = "Not in OUTBOUND_MASTER — not picked yet"
-            elif sq is None:
-                status = "Not in sales report"
+            sent = inv in sent_invoices
+            row["IN_WMS_MASTER"] = "Yes" if sent else "No"
+            if not sent:
+                row["STATUS"] = "Not in OUTBOUND_MASTER — not picked yet"
+                rep_rows.append(row)
+                continue
+            # whichever base the WMS side actually carries
+            hit = next((b for b in (b1, b2) if b and (inv, b) in wms_qty), "")
+            row["BASE_ID"] = hit or (b1 or b2)
+            if not hit:
+                row["STATUS"] = "Not in OUTBOUND_DETAIL"
+                rep_rows.append(row)
+                continue
+            wq = wms_qty[(inv, hit)]
+            sq = sales_qty.get((inv, hit), 0.0)
+            row["WMS_QTY"] = wq
+            if abs(sq - wq) <= 0.01:
+                row["STATUS"] = "Matched"
+                matched_keys.add((inv, hit))
+                n_matched += 1
             else:
-                wq = wms_qty.get((inv, base))
-                if wq is None:
-                    status = "Not in OUTBOUND_DETAIL"
-                elif abs(sq - wq) <= 0.01:
-                    status = "Matched"
-                    matched_mask.at[i] = True
-                else:
-                    status = f"Qty mismatch (sales {sq:g} vs WMS {wq:g})"
-        elif sq is None:
-            status = "Not in sales report"
-        elif abs(sq - doc_qty) <= 0.01:
-            status = "Matched"
-            matched_mask.at[i] = True
+                row["STATUS"] = f"Qty mismatch (sales {sq:g} vs WMS {wq:g})"
         else:
-            status = f"Qty mismatch (report {sq:g})"
+            hit = next((b for b in (b1, b2) if b and (inv, b) in doc_qty_by_key), "")
+            row["BASE_ID"] = hit or (b1 or b2)
+            if not hit:
+                row["STATUS"] = "Not in the invoice register"
+                rep_rows.append(row)
+                continue
+            dq = doc_qty_by_key[(inv, hit)]
+            sq = sales_qty.get((inv, hit), 0.0)
+            row["WMS_QTY"] = dq
+            if abs(sq - dq) <= 0.01:
+                row["STATUS"] = "Matched (register qty — no WMS output yet)"
+                matched_keys.add((inv, hit))
+                n_matched += 1
+            else:
+                row["STATUS"] = f"Qty mismatch (sales {sq:g} vs register {dq:g})"
+        rep_rows.append(row)
 
-        rep_rows.append({"TAX_INVOICE_NO": inv, "LINE": row["LINE"],
-                         "ITEM_CODE": row["ITEM_CODE"], "DOC_QTY": doc_qty,
-                         "SALES_QTY": sq if sq is not None else "", "STATUS": status})
-
-    d.loc[matched_mask & (d["PICKING"] != STATUS_DONE), "PICKING"] = STATUS_DONE
-    d = d.drop(columns=["_BASE"])
-
+    # ---- carry the confirmation into the register ----
+    d = details
     s = summary
     n_inv_done = 0
-    if summary is not None and len(summary):
-        s = summary.copy()
-        all_done = d.groupby("TAX_INVOICE_NO")["PICKING"].apply(
-            lambda x: bool(len(x)) and (x == STATUS_DONE).all())
-        inv_col = s["TAX_INVOICE_NO"].astype(str).str.strip()
-        for inv, done in all_done.items():
-            if not done:
-                continue
-            m = (inv_col == str(inv).strip()) & (s["PICKING"] != STATUS_DONE)
-            n_inv_done += int(m.sum())
-            s.loc[m, "PICKING"] = STATUS_DONE
+    if details is not None and len(details) and matched_keys:
+        d = details.copy()
+        keys = list(zip(d["TAX_INVOICE_NO"].astype(str).str.strip(),
+                        d["ITEM_CODE"].map(base_item)))
+        hit_mask = pd.Series([k in matched_keys for k in keys], index=d.index)
+        d.loc[hit_mask & (d["PICKING"] != STATUS_DONE), "PICKING"] = STATUS_DONE
 
-    return {"summary": s, "details": d, "report": pd.DataFrame(rep_rows, columns=SALES_REPORT_COLS),
-           "matched": int(matched_mask.sum()), "invoices_completed": n_inv_done, "error": "",
-           "used_wms": use_wms}
+        if summary is not None and len(summary):
+            s = summary.copy()
+            all_done = d.groupby("TAX_INVOICE_NO")["PICKING"].apply(
+                lambda x: bool(len(x)) and (x == STATUS_DONE).all())
+            inv_col = s["TAX_INVOICE_NO"].astype(str).str.strip()
+            for inv, done in all_done.items():
+                if not done:
+                    continue
+                m = (inv_col == str(inv).strip()) & (s["PICKING"] != STATUS_DONE)
+                n_inv_done += int(m.sum())
+                s.loc[m, "PICKING"] = STATUS_DONE
+
+    return {"summary": s, "details": d,
+            "report": pd.DataFrame(rep_rows, columns=SALES_REPORT_COLS),
+            "matched": n_matched, "invoices_completed": n_inv_done, "error": "",
+            "used_wms": use_wms}
 
 
 # --------------------------------------------------------------------------- #
