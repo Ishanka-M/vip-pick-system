@@ -24,7 +24,7 @@ from doc_parser import ParsedDoc, base_item, clean_item
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 1
+API = 3
 
 SUMMARY_COLS = [
     "TAX_INVOICE_DATE", "TAX_INVOICE_NO", "AR_INVOICE_NO", "CUSTOMER_NAME", "QTY",
@@ -268,6 +268,145 @@ def mark_unpicked(summary: pd.DataFrame, invoice_no: str,
     d.loc[m, "PICKED_QTY"] = 0.0
     d.loc[m, "UPDATED_AT"] = stamp
     return d
+
+
+# --------------------------------------------------------------------------- #
+# dashboard — how much is still left
+# --------------------------------------------------------------------------- #
+PENDING_COLS = ["DAYS", "TAX_INVOICE_DATE", "TAX_INVOICE_NO", "CUSTOMER_NAME", "QTY",
+                "SHORT_QTY", "REASON", "DOC_TYPE", "MRP", "REMARK"]
+
+# order matters — the first pattern that matches a remark wins
+_REASONS: list[tuple[str, str]] = [
+    ("On another pick task", r"another pick task|on pick task"),
+    ("Stock short", r"stock short"),
+    ("Pallet over-pick", r"over-pick"),
+    ("Qty verify failed", r"qty verify"),
+    ("Document incomplete", r"incomplete document"),
+    ("Duplicate", r"duplicate"),
+    ("Load deleted", r"load deleted"),
+]
+
+
+def parse_date(v: Any) -> Any:
+    """'12-AUG-2026' first, anything else after."""
+    d = pd.to_datetime(v, format="%d-%b-%Y", errors="coerce")
+    if pd.isna(d):
+        d = pd.to_datetime(v, dayfirst=True, errors="coerce")
+    return d
+
+
+def classify(remark: Any) -> str:
+    t = str(remark or "").lower()
+    if not t.strip():
+        return "Not picked yet"
+    for name, pat in _REASONS:
+        if re.search(pat, t):
+            return name
+    return "Other"
+
+
+def dashboard(summary: pd.DataFrame, date_from: Any = None, date_to: Any = None,
+              doc_types: list[str] | None = None) -> dict[str, Any]:
+    """
+    Everything the Pending vs picked view needs, in one pass.
+
+    The question is always "how much is still left" — so the numbers are counted
+    both ways: invoices and quantity, because one pending invoice for 1 000 units
+    is not the same problem as ten pending invoices for 2 units each.
+    """
+    empty = {"kpi": {k: 0 for k in ("total", "picked", "pending", "qty", "qty_picked",
+                                    "qty_pending", "pct", "oldest")},
+             "by_reason": pd.DataFrame(columns=["REASON", "INVOICES", "QTY"]),
+             "by_customer": pd.DataFrame(columns=["CUSTOMER_NAME", "INVOICES", "QTY"]),
+             "pending": pd.DataFrame(columns=PENDING_COLS),
+             "picked": pd.DataFrame(columns=PENDING_COLS),
+             "summary": pd.DataFrame(columns=SUMMARY_COLS), "invoices": []}
+    if summary is None or not len(summary):
+        return empty
+
+    d = summary.reindex(columns=SUMMARY_COLS).copy()
+    d["QTY"] = pd.to_numeric(d["QTY"], errors="coerce").fillna(0.0)
+    d["PICKED_QTY"] = pd.to_numeric(d["PICKED_QTY"], errors="coerce").fillna(0.0)
+    d["_DATE"] = d["TAX_INVOICE_DATE"].map(parse_date)
+    d["KORBER_PICK"] = d["KORBER_PICK"].astype(str).str.strip().str.title()
+
+    if doc_types:
+        d = d[d["DOC_TYPE"].astype(str).isin(doc_types)]
+    if date_from is not None:
+        d = d[d["_DATE"].isna() | (d["_DATE"] >= pd.Timestamp(date_from))]
+    if date_to is not None:
+        d = d[d["_DATE"].isna() | (d["_DATE"] <= pd.Timestamp(date_to))]
+    if not len(d):
+        return empty
+
+    today = pd.Timestamp(datetime.now().date())
+    d["DAYS"] = (today - d["_DATE"]).dt.days
+    d["REASON"] = d["REMARK"].map(classify)
+    d.loc[d["KORBER_PICK"] == "Yes", "REASON"] = "Picked"
+    d["SHORT_QTY"] = (d["QTY"] - d["PICKED_QTY"]).clip(lower=0)
+
+    pend = d[d["KORBER_PICK"] != "Yes"].copy()
+    done = d[d["KORBER_PICK"] == "Yes"].copy()
+
+    kpi = {
+        "total": int(len(d)), "picked": int(len(done)), "pending": int(len(pend)),
+        "qty": float(d["QTY"].sum()), "qty_picked": float(done["QTY"].sum()),
+        "qty_pending": float(pend["QTY"].sum()),
+        "pct": (float(len(done)) / len(d) * 100.0) if len(d) else 0.0,
+        "oldest": int(pend["DAYS"].max()) if len(pend) and pend["DAYS"].notna().any() else 0,
+    }
+
+    by_reason = (pend.groupby("REASON")
+                 .agg(INVOICES=("TAX_INVOICE_NO", "count"), QTY=("QTY", "sum"))
+                 .reset_index().sort_values("QTY", ascending=False)
+                 if len(pend) else empty["by_reason"])
+    by_customer = (pend.groupby("CUSTOMER_NAME")
+                   .agg(INVOICES=("TAX_INVOICE_NO", "count"), QTY=("QTY", "sum"))
+                   .reset_index().sort_values("QTY", ascending=False)
+                   if len(pend) else empty["by_customer"])
+
+    def _tidy(x: pd.DataFrame) -> pd.DataFrame:
+        if not len(x):
+            return pd.DataFrame(columns=PENDING_COLS)
+        return (x.sort_values(["DAYS", "QTY"], ascending=[False, False])
+                 .reindex(columns=PENDING_COLS).reset_index(drop=True))
+
+    return {"kpi": kpi, "by_reason": by_reason, "by_customer": by_customer,
+            "pending": _tidy(pend), "picked": _tidy(done),
+            "summary": d.reindex(columns=SUMMARY_COLS).reset_index(drop=True),
+            "invoices": [str(x) for x in d["TAX_INVOICE_NO"]]}
+
+
+def details_for(details: pd.DataFrame, invoices: list[str]) -> pd.DataFrame:
+    """Detail lines belonging to a set of invoices — keeps the two reports in step."""
+    if details is None or not len(details):
+        return pd.DataFrame(columns=DETAIL_COLS)
+    keep = {str(x) for x in (invoices or [])}
+    d = details.reindex(columns=DETAIL_COLS)
+    return d[d["TAX_INVOICE_NO"].astype(str).isin(keep)].reset_index(drop=True)
+
+
+def pending_excel(dash: dict[str, Any]) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        k = dash["kpi"]
+        pd.DataFrame([
+            {"Measure": "Invoices total", "Value": k["total"]},
+            {"Measure": "Picked", "Value": k["picked"]},
+            {"Measure": "Pending", "Value": k["pending"]},
+            {"Measure": "Qty total", "Value": k["qty"]},
+            {"Measure": "Qty picked", "Value": k["qty_picked"]},
+            {"Measure": "Qty pending", "Value": k["qty_pending"]},
+            {"Measure": "Complete %", "Value": round(k["pct"], 1)},
+            {"Measure": "Oldest pending (days)", "Value": k["oldest"]},
+        ]).to_excel(xw, sheet_name="Status", index=False)
+        for name, key in [("Pending", "pending"), ("By reason", "by_reason"),
+                          ("By customer", "by_customer"), ("Picked", "picked")]:
+            df = dash.get(key)
+            (df if df is not None and len(df) else pd.DataFrame({"info": ["- none -"]})) \
+                .to_excel(xw, sheet_name=name, index=False)
+    return buf.getvalue()
 
 
 # --------------------------------------------------------------------------- #

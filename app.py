@@ -37,7 +37,7 @@ st.set_page_config(
 # run against a stale one and say exactly which file to replace.
 _NEEDS = {"pick_engine.py": (E, 4), "doc_parser.py": (P, 3), "pick_pdf.py": (PP, 4),
           "sku_master.py": (SKU, 2), "ui.py": (ui, 2),
-          "invoice_register.py": (R, 1)}
+          "invoice_register.py": (R, 3)}
 _STALE = [(f, getattr(m, "API", 0), n) for f, (m, n) in _NEEDS.items()
           if getattr(m, "API", 0) < n]
 if _STALE:
@@ -399,9 +399,9 @@ def _draw_rail():
          "value": (f"{len(res_now['accepted'])} picked" if res_now else "not run")},
     ])
 
-(tab_gen, tab_reg, tab_loads, tab_sku, tab_search, tab_bal, tab_hist,
- tab_help) = st.tabs(["Pick", "Register", "Loads", "SKU master", "Search", "Stock",
-                      "History", "Guide"])
+(tab_gen, tab_dash, tab_reg, tab_loads, tab_sku, tab_search, tab_bal, tab_hist,
+ tab_help) = st.tabs(["Pick", "Dashboard", "Register", "Loads", "SKU master",
+                      "Search", "Stock", "History", "Guide"])
 
 # =========================================================================== #
 # TAB 1 — Generate
@@ -1009,6 +1009,123 @@ with tab_gen:
 
 
 
+def _register_frames():
+    """Register data for the Dashboard and the Register tab — read once."""
+    empty = (pd.DataFrame(columns=R.SUMMARY_COLS), pd.DataFrame(columns=R.DETAIL_COLS))
+    if gs_ready:
+        if "reg_cache" not in st.session_state:
+            try:
+                import gsheet
+                st.session_state["reg_cache"] = gsheet.read_register(sa_info, sheet_key)
+            except Exception as ex:
+                st.session_state["reg_cache"] = empty
+                st.session_state["reg_error"] = str(ex)
+        a, b = st.session_state["reg_cache"]
+    elif st.session_state.get("reg_run"):
+        a, b = st.session_state["reg_run"]
+    else:
+        a, b = empty
+    a = a if a is not None and len(a) else empty[0]
+    b = b if b is not None and len(b) else empty[1]
+    return a, b
+
+
+# =========================================================================== #
+# TAB — Dashboard (pending vs picked)
+# =========================================================================== #
+with tab_dash:
+    ui.section("Pending vs picked", hint="how much is still to go")
+    d_sum, d_det = _register_frames()
+
+    if not len(d_sum):
+        ui.empty("Nothing to show yet",
+                 "Generate a pick and this fills up from the invoice register.", "📊")
+    else:
+        with st.expander("Filter", expanded=False):
+            fa, fb, fc = st.columns(3)
+            dates = d_sum["TAX_INVOICE_DATE"].map(R.parse_date).dropna()
+            lo = dates.min().date() if len(dates) else datetime.now().date()
+            hi = dates.max().date() if len(dates) else datetime.now().date()
+            d_from = fa.date_input("Invoice date from", value=lo, key="dash_from")
+            d_to = fb.date_input("to", value=hi, key="dash_to")
+            d_types = fc.multiselect("Document type",
+                                     sorted(d_sum["DOC_TYPE"].astype(str).unique()),
+                                     key="dash_types")
+        dash = R.dashboard(d_sum, d_from, d_to, d_types or None)
+        k = dash["kpi"]
+
+        # ---- the answer, first ----
+        pct = k["pct"] / 100.0
+        st.progress(min(1.0, max(0.0, pct)),
+                    text=f"{k['picked']} of {k['total']} invoices picked · "
+                         f"{k['pct']:.0f}%")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Pending invoices", k["pending"], delta_color="inverse")
+        m2.metric("Pending qty", E._qty_str(k["qty_pending"]), delta_color="inverse")
+        m3.metric("Picked qty", E._qty_str(k["qty_picked"]))
+        m4.metric("Oldest pending", f"{k['oldest']} d",
+                  help="Days since the invoice date of the oldest one still waiting.")
+
+        if not k["pending"]:
+            st.success("Nothing pending — every invoice in this range is picked.")
+        else:
+            c1, c2 = st.columns([1.1, 1])
+            with c1:
+                ui.eyebrow("Why they are waiting")
+                br = dash["by_reason"]
+                if len(br):
+                    st.bar_chart(br.set_index("REASON")["QTY"], horizontal=True,
+                                 color="#F0A81C", height=max(180, 46 * len(br)))
+                    st.dataframe(br, hide_index=True, width="stretch")
+            with c2:
+                ui.eyebrow("Who is waiting")
+                bc = dash["by_customer"].head(8)
+                if len(bc):
+                    st.bar_chart(bc.set_index("CUSTOMER_NAME")["QTY"], horizontal=True,
+                                 color="#3E8FD0", height=max(180, 46 * len(bc)))
+                    st.dataframe(bc, hide_index=True, width="stretch")
+
+            ui.eyebrow("Oldest first — chase these")
+            pend = dash["pending"]
+            st.dataframe(pend, hide_index=True, width="stretch", height=340,
+                         column_config={
+                             "DAYS": st.column_config.NumberColumn(
+                                 "Days", help="Since the invoice date", format="%d d"),
+                             "QTY": st.column_config.NumberColumn("Qty"),
+                             "SHORT_QTY": st.column_config.NumberColumn("Still to pick")})
+
+            st.caption("A pending invoice only clears when it is picked — upload it "
+                       "again on the Pick tab and the register updates itself.")
+
+        # ---- every report, from here, under the same filter ----
+        st.divider()
+        ui.eyebrow("Download")
+        d_stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        XL = ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        dash_sum = dash["summary"]
+        dash_det = R.details_for(d_det, dash["invoices"])
+        pend = dash["pending"]
+
+        q1, q2, q3, q4 = st.columns(4)
+        q1.download_button("Summary report (Excel)", data=R.summary_excel(dash_sum),
+                           file_name=f"Invoice_Summary_{d_stamp}.xlsx", mime=XL,
+                           width="stretch", key="dash_sum_xl")
+        q2.download_button("Details report (Excel)", data=R.details_excel(dash_det),
+                           file_name=f"Invoice_Details_{d_stamp}.xlsx", mime=XL,
+                           width="stretch", key="dash_det_xl")
+        q3.download_button("Pending report (Excel)", data=R.pending_excel(dash),
+                           file_name=f"Pending_{d_stamp}.xlsx", mime=XL,
+                           width="stretch", key="dash_pend_xl",
+                           disabled=not k["pending"])
+        q4.download_button("Pending list (CSV)", data=pend.to_csv(index=False).encode(),
+                           file_name=f"Pending_{d_stamp}.csv", mime="text/csv",
+                           width="stretch", key="dash_pend_csv",
+                           disabled=not k["pending"])
+        st.caption(f"The filter above applies to all four — "
+                   f"{len(dash_sum)} invoices · {len(dash_det)} lines · "
+                   f"{k['pending']} pending.")
+
+
 # =========================================================================== #
 # TAB — Invoice register
 # =========================================================================== #
@@ -1016,23 +1133,11 @@ with tab_reg:
     ui.section("Invoice register",
                hint="every document that has been uploaded, picked or not")
 
-    reg_s = pd.DataFrame(columns=R.SUMMARY_COLS)
-    reg_d = pd.DataFrame(columns=R.DETAIL_COLS)
-    if gs_ready:
-        if "reg_cache" not in st.session_state:
-            try:
-                import gsheet
-                st.session_state["reg_cache"] = gsheet.read_register(sa_info, sheet_key)
-            except Exception as ex:
-                st.warning(f"Register read error: {ex}")
-                st.session_state["reg_cache"] = (reg_s, reg_d)
-        reg_s, reg_d = st.session_state["reg_cache"]
-    elif st.session_state.get("reg_run"):
-        reg_s, reg_d = st.session_state["reg_run"]
+    reg_s, reg_d = _register_frames()
+    if st.session_state.get("reg_error"):
+        st.warning(f"Register read error: {st.session_state['reg_error']}")
+    elif not gs_ready and st.session_state.get("reg_run"):
         st.info("No database connected — showing this session's run only.")
-
-    reg_s = reg_s if reg_s is not None and len(reg_s) else pd.DataFrame(columns=R.SUMMARY_COLS)
-    reg_d = reg_d if reg_d is not None and len(reg_d) else pd.DataFrame(columns=R.DETAIL_COLS)
 
     if not len(reg_s):
         ui.empty("Nothing registered yet",
@@ -1082,7 +1187,8 @@ with tab_reg:
                             mime="application/vnd.openxmlformats-officedocument."
                                  "spreadsheetml.sheet", width="stretch")
         st.caption(f"Downloading {len(vs)} invoices and {len(vd)} lines — the filters "
-                   "above apply to both files.")
+                   "above apply to both files. The **Dashboard** tab has the same two "
+                   "reports filtered by invoice date instead.")
 
         # ---- remarks are operational notes, so let them be edited ----
         with st.expander("Edit remarks"):
@@ -1599,7 +1705,8 @@ with tab_hist:
 # =========================================================================== #
 with tab_help:
     ui.section("How it works", hint="quick reference")
-    g1, g2, g4, g3 = st.tabs(["The pick", "Output files", "Register", "Setup"])
+    g1, g2, g4, g5, g3 = st.tabs(["The pick", "Output files", "Register",
+                                  "Dashboard", "Setup"])
 
     with g1:
         st.markdown("""
@@ -1716,6 +1823,42 @@ add or change rows there and it applies from the next run.
 
 Both reports download as **separate Excel files**, and the filters on screen
 apply to what you get.
+""")
+
+    with g5:
+        st.markdown("""
+**Pending vs picked — how much is still left.**
+
+It reads the invoice register, so it covers every document ever uploaded, not
+just the last run.
+
+| | |
+|---|---|
+| Progress bar | picked invoices out of the total, as a percentage |
+| Pending invoices / Pending qty | what is still to go — counted both ways, because one pending invoice for 1 000 units is not the same problem as ten for 2 units |
+| Oldest pending | days since the invoice date of the oldest one still waiting |
+| Why they are waiting | pending quantity grouped by reason — stock short · on another pick task · duplicate · document incomplete · not picked yet |
+| Who is waiting | pending quantity by customer, biggest first |
+| Oldest first | the chase list — days, invoice, customer, qty, still to pick, reason |
+
+**Filter** by invoice date range and document type; every number and both
+downloads follow the filter.
+
+**Downloads — all four sit here**
+
+| File | What is in it |
+|---|---|
+| Summary report (Excel) | one row per invoice, the whole register |
+| Details report (Excel) | one row per document line |
+| Pending report (Excel) | five sheets — Status · Pending · By reason · By customer · Picked |
+| Pending list (CSV) | just the chase list |
+
+The date and document-type filter applies to all four. The **Register** tab has
+the same Summary and Details reports with its own filters (search · Körber Pick ·
+MRP) — same data, pick whichever filter suits.
+
+A pending invoice clears itself: upload it again on the **Pick** tab and once it
+picks, the register flips it to `Yes` and it drops off this screen.
 """)
 
     with g3:

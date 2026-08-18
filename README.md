@@ -34,7 +34,7 @@ streamlit run app.py
 |---|---|
 | `pick_engine.py` · `pick_pdf.py` · `gsheet.py` | 4 |
 | `doc_parser.py` · `sku_master.py` · `ui.py` | 3 / 2 / 2 |
-| `invoice_register.py` | 1 |
+| `invoice_register.py` | 3 |
 
 **`.streamlit/config.toml` එක repo එකට push කරන්න අමතක කරන්න එපා.** Dropdown ·
 date picker · `st.dataframe` (canvas එකක් — CSS එකට ළඟා වෙන්න බෑ) වගේ widget වල
@@ -646,3 +646,43 @@ Freeze pane + auto-filter දාලා තියෙනවා.
 
 Worksheets: `INVOICE_SUMMARY` · `INVOICE_DETAIL`. **FULL DB RESET එකෙන් register
 එක clear වෙන්නේ නෑ** — scope එකෙන් `register` තෝරොත් විතරයි.
+
+---
+
+## 23. Dashboard — pending vs picked
+
+Tab: **Dashboard**. Invoice register එකෙන් කියවනවා, ඒ නිසා **මුළු history එකම**
+— අන්තිම run එක විතරක් නෙවෙයි.
+
+| | |
+|---|---|
+| Progress bar | picked invoices / total, % එකත් එක්ක |
+| Pending invoices · Pending qty | ඉතුරු ප්‍රමාණය — **දෙකම** ගණන් කරනවා. Unit 1000ක pending invoice එකයි, unit 2 බැගින් pending invoice 10යි එකම ප්‍රශ්නයක් නෙවෙයි |
+| Oldest pending | ඉතුරු වෙලා තියෙන පරණම එකේ invoice date එකේ ඉඳන් දවස් ගාණ |
+| Why they are waiting | pending qty එක **හේතුව අනුව** — stock short · on another pick task · duplicate · document incomplete · not picked yet |
+| Who is waiting | pending qty එක customer අනුව, ලොකුම එක උඩින් |
+| Oldest first | chase list එක — days · invoice · customer · qty · still to pick · reason |
+
+Remark එකෙන් හේතුව automatic classify වෙනවා (`_REASONS` pattern list එකෙන්).
+
+**Filter** — invoice date range + document type. හැම number එකකටම, download 2ටම
+apply වෙනවා.
+
+**Download — හතරම මෙතන**
+
+| File | මොනවද |
+|---|---|
+| **Summary report (Excel)** | invoice එකකට row එකයි — මුළු register එකම |
+| **Details report (Excel)** | document line එකකට row එකයි |
+| **Pending report (Excel)** | sheet 5ක්: `Status` · `Pending` · `By reason` · `By customer` · `Picked` |
+| **Pending list (CSV)** | chase list එක විතරයි |
+
+Date range + document type filter එක **හතරටම** apply වෙනවා.
+
+> Summary සහ Details report දෙක **තැන් දෙකකින්ම** ගන්න පුළුවන් — data එකම
+> එකයි, filter දෙක වෙනස්:
+> * **Dashboard** → invoice date range · document type
+> * **Register** → search · Körber Pick · MRP
+
+Pending invoice එකක් **තනියම clear වෙනවා** — Pick tab එකෙන් ආපහු upload කරලා
+pick වුණාම register එක `Yes` කරනවා, dashboard එකෙන් අයින් වෙනවා.
