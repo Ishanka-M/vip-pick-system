@@ -20,7 +20,7 @@ import pdfplumber
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 4
+API = 5
 
 # --------------------------------------------------------------------------- #
 # Item-code helpers
@@ -37,6 +37,9 @@ def clean_item(code: Any) -> str:
     return s
 
 
+_BASE_SUFFIX = re.compile(r"(?:\d{3})+")
+
+
 def base_item(code: Any) -> str:
     """
     Matching key — Donaldson suffix එක අයින් කරලා base ID එක විතරක්.
@@ -45,16 +48,28 @@ def base_item(code: Any) -> str:
         07011636-000-440 -> 07011636
         100409-101       -> 100409
         P550945          -> P550945
-    Suffix එක කියලා ගන්නේ **3-digit කෑලි විතරක්** නම් — එහෙම නැත්නම් මුළු code එකම.
-        05-47174 -> 05-47174   (05 නෙවෙයි — වැරදි match වළක්වන්න)
+
+    ERP export එකේ සමහර වෙලාවට hyphen එක වෙනුවට **space** එකක් එනවා, සහ
+    3-digit කෑලි එකට ඇලිලා එනවා. ඒවත් suffix — base එක එකමයි:
+        X770132 003710   -> X770132   (= X770132-003-710)
+        P951413 000710   -> P951413
+        P775704     710  -> P775704
+    ඒ නිසා whitespace එකත් separator එකක් විදිහට ගන්නවා, suffix කෑල්ලක් කියලා
+    ගන්නේ **digit 3ක ගුණාකාරයක්** නම් විතරයි (3, 6, 9 …).
+
+    එහෙම නැත්නම් මුළු code එකම — වැරදි match වළක්වන්න:
+        05-47174   -> 05-47174    (47174 = digit 5යි, 3ේ ගුණාකාරයක් නෙවෙයි)
+        1C072323-INL -> 1C072323-INL
     """
-    s = clean_item(code)
+    s = str(code or "").strip().upper().replace("\n", " ")
+    s = re.sub(r"\s+", "-", s).rstrip(".")
+    s = _ITEM_CLEAN.sub("", s)
     if not s:
         return ""
-    parts = s.split("-")
-    if len(parts) > 1 and all(re.fullmatch(r"\d{3}", p) for p in parts[1:]):
+    parts = [p for p in s.split("-") if p]
+    if len(parts) > 1 and all(_BASE_SUFFIX.fullmatch(p) for p in parts[1:]):
         return parts[0]
-    return s
+    return clean_item(code) or s
 
 
 def _num(x: Any) -> float | None:

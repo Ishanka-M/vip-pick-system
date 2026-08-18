@@ -35,7 +35,7 @@ streamlit run app.py
 | `gsheet.py` | 7 |
 | `invoice_register.py` | 10 |
 | `pick_engine.py` · `pick_pdf.py` | 4 |
-| `doc_parser.py` | 4 |
+| `doc_parser.py` | 5 |
 | `ui.py` | 3 |
 | `sku_master.py` | 2 |
 
@@ -336,9 +336,19 @@ preview එකේ පේනවා.
 SKU master එකේ description, pick කරද්දී inventory එකේ description එක හිස් නම්
 automatic fill වෙනවා (pick sheet · email · shortage PDF ඔක්කොම).
 
-> **Base ID rule** — suffix එක කියලා ගන්නේ **3-digit කෑලි විතරක්** නම්:
-> `07011636-000-440` → `07011636` ✅ · `100409-101` → `100409` ✅ ·
-> `05-47174` → `05-47174` (`05` නෙවෙයි — වැරදි match වළක්වන්න)
+> **Base ID rule** — separator එකෙන් (hyphen **හෝ space**) කැඩුවම, පස්සේ තියෙන
+> කෑලි **ඔක්කොම digit 3ක ගුණාකාර** නම් ඒවා suffix, මුල් කෑල්ල base ID එක:
+> `07011636-000-440` → `07011636` ✅ · `100409-101` → `100409` ✅
+>
+> ERP export එකේ hyphen එක වෙනුවට **space** එකක් එනවා, 3-digit කෑලි එකට
+> ඇලිලත් එනවා — ඒවත් suffix, base එක එකමයි:
+> `X770132 003710` → `X770132` ✅ · `P951413 000710` → `P951413` ✅ ·
+> `P775704   710` → `P775704` ✅ · `X770132-003710` → `X770132` ✅
+> (non-breaking space `\xa0` වුණත් අල්ලනවා)
+>
+> 3ේ ගුණාකාරයක් නෙවෙයි නම් / digit නෙවෙයි නම් **මුළු code එකම** — වැරදි match
+> වළක්වන්න: `05-47174` → `05-47174` (digit 5යි) ·
+> `1C072323-INL` → `1C072323-INL` (`INL` digit නෙවෙයි)
 
 ---
 
