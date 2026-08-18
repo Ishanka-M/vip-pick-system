@@ -37,7 +37,7 @@ st.set_page_config(
 # run against a stale one and say exactly which file to replace.
 _NEEDS = {"pick_engine.py": (E, 4), "doc_parser.py": (P, 3), "pick_pdf.py": (PP, 4),
           "sku_master.py": (SKU, 2), "ui.py": (ui, 2),
-          "invoice_register.py": (R, 4)}
+          "invoice_register.py": (R, 5)}
 _STALE = [(f, getattr(m, "API", 0), n) for f, (m, n) in _NEEDS.items()
           if getattr(m, "API", 0) < n]
 if _STALE:
@@ -1104,7 +1104,12 @@ def _register_frames():
         a, b = empty
     a = a if a is not None and len(a) else empty[0]
     b = b if b is not None and len(b) else empty[1]
-    return a, b
+    # Rows written before duplicates were excluded are filtered here, so the
+    # Register tab, the Dashboard and every report see the same thing.
+    clean = R.strip_duplicates(a, b)
+    st.session_state["reg_dupes"] = clean["dropped"]
+    st.session_state["reg_dupe_ids"] = clean["invoices"]
+    return clean["summary"], clean["details"]
 
 
 # =========================================================================== #
@@ -1130,9 +1135,11 @@ with tab_dash:
                                      key="dash_types")
         dash = R.dashboard(d_sum, d_from, d_to, d_types or None)
         k = dash["kpi"]
-        if dash.get("duplicates"):
-            st.caption(f"{dash['duplicates']} duplicate row(s) left out — a duplicate "
-                       "is an invoice that was already picked, not outstanding work.")
+        _nd = st.session_state.get("reg_dupes", 0) or dash.get("duplicates", 0)
+        if _nd:
+            st.caption(f"{_nd} duplicate row(s) left out — a duplicate is an invoice "
+                       "that was already picked, not outstanding work. Clear them on "
+                       "the Register tab.")
 
         # ---- the answer, first ----
         pct = k["pct"] / 100.0
@@ -1218,6 +1225,34 @@ with tab_reg:
                hint="every document that has been uploaded, picked or not")
 
     reg_s, reg_d = _register_frames()
+    _ndup = st.session_state.get("reg_dupes", 0)
+    if _ndup:
+        with st.container(border=True):
+            c_a, c_b = st.columns([3, 1])
+            c_a.markdown(
+                ui.stamp(f"{_ndup} duplicate rows hidden", "warn") + " &nbsp;" +
+                ui.muted("Invoices that were already picked in an earlier run — "
+                         "they are left out of this table, both reports and the "
+                         "dashboard. Clear them to tidy the sheet itself."),
+                unsafe_allow_html=True)
+            c_b.write("")
+            if c_b.button("Clear them", width="stretch", disabled=not gs_ready):
+                try:
+                    import gsheet
+                    raw_s, raw_d = gsheet.read_register(sa_info, sheet_key, fresh=True)
+                    clean = R.strip_duplicates(raw_s, raw_d)
+                    book = gsheet.open_book(sa_info, sheet_key)
+                    with gsheet.sheet_lock(sa_info, sheet_key, "REGISTER", owner=USER):
+                        gsheet.write_table(book, gsheet.WS_INV_SUM, R.SUMMARY_COLS,
+                                           clean["summary"], prev_rows=len(raw_s))
+                        gsheet.write_table(book, gsheet.WS_INV_DET, R.DETAIL_COLS,
+                                           clean["details"], prev_rows=len(raw_d))
+                    gsheet.cache_clear(sheet_key)
+                    st.session_state.pop("reg_cache", None)
+                    st.toast(f"Removed {clean['dropped']} duplicate rows", icon="🧹")
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"Cleanup error: {ex}")
     if st.session_state.get("reg_error"):
         st.warning(f"Register read error: {st.session_state['reg_error']}")
     elif not gs_ready and st.session_state.get("reg_run"):
@@ -1894,6 +1929,15 @@ picked or not, one row per invoice — for good.
 
 **Details** — one row per document line: item, quantity, and the pallets,
 locations and lots it came off.
+
+**Duplicates never enter the register.** Uploading an invoice that was already
+picked adds nothing — no row, no pending work, nothing in either report or on the
+dashboard. The screen says which ones were left out. A file dropped in twice in
+one upload is different: the first copy is the real document and still gets its
+row, with its own reason if it failed.
+
+Rows written before this rule are hidden and can be cleared off the sheet with
+one button on the Register tab.
 
 **How Körber Pick moves**
 

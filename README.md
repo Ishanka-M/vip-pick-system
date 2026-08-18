@@ -33,7 +33,8 @@ streamlit run app.py
 | File | API |
 |---|---|
 | `gsheet.py` | 5 |
-| `pick_engine.py` · `pick_pdf.py` · `invoice_register.py` | 4 |
+| `invoice_register.py` | 5 |
+| `pick_engine.py` · `pick_pdf.py` | 4 |
 | `doc_parser.py` | 3 |
 | `sku_master.py` · `ui.py` | 2 |
 
@@ -695,15 +696,23 @@ pick වුණාම register එක `Yes` කරනවා, dashboard එකෙ�
 ### Duplicate කිසිම තැනකට යන්නේ නෑ
 
 Invoice එකක් කලින් pick වෙලා තියෙද්දී ආපහු upload කරොත් — ඒක **pending වැඩක්
-නෙවෙයි**, ඉවර වුණ වැඩක්. ඒ නිසා:
+නෙවෙයි**, ඉවර වුණ වැඩක්. ඒ නිසා **register එකටවත් dashboard එකටවත් යන්නේ නෑ**:
 
-* `R.build()` එකේදීම **register row එකක් හැදෙන්නේ නෑ** (කලින් `No` + remark
-  එකක් හැදිලා, ඒක permanent pending එකක් විදිහට dashboard එකේ ඉරිලා තිබුණා)
+* `R.build()` එකේදීම **register row එකක් හැදෙන්නේ නෑ**
+* `merge_summary()` එකේත් guard එකක් — කොහොම හරි එකක් ආවත් store වෙන්නේ නෑ
+* `_register_frames()` — Register tab · Dashboard · report හතරම කියවන **එකම
+  තැන**. Legacy duplicate row තිබ්බත් ඔක්කොමට filter වෙනවා
+* Register tab එකේ **"Clear them"** button එකෙන් sheet එකෙන්ම අයින් කරන්න
+  පුළුවන් (summary + ඒවායේ detail lines එක්කම)
 * Screen එකේ පේනවා: *"Already picked earlier, left out of the register and the
   dashboard: 333262712337"*
-* කලින් save වෙලා තියෙන legacy duplicate row තිබ්බත් **dashboard එකේ හැම
-  number එකකින්ම අයින්** — KPI · chart · pending list · download හතරම.
-  කීයක් අයින් කළාද කියලා caption එකකින් කියනවා.
+
+> **`DUPLICATE (batch)` වෙනස්.** ඒක කියන්නේ එකම file එක එකම upload එකේ දෙපාරක්
+> දාලා කියන එක විතරයි — **පළවෙනි copy එක ඇත්ත document එක**, ඒකට row එකක්
+> ඕන. කලින් version එකේ batch duplicate note එකෙන් ඇත්ත හේතුව
+> (`STOCK SHORT` වගේ) overwrite වෙලා, ඒ invoice එකම register එකෙන් වැටිලා
+> ගියා. දැන් ඇත්ත හේතුවට මුල් තැන, skip වෙන්නේ
+> `already processed` / `other user` දෙකට විතරයි.
 
 ### API quota
 

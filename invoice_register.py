@@ -24,7 +24,7 @@ from doc_parser import ParsedDoc, base_item, clean_item
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 4
+API = 5
 
 SUMMARY_COLS = [
     "TAX_INVOICE_DATE", "TAX_INVOICE_NO", "AR_INVOICE_NO", "CUSTOMER_NAME", "QTY",
@@ -47,6 +47,10 @@ DEFAULT_MRP = [{"NAME": "Sharma, Rahul", "EMAIL": "rahul.sharma1@donaldson.com"}
 # run and is already sitting in the register as Yes. Registering it again would
 # invent a second, permanently-pending copy of work that is finished.
 DUPLICATE_PAT = r"duplicate"
+# ...but "DUPLICATE (batch)" only means the same file was dropped in twice in one
+# upload. The first copy is the real document and still needs its own row, so
+# only the two "it already exists elsewhere" cases skip registration.
+DUP_SKIP_PAT = r"duplicate\s*\(\s*(already processed|other user)"
 
 
 # --------------------------------------------------------------------------- #
@@ -123,6 +127,9 @@ def build(docs: list[ParsedDoc], res: dict[str, Any], contacts: list[dict],
             num = str(r.get("DOC_NUMBER", ""))
             why = str(r.get("REASON", "")).strip()
             det = str(r.get("DETAIL", "")).strip()
+            # a real failure must not be overwritten by the batch-duplicate note
+            if num in reasons and re.search(DUPLICATE_PAT, why, re.I):
+                continue
             reasons[num] = (f"{why} — {det}" if det else why)[:400]
 
     alloc = res.get("allocations")
@@ -138,7 +145,7 @@ def build(docs: list[ParsedDoc], res: dict[str, Any], contacts: list[dict],
         if not num or num in seen:
             continue
         seen.add(num)
-        if num not in picked and re.search(DUPLICATE_PAT, reasons.get(num, ""), re.I):
+        if num not in picked and re.search(DUP_SKIP_PAT, reasons.get(num, ""), re.I):
             skipped.append(num)          # already in the register from its real run
             continue
         is_inv = doc.doc_type.upper().startswith("INVOICE")
@@ -200,6 +207,31 @@ def build(docs: list[ParsedDoc], res: dict[str, Any], contacts: list[dict],
 # --------------------------------------------------------------------------- #
 # merge into what is already stored
 # --------------------------------------------------------------------------- #
+def is_duplicate_row(df: pd.DataFrame) -> pd.Series:
+    """Rows that only exist because an invoice was uploaded a second time."""
+    if df is None or not len(df):
+        return pd.Series(dtype=bool)
+    rem = df.get("REMARK", pd.Series("", index=df.index)).astype(str)
+    pick = df.get("KORBER_PICK", pd.Series("", index=df.index)).astype(str).str.strip()
+    return rem.str.contains(DUPLICATE_PAT, case=False, na=False) & (pick != "Yes")
+
+
+def strip_duplicates(summary: pd.DataFrame, details: pd.DataFrame | None = None
+                     ) -> dict[str, Any]:
+    """Drop duplicate rows from the register — and their detail lines with them."""
+    if summary is None or not len(summary):
+        return {"summary": summary, "details": details, "dropped": 0, "invoices": []}
+    bad = is_duplicate_row(summary)
+    nums = [str(x) for x in summary.loc[bad, "TAX_INVOICE_NO"]]
+    out_s = summary[~bad].reset_index(drop=True)
+    out_d = details
+    if details is not None and len(details) and nums:
+        out_d = details[~details["TAX_INVOICE_NO"].astype(str).isin(set(nums))] \
+            .reset_index(drop=True)
+    return {"summary": out_s, "details": out_d, "dropped": int(bad.sum()),
+            "invoices": nums}
+
+
 def merge_summary(old: pd.DataFrame | None, new: pd.DataFrame) -> dict[str, Any]:
     """
     One row per invoice, updated in place.
@@ -209,6 +241,8 @@ def merge_summary(old: pd.DataFrame | None, new: pd.DataFrame) -> dict[str, Any]
     duplicate — only deleting the load does that (`mark_unpicked`).
     """
     cols = SUMMARY_COLS
+    if new is not None and len(new):          # belt and braces — never store one
+        new = new[~is_duplicate_row(new)].reset_index(drop=True)
     if old is None or not len(old):
         return {"data": new.reindex(columns=cols), "new": len(new), "updated": 0,
                 "picked_now": [n for n, k in zip(new["TAX_INVOICE_NO"], new["KORBER_PICK"])
@@ -350,8 +384,7 @@ def dashboard(summary: pd.DataFrame, date_from: Any = None, date_to: Any = None,
     if date_to is not None:
         d = d[d["_DATE"].isna() | (d["_DATE"] <= pd.Timestamp(date_to))]
     # Legacy rows written before duplicates were excluded — out of every number.
-    dup = d["REMARK"].astype(str).str.contains(DUPLICATE_PAT, case=False, na=False) & \
-        (d["KORBER_PICK"] != "Yes")
+    dup = is_duplicate_row(d)
     n_dup = int(dup.sum())
     d = d[~dup]
     if not len(d):
