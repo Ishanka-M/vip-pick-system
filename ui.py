@@ -36,7 +36,7 @@ import streamlit as st
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 2
+API = 3
 
 # --------------------------------------------------------------------------- #
 # the only fixed hues — chosen to sit on both near-white and near-black
@@ -193,6 +193,21 @@ code, kbd{{ font-family:var(--mono); font-size:.86em; color:inherit;
 .stamp.mute{{ color:var(--t-mute); }}
 .muted{{ color:var(--t-mute); }}
 
+/* ---------- KPI cards — a professional stat row for the Dashboard ---------- */
+.kpi-row{{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+  gap:10px; margin:8px 0 4px; }}
+.kpi{{ background:var(--fill-1); border:1px solid var(--line);
+  border-top:3px solid var(--line-2); border-radius:10px; padding:12px 14px; }}
+.kpi .kpi-l{{ font-family:var(--display); font-weight:600; font-size:.72rem;
+  text-transform:uppercase; letter-spacing:.09em; color:var(--t-mute); }}
+.kpi .kpi-v{{ font-family:var(--mono); font-weight:600; font-size:1.5rem;
+  color:inherit; margin-top:3px; line-height:1.1; }}
+.kpi .kpi-hint{{ font-size:.78rem; color:var(--t-mute); margin-top:3px; }}
+.kpi.ok{{ border-top-color:var(--ok); }} .kpi.ok .kpi-v{{ color:var(--ok-t); }}
+.kpi.warn{{ border-top-color:var(--accent); }} .kpi.warn .kpi-v{{ color:var(--warn-t); }}
+.kpi.stop{{ border-top-color:var(--stop); }} .kpi.stop .kpi-v{{ color:var(--stop-t); }}
+.kpi.info{{ border-top-color:var(--info); }} .kpi.info .kpi-v{{ color:var(--info-t); }}
+
 /* ---------- empty state ---------- */
 .empty{{ background:var(--fill-1); border:1px dashed var(--line-2);
   border-radius:var(--r); padding:26px 22px; text-align:center; }}
@@ -295,6 +310,23 @@ span[translate="no"], .material-icons, .material-symbols-rounded,
   font-variant:normal !important; white-space:nowrap !important;
   font-feature-settings:'liga' !important;
   -webkit-font-feature-settings:'liga' !important; }}
+
+/* ---------- camera input — the Packing scan screen ---------- */
+[data-testid="stCameraInput"] video, [data-testid="stCameraInput"] img{{
+  border-radius:var(--r); border:1px solid var(--line); }}
+[data-testid="stCameraInput"] button{{ min-height:46px; }}
+
+/* ---------- mobile — bigger tap targets, single-column KPIs ---------- */
+@media (max-width:640px){{
+  .stButton>button, .stDownloadButton>button, .stLinkButton>a{{
+    padding:.62rem 1rem; font-size:1rem; min-height:44px; }}
+  .stTextInput input, .stNumberInput input, .stDateInput input{{ min-height:42px; }}
+  .kpi-row{{ grid-template-columns:repeat(2,1fr); }}
+  .kpi .kpi-v{{ font-size:1.24rem; }}
+  .tb-title{{ font-size:1.12rem; }}
+  [data-testid="stTabs"] [role="tab"] p{{ font-size:.84rem; }}
+  .rail{{ flex-wrap:wrap; }} .rail .st{{ flex:1 1 46%; border-bottom:1px solid var(--line); }}
+}}
 </style>
 """
 
@@ -383,6 +415,22 @@ def stamp(text: str, tone: str = "mute") -> str:
 
 def muted(text: str) -> str:
     return f"<span class='muted'>{_esc(text)}</span>"
+
+
+def kpi_row(items: list[dict]) -> None:
+    """
+    A row of stat cards — for the Dashboard, sturdier than bare st.metric.
+    items: [{"label":..., "value":..., "hint":..., "tone":"ok|warn|stop|info|"}]
+    """
+    cells = []
+    for it in items:
+        tone = it.get("tone", "")
+        hint = (f"<div class='kpi-hint'>{_esc(it.get('hint',''))}</div>"
+                if it.get("hint") else "")
+        cells.append(
+            f"<div class='kpi {tone}'><div class='kpi-l'>{_esc(it.get('label',''))}</div>"
+            f"<div class='kpi-v'>{_esc(it.get('value',''))}</div>{hint}</div>")
+    st.markdown(f"<div class='kpi-row'>{''.join(cells)}</div>", unsafe_allow_html=True)
 
 
 def doc_card(doc_id: str, meta: str, tone: str = "ok", badge: str = "",

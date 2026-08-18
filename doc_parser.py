@@ -20,7 +20,7 @@ import pdfplumber
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 3
+API = 4
 
 # --------------------------------------------------------------------------- #
 # Item-code helpers
@@ -78,7 +78,9 @@ class DocLine:
     customer_po: str = ""
     sales_order: str = ""
     so_line: str = ""
-    line_amount: float | None = None
+    line_amount: float | None = None       # Ext Price (pre-tax)
+    unit_price: float | None = None
+    line_total: float | None = None        # "Total" column — incl. tax, per line
 
     @property
     def base(self) -> str:
@@ -101,6 +103,7 @@ class ParsedDoc:
     lines: list[DocLine] = field(default_factory=list)
     declared_qty: float | None = None      # "Total Quantity"
     declared_amount: float | None = None   # "Sub Total" / "Grand Total"
+    total_incl_tax: float | None = None    # "Total Amount (Incl. Tax)" — invoice grand total
     notes: list[str] = field(default_factory=list)
 
     # ---------------- completeness ---------------- #
@@ -297,6 +300,10 @@ def _parse_invoice(pdf: pdfplumber.PDF, filename: str) -> ParsedDoc:
     m = re.search(r"Sub Total:\s*(?:INR)?\s*([\d,]+\.\d{2})", full_text)
     if m:
         doc.declared_amount = _num(m.group(1))
+    m = re.search(r"Total Amount\s*\(Incl\.?\s*Tax\)\s*:?\s*(?:INR)?\s*([\d,]+\.\d{2})",
+                  full_text, re.I)
+    if m:
+        doc.total_incl_tax = _num(m.group(1))
 
     bounds: list[float] = []
     labels: list[str] = []
@@ -340,6 +347,8 @@ def _parse_invoice(pdf: pdfplumber.PDF, filename: str) -> ParsedDoc:
             i_qty = _col(labels, "Qty", "Quantity")
             i_uom = _col(labels, "UOM")
             i_ext = _col(labels, "Ext Price")
+            i_unit = _col(labels, "Unit Price")
+            i_total = _col(labels, "Total")
 
             def cell(idx: int | None) -> str:
                 return cells[idx].strip() if (idx is not None and idx < len(cells)) else ""
@@ -364,6 +373,8 @@ def _parse_invoice(pdf: pdfplumber.PDF, filename: str) -> ParsedDoc:
                     sales_order=cell(i_so),
                     so_line=cell(i_sol),
                     line_amount=_num(cell(i_ext)),
+                    unit_price=_num(cell(i_unit)),
+                    line_total=_num(cell(i_total)),
                 )
                 doc.lines.append(cur)
                 continue
@@ -462,6 +473,9 @@ def _parse_challan(pdf: pdfplumber.PDF, filename: str) -> ParsedDoc:
     m = re.search(r"Grand Total[^0-9]*([\d,]+\.\d{2})", full_text)
     if m:
         doc.declared_amount = _num(m.group(1))
+    m = re.search(r"Total Amount\s*\(Incl\.?\s*Tax\)\s*:?\s*(?:INR)?\s*([\d,]+\.\d{2})",
+                  full_text, re.I)
+    doc.total_incl_tax = _num(m.group(1)) if m else doc.declared_amount
 
     seen: set[tuple] = set()
     for page in pdf.pages:
@@ -523,6 +537,7 @@ def _parse_challan(pdf: pdfplumber.PDF, filename: str) -> ParsedDoc:
                         qty=float(qty),
                         uom=cell(i_uom) or "EA",
                         line_amount=amt,
+                        line_total=amt,
                     )
                 )
 

@@ -32,11 +32,12 @@ streamlit run app.py
 
 | File | API |
 |---|---|
-| `gsheet.py` | 5 |
-| `invoice_register.py` | 5 |
+| `gsheet.py` | 6 |
+| `invoice_register.py` | 6 |
 | `pick_engine.py` · `pick_pdf.py` | 4 |
-| `doc_parser.py` | 3 |
-| `sku_master.py` · `ui.py` | 2 |
+| `doc_parser.py` | 4 |
+| `ui.py` | 3 |
+| `sku_master.py` | 2 |
 
 **`.streamlit/config.toml` එක repo එකට push කරන්න අමතක කරන්න එපා.** Dropdown ·
 date picker · `st.dataframe` (canvas එකක් — CSS එකට ළඟා වෙන්න බෑ) වගේ widget වල
@@ -753,3 +754,79 @@ rerun එකකට වැය වෙන එක තමයි ඇත්ත speed �
 
 Download cache එකේ key එක frame එකේ **content hash** එකක් — data වෙනස් වුණාම
 තනියම rebuild වෙනවා, පරණ file එකක් කවදාවත් යන්නේ නෑ.
+
+---
+
+## 25. Roles — Admin / Dashboard / Packing
+
+App එක open කරාම login screen එකක්. තුනක් තෝරගන්න:
+
+| Role | Access | Password |
+|---|---|---|
+| **Admin** | හැම එකක්ම — Pick, Dashboard, Register, Loads, SKU master, Search, Stock, History, Reset | ඔව් — default `Isha@1996`, `secrets.toml`→`[app] admin_password` එකෙන් වෙනස් කරන්න පුළුවන් (නැත්නම් reset password එකම) |
+| **Dashboard** | **Pending vs picked** සහ **Invoice register** විතරයි — upload / pick / reset කිසිම දෙයක් නෑ | නෑ |
+| **Packing** | QR scan interface එක විතරයි | නෑ |
+
+Sidebar එකේ **Switch role / Log out** button එකෙන් ආපහු login screen එකට.
+Session එකක් per browser tab — වෙන කෙනෙක් login වෙන එකෙන් මේකට බලපෑමක් නෑ.
+
+---
+
+## 26. Packing — QR scan (mobile camera)
+
+Login → **Packing**. Mobile camera එකෙන්:
+
+1. **Scan QR code** click කරාම phone එකේ native camera app එක open වෙනවා
+2. Pick sheet PDF එකේ **LOAD_ID QR** එකට camera එක point කරලා photo එකක් capture කරන්න
+3. App එක photo එකෙන් QR එක decode කරලා (OpenCV), `TAX_INVOICE_NO` එකට match කරනවා
+4. හම්බුණොත් — `INVOICE_SUMMARY` සහ `INVOICE_DETAIL` දෙකේම **PACKING = Completed**
+   ලෙස update වෙනවා, ඒ instant එකේම save
+5. **Scan the next one** button එකෙන් ඊළඟ QR එකට
+
+Live video scan එකක් නෙවෙයි — photo capture + decode, ඒක mobile browser හැම එකකම
+reliable විදිහට වැඩ කරන approach එක. QR එකක් හම්බුනේ නැත්නම් / LOAD_ID එක register
+එකේ නැත්නම් error message එකක්. Session එකේ scan කරපු ලැයිස්තුවක් පහළින්.
+
+---
+
+## 27. Picking / Packing / Dispatch — status columns
+
+`INVOICE_SUMMARY` සහ `INVOICE_DETAIL` දෙකේම තුන් column — `KORBER_PICK`
+(මේ app එකෙන්ම pallet allocate කළාද) එකෙන් **independent**, physical warehouse
+execution එක track කරන්නේ:
+
+| Column | `Completed` වෙන්නේ කොහොමද |
+|---|---|
+| **PICKING** | `Pick_Live_status` upload — `Open Pick = 0` · හෝ Invoice sales report match (පහළින්) |
+| **PACKING** | Packing role QR scan (§ 26) |
+| **DISPATCH** | `Pick_Live_status` upload — `Shipped Pick ≠ 0` හෝ `Total Pick = Shipped Pick` |
+
+**Pending → Completed විතරයි** — කවදාවත් ආපහු Pending වෙන්නේ නෑ (invoice එක ආපහු
+upload කළත්, stale report එකක් upload කළත්). Register tab → **Update status**
+sub-tab එකෙන් file 2ක් upload කරන්න පුළුවන් (Load Id / Tax Invoice No. එකෙන්
+match වෙනවා):
+
+* **Pick_Live_status** (WMS export) — `Load Id`, `Open Pick`, `Total Pick`,
+  `Shipped Pick` columns ඕන
+* **Invoice sales report** (ERP export) — `Tax Invoice No.`, `Item Code` /
+  `Customer Item`, `QTY` columns ඕන. Line එකේ qty එක document qty එකට **හරියටම**
+  ගැලපුනොත් ඒ line එකට Picking confirm, invoice එකේ line ඔක්කොම confirm වුණාම
+  invoice එකටම Picking = Completed
+
+Admin සහ Dashboard role දෙකටම මේ upload දෙක Register tab එකේ තියෙනවා.
+
+---
+
+## 28. Invoice Unit Price / Total
+
+Invoice PDF එකේ line table එකේ **Unit Price** සහ **Total** column දෙක, සහ
+document එකේ **Total Amount (Incl. Tax)** — දැන් parse වෙලා register එකට save
+වෙනවා:
+
+| Register | Column |
+|---|---|
+| `INVOICE_DETAIL` | `UNIT_PRICE`, `LINE_TOTAL` (line එකේ Total — tax සමග) |
+| `INVOICE_SUMMARY` | `TOTAL_INCL_TAX` (document එකේ Total Amount (Incl. Tax)) |
+
+Delivery Challan එකකට Unit Price column එකක් නෑ — `LINE_TOTAL` එකට Total
+Amount (incl. tax) column එකේ අගය, `TOTAL_INCL_TAX` එකට Grand Total එක.

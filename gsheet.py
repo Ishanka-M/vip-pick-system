@@ -29,7 +29,7 @@ import pick_engine as E
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 5
+API = 6
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -754,6 +754,61 @@ def register_unpick(sa_info: dict, sheet_key: str, invoice_no: str,
         n = _replace_ws(book, WS_INV_SUM, R.SUMMARY_COLS, upd)
     cache_clear(sheet_key)
     return n
+
+
+# --------------------------------------------------------------------------- #
+# Picking / Packing / Dispatch — status updates
+# --------------------------------------------------------------------------- #
+# Each of these reads INVOICE_SUMMARY + INVOICE_DETAIL fresh *inside* the lock,
+# applies the update, and writes both back in the same lock — same pattern as
+# save_register — so two people uploading a status report / scanning a QR at
+# the same time never clobber each other.
+def apply_live_status(sa_info: dict, sheet_key: str, live_df,
+                      owner: str = "") -> dict[str, Any]:
+    with sheet_lock(sa_info, sheet_key, "REGISTER", owner=owner):
+        book = open_book(sa_info, sheet_key)
+        cur_s = read_ws(sa_info, sheet_key, WS_INV_SUM, use_cache=False)
+        cur_d = read_ws(sa_info, sheet_key, WS_INV_DET, use_cache=False)
+        res = R.apply_pick_live_status(cur_s, cur_d, live_df)
+        if not res.get("error"):
+            write_table(book, WS_INV_SUM, R.SUMMARY_COLS, res["summary"],
+                        prev_rows=len(cur_s))
+            write_table(book, WS_INV_DET, R.DETAIL_COLS, res["details"],
+                        prev_rows=len(cur_d))
+    cache_clear(sheet_key)
+    return res
+
+
+def scan_packing(sa_info: dict, sheet_key: str, load_id: str,
+                 owner: str = "") -> dict[str, Any]:
+    with sheet_lock(sa_info, sheet_key, "REGISTER", owner=owner):
+        book = open_book(sa_info, sheet_key)
+        cur_s = read_ws(sa_info, sheet_key, WS_INV_SUM, use_cache=False)
+        cur_d = read_ws(sa_info, sheet_key, WS_INV_DET, use_cache=False)
+        res = R.apply_packing_scan(cur_s, cur_d, load_id, user=owner)
+        if res["found"] and not res["already"]:
+            write_table(book, WS_INV_SUM, R.SUMMARY_COLS, res["summary"],
+                        prev_rows=len(cur_s))
+            write_table(book, WS_INV_DET, R.DETAIL_COLS, res["details"],
+                        prev_rows=len(cur_d))
+    cache_clear(sheet_key)
+    return res
+
+
+def apply_sales_report(sa_info: dict, sheet_key: str, sales_df,
+                       owner: str = "") -> dict[str, Any]:
+    with sheet_lock(sa_info, sheet_key, "REGISTER", owner=owner):
+        book = open_book(sa_info, sheet_key)
+        cur_s = read_ws(sa_info, sheet_key, WS_INV_SUM, use_cache=False)
+        cur_d = read_ws(sa_info, sheet_key, WS_INV_DET, use_cache=False)
+        res = R.apply_sales_report(cur_s, cur_d, sales_df)
+        if not res.get("error"):
+            write_table(book, WS_INV_SUM, R.SUMMARY_COLS, res["summary"],
+                        prev_rows=len(cur_s))
+            write_table(book, WS_INV_DET, R.DETAIL_COLS, res["details"],
+                        prev_rows=len(cur_d))
+    cache_clear(sheet_key)
+    return res
 
 
 # --------------------------------------------------------------------------- #

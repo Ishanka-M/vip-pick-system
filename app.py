@@ -35,9 +35,9 @@ st.set_page_config(
 # Streamlit Cloud redacts exception text, so a half-updated deploy used to die
 # with an unreadable TypeError. Every module carries an API number; refuse to
 # run against a stale one and say exactly which file to replace.
-_NEEDS = {"pick_engine.py": (E, 4), "doc_parser.py": (P, 3), "pick_pdf.py": (PP, 4),
-          "sku_master.py": (SKU, 2), "ui.py": (ui, 2),
-          "invoice_register.py": (R, 5)}
+_NEEDS = {"pick_engine.py": (E, 4), "doc_parser.py": (P, 4), "pick_pdf.py": (PP, 4),
+          "sku_master.py": (SKU, 2), "ui.py": (ui, 3),
+          "invoice_register.py": (R, 6)}
 _STALE = [(f, getattr(m, "API", 0), n) for f, (m, n) in _NEEDS.items()
           if getattr(m, "API", 0) < n]
 if _STALE:
@@ -170,7 +170,564 @@ sheet_key = str(conf.get("data_sheet", "")).strip()
 autosave = bool(conf.get("auto_save", True))
 gs_ready = bool(sa_info and sheet_key)
 
+
+def _register_frames():
+    """Register data for the Dashboard and the Register tab — read once."""
+    empty = (pd.DataFrame(columns=R.SUMMARY_COLS), pd.DataFrame(columns=R.DETAIL_COLS))
+    if gs_ready:
+        if "reg_cache" not in st.session_state:
+            try:
+                import gsheet
+                st.session_state["reg_cache"] = gsheet.read_register(sa_info, sheet_key)
+            except Exception as ex:
+                st.session_state["reg_cache"] = empty
+                st.session_state["reg_error"] = str(ex)
+        a, b = st.session_state["reg_cache"]
+    elif st.session_state.get("reg_run"):
+        a, b = st.session_state["reg_run"]
+    else:
+        a, b = empty
+    a = a if a is not None and len(a) else empty[0]
+    b = b if b is not None and len(b) else empty[1]
+    # A sheet written by an older release is missing columns added since (e.g.
+    # PICKING/PACKING/DISPATCH) until the next save rewrites its header — every
+    # reader downstream can assume the full, current schema because of this.
+    a = a.reindex(columns=R.SUMMARY_COLS, fill_value="")
+    b = b.reindex(columns=R.DETAIL_COLS, fill_value="")
+    for c in R.STATUS_COLS:
+        a[c] = a[c].replace("", R.STATUS_PENDING)
+        b[c] = b[c].replace("", R.STATUS_PENDING)
+    # Rows written before duplicates were excluded are filtered here, so the
+    # Register tab, the Dashboard and every report see the same thing.
+    clean = R.strip_duplicates(a, b)
+    st.session_state["reg_dupes"] = clean["dropped"]
+    st.session_state["reg_dupe_ids"] = clean["invoices"]
+    return clean["summary"], clean["details"]
+
+
+def _dashboard_tab_body() -> None:
+    ui.section("Pending vs picked", hint="how much is still to go")
+    d_sum, d_det = _register_frames()
+
+    if not len(d_sum):
+        ui.empty("Nothing to show yet",
+                 "Generate a pick and this fills up from the invoice register.", "📊")
+    else:
+        with st.expander("Filter", expanded=False):
+            fa, fb, fc = st.columns(3)
+            dates = d_sum["TAX_INVOICE_DATE"].map(R.parse_date).dropna()
+            lo = dates.min().date() if len(dates) else datetime.now().date()
+            hi = dates.max().date() if len(dates) else datetime.now().date()
+            d_from = fa.date_input("Invoice date from", value=lo, key="dash_from")
+            d_to = fb.date_input("to", value=hi, key="dash_to")
+            d_types = fc.multiselect("Document type",
+                                     sorted(d_sum["DOC_TYPE"].astype(str).unique()),
+                                     key="dash_types")
+        dash = R.dashboard(d_sum, d_from, d_to, d_types or None)
+        k = dash["kpi"]
+        _nd = st.session_state.get("reg_dupes", 0) or dash.get("duplicates", 0)
+        if _nd:
+            st.caption(f"{_nd} duplicate row(s) left out — a duplicate is an invoice "
+                       "that was already picked, not outstanding work. Clear them on "
+                       "the Register tab.")
+
+        # ---- the answer, first ----
+        pct = k["pct"] / 100.0
+        st.progress(min(1.0, max(0.0, pct)),
+                    text=f"{k['picked']} of {k['total']} invoices picked · "
+                         f"{k['pct']:.0f}%")
+        ui.kpi_row([
+            {"label": "Pending invoices", "value": k["pending"], "tone": "warn"},
+            {"label": "Pending qty", "value": E._qty_str(k["qty_pending"]), "tone": "warn"},
+            {"label": "Picked qty", "value": E._qty_str(k["qty_picked"]), "tone": "ok"},
+            {"label": "Oldest pending", "value": f"{k['oldest']} d",
+             "hint": "days since invoice date"},
+        ])
+        ui.eyebrow("Warehouse execution")
+        ui.kpi_row([
+            {"label": "Picking done", "value": f"{k['picking_done']} / {k['total']}",
+             "tone": "info"},
+            {"label": "Packing done", "value": f"{k['packing_done']} / {k['total']}",
+             "tone": "info"},
+            {"label": "Dispatch done", "value": f"{k['dispatch_done']} / {k['total']}",
+             "tone": "ok"},
+        ])
+
+        if not k["pending"]:
+            st.success("Nothing pending — every invoice in this range is picked.")
+        else:
+            c1, c2 = st.columns([1.1, 1])
+            with c1:
+                ui.eyebrow("Why they are waiting")
+                br = dash["by_reason"]
+                if len(br):
+                    st.bar_chart(br.set_index("REASON")["QTY"], horizontal=True,
+                                 color="#F0A81C", height=max(180, 46 * len(br)))
+                    st.dataframe(br, hide_index=True, width="stretch")
+            with c2:
+                ui.eyebrow("Who is waiting")
+                bc = dash["by_customer"].head(8)
+                if len(bc):
+                    st.bar_chart(bc.set_index("CUSTOMER_NAME")["QTY"], horizontal=True,
+                                 color="#3E8FD0", height=max(180, 46 * len(bc)))
+                    st.dataframe(bc, hide_index=True, width="stretch")
+
+            ui.eyebrow("Oldest first — chase these")
+            pend = dash["pending"]
+            st.dataframe(pend, hide_index=True, width="stretch", height=340,
+                         column_config={
+                             "DAYS": st.column_config.NumberColumn(
+                                 "Days", help="Since the invoice date", format="%d d"),
+                             "QTY": st.column_config.NumberColumn("Qty"),
+                             "SHORT_QTY": st.column_config.NumberColumn("Still to pick")})
+
+            st.caption("A pending invoice only clears when it is picked — upload it "
+                       "again on the Pick tab and the register updates itself.")
+
+        # ---- every report, from here, under the same filter ----
+        st.divider()
+        ui.eyebrow("Download")
+        d_stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        XL = ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        dash_sum = dash["summary"]
+        dash_det = R.details_for(d_det, dash["invoices"])
+        pend = dash["pending"]
+
+        q1, q2, q3, q4 = st.columns(4)
+        q1.download_button("Summary report (Excel)",
+                           data=_bytes(f"ds{_fkey(dash_sum)}", R.summary_excel, dash_sum),
+                           file_name=f"Invoice_Summary_{d_stamp}.xlsx", mime=XL,
+                           width="stretch", key="dash_sum_xl")
+        q2.download_button("Details report (Excel)",
+                           data=_bytes(f"dd{_fkey(dash_det)}", R.details_excel, dash_det),
+                           file_name=f"Invoice_Details_{d_stamp}.xlsx", mime=XL,
+                           width="stretch", key="dash_det_xl")
+        q3.download_button("Pending report (Excel)",
+                           data=_bytes(f"dp{_fkey(dash['pending'], dash_sum)}",
+                                       R.pending_excel, dash),
+                           file_name=f"Pending_{d_stamp}.xlsx", mime=XL,
+                           width="stretch", key="dash_pend_xl",
+                           disabled=not k["pending"])
+        q4.download_button("Pending list (CSV)", data=pend.to_csv(index=False).encode(),
+                           file_name=f"Pending_{d_stamp}.csv", mime="text/csv",
+                           width="stretch", key="dash_pend_csv",
+                           disabled=not k["pending"])
+        st.caption(f"The filter above applies to all four — "
+                   f"{len(dash_sum)} invoices · {len(dash_det)} lines · "
+                   f"{k['pending']} pending.")
+
+
+def _status_update_ui(reg_s: pd.DataFrame, reg_d: pd.DataFrame) -> None:
+    """Pick_Live_status + Invoice sales report -> Picking / Packing / Dispatch."""
+    st.caption("Upload the WMS **Pick_Live_status** report and/or the ERP "
+               "**Invoice sales report** to refresh Picking / Dispatch here — "
+               "matched by Load Id / Tax Invoice No. Packing is set from the "
+               "**Packing** login's QR scan, not from here.")
+    if not gs_ready:
+        st.warning("No database connected — status updates cannot be saved.")
+        return
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("##### Pick_Live_status")
+        st.caption("Open Pick = 0 → Picking Completed. Shipped Pick ≠ 0, or "
+                   "Total Pick = Shipped Pick → Dispatch Completed.")
+        f_live = st.file_uploader("Pick_Live_status (Excel)", type=["xlsx", "xls"],
+                                  key="live_status_up")
+        if f_live is not None and st.button("Apply Pick_Live_status", width="stretch",
+                                            key="live_status_apply"):
+            try:
+                live_df = pd.read_excel(f_live)
+                import gsheet
+                res = gsheet.apply_live_status(sa_info, sheet_key, live_df, owner=USER)
+                if res.get("error"):
+                    st.error(res["error"])
+                else:
+                    st.session_state.pop("reg_cache", None)
+                    st.success(f"Picking marked Completed on {res['picking_done']} row(s) · "
+                              f"Dispatch on {res['dispatch_done']} row(s).")
+                    if res["unmatched"]:
+                        shown = ", ".join(res["unmatched"][:15])
+                        st.caption(f"{len(res['unmatched'])} Load Id(s) in the file were not "
+                                  f"found in the register: {shown}"
+                                  + (" …" if len(res["unmatched"]) > 15 else ""))
+                    with st.expander("What the file said, row by row"):
+                        st.dataframe(res["report"], hide_index=True, width="stretch")
+                    st.rerun()
+            except Exception as ex:
+                st.error(f"Could not read/apply that file: {ex}")
+
+    with c2:
+        st.markdown("##### Invoice sales report")
+        st.caption("Matched on Tax Invoice No. + Item Code / Customer Item + Qty. "
+                   "A line whose quantity matches exactly confirms Picking.")
+        f_sales = st.file_uploader("Invoice sales report (Excel)", type=["xlsx", "xls"],
+                                   key="sales_report_up")
+        if f_sales is not None and st.button("Apply sales report", width="stretch",
+                                             key="sales_report_apply"):
+            try:
+                sales_df = pd.read_excel(f_sales)
+                import gsheet
+                res = gsheet.apply_sales_report(sa_info, sheet_key, sales_df, owner=USER)
+                if res.get("error"):
+                    st.error(res["error"])
+                else:
+                    st.session_state.pop("reg_cache", None)
+                    st.success(f"{res['matched']} line(s) matched · Picking marked Completed "
+                              f"on {res['invoices_completed']} whole invoice(s).")
+                    with st.expander("Reconciliation, line by line"):
+                        st.dataframe(res["report"], hide_index=True, width="stretch",
+                                    height=340)
+                    st.rerun()
+            except Exception as ex:
+                st.error(f"Could not read/apply that file: {ex}")
+
+
+def _register_tab_body() -> None:
+    ui.section("Invoice register",
+               hint="every document that has been uploaded, picked or not")
+
+    reg_s, reg_d = _register_frames()
+    _ndup = st.session_state.get("reg_dupes", 0)
+    if _ndup:
+        with st.container(border=True):
+            c_a, c_b = st.columns([3, 1])
+            c_a.markdown(
+                ui.stamp(f"{_ndup} duplicate rows hidden", "warn") + " &nbsp;" +
+                ui.muted("Invoices that were already picked in an earlier run — "
+                         "they are left out of this table, both reports and the "
+                         "dashboard. Clear them to tidy the sheet itself."),
+                unsafe_allow_html=True)
+            c_b.write("")
+            if c_b.button("Clear them", width="stretch", disabled=not gs_ready):
+                try:
+                    import gsheet
+                    raw_s, raw_d = gsheet.read_register(sa_info, sheet_key, fresh=True)
+                    clean = R.strip_duplicates(raw_s, raw_d)
+                    book = gsheet.open_book(sa_info, sheet_key)
+                    with gsheet.sheet_lock(sa_info, sheet_key, "REGISTER", owner=USER):
+                        gsheet.write_table(book, gsheet.WS_INV_SUM, R.SUMMARY_COLS,
+                                           clean["summary"], prev_rows=len(raw_s))
+                        gsheet.write_table(book, gsheet.WS_INV_DET, R.DETAIL_COLS,
+                                           clean["details"], prev_rows=len(raw_d))
+                    gsheet.cache_clear(sheet_key)
+                    st.session_state.pop("reg_cache", None)
+                    st.toast(f"Removed {clean['dropped']} duplicate rows", icon="🧹")
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"Cleanup error: {ex}")
+    if st.session_state.get("reg_error"):
+        st.warning(f"Register read error: {st.session_state['reg_error']}")
+    elif not gs_ready and st.session_state.get("reg_run"):
+        st.info("No database connected — showing this session's run only.")
+
+    if not len(reg_s):
+        ui.empty("Nothing registered yet",
+                 "Generate a pick and every uploaded document lands here.", "🗒️")
+    else:
+        yes = (reg_s["KORBER_PICK"].astype(str) == "Yes").sum()
+        ui.kpi_row([
+            {"label": "Invoices", "value": len(reg_s)},
+            {"label": "Körber picked", "value": int(yes), "tone": "ok"},
+            {"label": "Not picked", "value": int(len(reg_s) - yes), "tone": "warn"},
+            {"label": "MRP", "value": int((reg_s["MRP"].astype(str) == "Yes").sum())},
+            {"label": "Picking done",
+             "value": int((reg_s["PICKING"].astype(str) == R.STATUS_DONE).sum()),
+             "tone": "info"},
+            {"label": "Packing done",
+             "value": int((reg_s["PACKING"].astype(str) == R.STATUS_DONE).sum()),
+             "tone": "info"},
+            {"label": "Dispatch done",
+             "value": int((reg_s["DISPATCH"].astype(str) == R.STATUS_DONE).sum()),
+             "tone": "ok"},
+        ])
+
+        f1, f2, f3 = st.columns([2, 1, 1])
+        rq = f1.text_input("Search", placeholder="invoice no · customer · item · remark",
+                           key="reg_q")
+        fk = f2.multiselect("Körber Pick", ["Yes", "No"], key="reg_k")
+        fm = f3.multiselect("MRP", ["Yes", "No"], key="reg_m")
+
+        vs, vd = reg_s.copy(), reg_d.copy()
+        if fk:
+            vs = vs[vs["KORBER_PICK"].astype(str).isin(fk)]
+        if fm:
+            vs = vs[vs["MRP"].astype(str).isin(fm)]
+        if rq.strip():
+            vs = R.search(vs, rq)
+        vd = vd[vd["TAX_INVOICE_NO"].astype(str).isin(set(vs["TAX_INVOICE_NO"].astype(str)))]
+
+        _sum_view_cols = R.SUMMARY_COLS[:8] + ["TOTAL_INCL_TAX"] + R.STATUS_COLS
+        _det_view_cols = R.DETAIL_COLS[:11] + ["UNIT_PRICE", "LINE_TOTAL"] + R.STATUS_COLS
+
+        t_sum, t_det, t_stat = st.tabs(["Summary", "Details", "Update status"])
+        with t_sum:
+            st.dataframe(vs[_sum_view_cols], hide_index=True, width="stretch",
+                         height=430)
+            with st.expander("All columns"):
+                st.dataframe(vs, hide_index=True, width="stretch", height=380)
+        with t_det:
+            st.caption("One row per document line, with the pallets it came off.")
+            st.dataframe(vd[_det_view_cols], hide_index=True, width="stretch", height=430)
+            with st.expander("All columns"):
+                st.dataframe(vd, hide_index=True, width="stretch", height=380)
+        with t_stat:
+            _status_update_ui(reg_s, reg_d)
+
+        ui.eyebrow("Download")
+        stamp2 = datetime.now().strftime("%Y%m%d_%H%M")
+        dl1, dl2 = st.columns(2)
+        dl1.download_button("Summary report (Excel)",
+                            data=_bytes(f"rs{_fkey(vs)}", R.summary_excel, vs),
+                            file_name=f"Invoice_Summary_{stamp2}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument."
+                                 "spreadsheetml.sheet", width="stretch")
+        dl2.download_button("Details report (Excel)",
+                            data=_bytes(f"rd{_fkey(vd)}", R.details_excel, vd),
+                            file_name=f"Invoice_Details_{stamp2}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument."
+                                 "spreadsheetml.sheet", width="stretch")
+        st.caption(f"Downloading {len(vs)} invoices and {len(vd)} lines — the filters "
+                   "above apply to both files. The **Dashboard** tab has the same two "
+                   "reports filtered by invoice date instead.")
+
+        # ---- remarks are operational notes, so let them be edited ----
+        with st.expander("Edit remarks"):
+            st.caption("A remark on a picked invoice is kept; picking a `No` again "
+                       "clears it automatically.")
+            ed = st.data_editor(
+                vs[["TAX_INVOICE_NO", "CUSTOMER_NAME", "KORBER_PICK", "REMARK"]],
+                hide_index=True, width="stretch", height=280, key="reg_remark",
+                column_config={
+                    "TAX_INVOICE_NO": st.column_config.TextColumn(disabled=True),
+                    "CUSTOMER_NAME": st.column_config.TextColumn(disabled=True),
+                    "KORBER_PICK": st.column_config.TextColumn(disabled=True)})
+            if st.button("Save remarks", disabled=not gs_ready):
+                try:
+                    import gsheet
+                    upd = reg_s.copy()
+                    idx = {str(v): i for i, v in enumerate(upd["TAX_INVOICE_NO"])}
+                    for _, r in ed.iterrows():
+                        i = idx.get(str(r["TAX_INVOICE_NO"]))
+                        if i is not None:
+                            upd.iat[i, upd.columns.get_loc("REMARK")] = str(r["REMARK"])
+                    gsheet.save_register(sa_info, sheet_key, upd.head(0), reg_d.head(0),
+                                         owner=USER)
+                    book = gsheet.open_book(sa_info, sheet_key)
+                    gsheet._replace_ws(book, gsheet.WS_INV_SUM, R.SUMMARY_COLS, upd)
+                    gsheet.cache_clear(sheet_key)
+                    st.session_state.pop("reg_cache", None)
+                    st.toast("Remarks saved", icon="📝")
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"Save error: {ex}")
+
+    # ---- the MRP rule lives here ----
+    with st.expander("MRP contacts — the rule behind the Yes / No"):
+        st.caption("A document is **MRP = Yes** when its `Contact Person` / `Email` "
+                   "matches one of these. Email wins when the document carries one.")
+        mrp_ed = st.data_editor(pd.DataFrame(MRP_CONTACTS, columns=["NAME", "EMAIL"]),
+                                num_rows="dynamic", width="stretch", hide_index=True,
+                                key="mrp_editor")
+        m1, m2 = st.columns(2)
+        if m1.button("Save MRP contacts", type="primary", width="stretch"):
+            st.session_state["mrp_contacts"] = R.load_contacts(
+                mrp_ed.to_dict("records"))
+            if gs_ready:
+                try:
+                    import gsheet
+                    gsheet.save_setting(sa_info, sheet_key, "MRP_CONTACTS",
+                                        R.dump_contacts(mrp_ed))
+                except Exception as ex:
+                    st.error(f"Save error: {ex}")
+            st.toast("MRP contacts saved — re-run a pick to apply", icon="✅")
+            st.rerun()
+        if m2.button("Reset to default", width="stretch"):
+            st.session_state["mrp_contacts"] = R.load_contacts(None)
+            if gs_ready:
+                try:
+                    import gsheet
+                    gsheet.save_setting(sa_info, sheet_key, "MRP_CONTACTS", "")
+                except Exception:
+                    pass
+            st.rerun()
+        st.caption("Changing this does not rewrite invoices already in the register — "
+                   "it applies from the next pick run.")
+
+
+
+# --------------------------------------------------------------------------- #
+# Role gate — Admin (full access) / Dashboard (view only) / Packing (QR scan)
+# --------------------------------------------------------------------------- #
+def _admin_pw() -> str:
+    """Same idea as the reset password — a secret overrides the default."""
+    try:
+        return str(st.secrets.get("app", {}).get("admin_password", "") or RESET_PASSWORD)
+    except Exception:
+        return RESET_PASSWORD
+
+
+ADMIN_PASSWORD = _admin_pw()
+
+
+def _decode_qr(img_bytes: bytes) -> str:
+    """LOAD_ID QR -> plain text. The pick sheet encodes the raw LOAD_ID string."""
+    try:
+        import cv2
+        import numpy as np
+        arr = np.frombuffer(img_bytes, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return ""
+        data, _points, _straight = cv2.QRCodeDetector().detectAndDecode(img)
+        return str(data or "").strip()
+    except Exception:
+        return ""
+
+
+def _packing_card(row: dict) -> None:
+    ui.doc_card(
+        str(row.get("TAX_INVOICE_NO", "")),
+        f"{row.get('CUSTOMER_NAME','')} · Qty {row.get('QTY','')} · "
+        f"{row.get('LINES','')} lines · {row.get('DOC_TYPE','')}",
+        tone="ok", badge="Packing complete")
+
+
+def _role_sidebar(label: str, extra=None) -> None:
+    with st.sidebar:
+        st.markdown(f"<div class='eyebrow'>{label}</div>", unsafe_allow_html=True)
+        if st.button("Switch role / Log out", width="stretch"):
+            st.session_state.pop("role", None)
+            st.rerun()
+        st.divider()
+        if extra:
+            extra()
+
+
+def _render_login() -> None:
+    ui.topbar("OutBound Pick Generator", "Körber One · EFL · sign in", chips=[])
+    ui.section("Sign in", hint="choose how you're using the app on this device")
+    c1, c2, c3 = st.columns(3)
+    with c1, st.container(border=True):
+        st.markdown("#### Admin")
+        st.caption("Full access — pick, dashboard, register, loads, SKU master, "
+                   "search, stock, history, reset.")
+        pw = st.text_input("Password", type="password", key="login_admin_pw")
+        if st.button("Sign in as Admin", width="stretch", type="primary",
+                     key="login_admin_btn"):
+            if pw == ADMIN_PASSWORD:
+                st.session_state["role"] = "admin"
+                st.rerun()
+            else:
+                st.error("Wrong password.")
+    with c2, st.container(border=True):
+        st.markdown("#### Dashboard")
+        st.caption("View only — Pending vs picked and the Invoice register.")
+        st.write("")
+        if st.button("Continue as Dashboard", width="stretch", key="login_dash_btn"):
+            st.session_state["role"] = "dashboard"
+            st.rerun()
+    with c3, st.container(border=True):
+        st.markdown("#### Packing")
+        st.caption("Scan the OUTBOUND PICK SHEET QR code on your phone to mark "
+                   "packing complete.")
+        st.write("")
+        if st.button("Continue as Packing", width="stretch", key="login_pack_btn"):
+            st.session_state["role"] = "packing"
+            st.rerun()
+
+
+def _render_dashboard_role_ui() -> None:
+    _role_sidebar("Dashboard", lambda: st.caption(
+        "View only — Pending vs picked · Invoice register."))
+    ui.topbar("OutBound Pick Generator", "Körber One · Dashboard",
+             chips=[{"label": "DB", "value": "connected" if gs_ready else "local only",
+                    "tone": "ok" if gs_ready else "warn"},
+                   {"label": "USER", "value": USER, "tone": ""}])
+    t_dash, t_reg = st.tabs(["Dashboard", "Register"])
+    with t_dash:
+        _dashboard_tab_body()
+    with t_reg:
+        _register_tab_body()
+
+
+def _render_packing_ui() -> None:
+    def _extra():
+        name = st.text_input("Your name", value=USER, key="packing_user")
+        if name:
+            st.session_state["user_id"] = name
+
+    _role_sidebar("Packing", _extra)
+    ui.topbar("Packing", "Scan the OUTBOUND PICK SHEET QR code · Körber One",
+             chips=[{"label": "DB", "value": "connected" if gs_ready else "local only",
+                    "tone": "ok" if gs_ready else "warn"},
+                   {"label": "USER", "value": st.session_state.get("user_id", USER),
+                    "tone": ""}])
+    if not gs_ready:
+        ui.empty("No database connected", "Packing status cannot be saved without "
+                 "`[gcp_service_account]` / `[google_sheet]` in secrets.", "📵")
+        return
+
+    ui.section("Scan", hint="point the camera at the LOAD ID QR code and capture")
+    cam_n = st.session_state.get("pk_cam_n", 0)
+    shot = st.camera_input("Scan QR code", label_visibility="collapsed",
+                           key=f"pk_cam_{cam_n}")
+
+    if shot is not None:
+        code = _decode_qr(shot.getvalue())
+        if not code:
+            st.error("No QR code found in that photo — hold it steady and a "
+                     "little closer, then capture again.")
+        else:
+            try:
+                import gsheet
+                res = gsheet.scan_packing(sa_info, sheet_key, code,
+                                          owner=st.session_state.get("user_id", USER))
+            except Exception as ex:
+                st.error(f"Save error: {ex}")
+                res = None
+            if res is not None:
+                if not res["found"]:
+                    st.error(f"LOAD ID `{code}` was not found in the invoice register.")
+                elif res["already"]:
+                    st.info(f"`{code}` was already marked Packing = Completed.")
+                    _packing_card(res["invoice"])
+                else:
+                    st.success(f"Packing marked Completed for `{code}`.")
+                    _packing_card(res["invoice"])
+                    hist = st.session_state.setdefault("packing_scans", [])
+                    hist.insert(0, {"LOAD ID": code,
+                                    "Customer": res["invoice"].get("CUSTOMER_NAME", ""),
+                                    "At": datetime.now().strftime("%H:%M:%S")})
+                    st.session_state["packing_scans"] = hist[:20]
+        if st.button("Scan the next one", type="primary", width="stretch"):
+            st.session_state["pk_cam_n"] = cam_n + 1
+            st.rerun()
+
+    hist = st.session_state.get("packing_scans", [])
+    if hist:
+        st.divider()
+        ui.eyebrow("Scanned this session")
+        st.dataframe(pd.DataFrame(hist), hide_index=True, width="stretch")
+
+
+_role = st.session_state.get("role")
+if not _role:
+    _render_login()
+    st.stop()
+if _role == "packing":
+    _render_packing_ui()
+    st.stop()
+if _role == "dashboard":
+    _render_dashboard_role_ui()
+    st.stop()
+
 with st.sidebar:
+    st.markdown("<div class='eyebrow'>Admin</div>", unsafe_allow_html=True)
+    if st.button("Switch role / Log out", width="stretch", key="admin_logout"):
+        st.session_state.pop("role", None)
+        st.rerun()
+    st.divider()
     st.markdown("<div class='eyebrow'>Setup</div>", unsafe_allow_html=True)
 
     with st.expander("Warehouse & client", expanded=False):
@@ -1086,293 +1643,18 @@ with tab_gen:
 
 
 
-def _register_frames():
-    """Register data for the Dashboard and the Register tab — read once."""
-    empty = (pd.DataFrame(columns=R.SUMMARY_COLS), pd.DataFrame(columns=R.DETAIL_COLS))
-    if gs_ready:
-        if "reg_cache" not in st.session_state:
-            try:
-                import gsheet
-                st.session_state["reg_cache"] = gsheet.read_register(sa_info, sheet_key)
-            except Exception as ex:
-                st.session_state["reg_cache"] = empty
-                st.session_state["reg_error"] = str(ex)
-        a, b = st.session_state["reg_cache"]
-    elif st.session_state.get("reg_run"):
-        a, b = st.session_state["reg_run"]
-    else:
-        a, b = empty
-    a = a if a is not None and len(a) else empty[0]
-    b = b if b is not None and len(b) else empty[1]
-    # Rows written before duplicates were excluded are filtered here, so the
-    # Register tab, the Dashboard and every report see the same thing.
-    clean = R.strip_duplicates(a, b)
-    st.session_state["reg_dupes"] = clean["dropped"]
-    st.session_state["reg_dupe_ids"] = clean["invoices"]
-    return clean["summary"], clean["details"]
-
-
 # =========================================================================== #
 # TAB — Dashboard (pending vs picked)
 # =========================================================================== #
 with tab_dash:
-    ui.section("Pending vs picked", hint="how much is still to go")
-    d_sum, d_det = _register_frames()
-
-    if not len(d_sum):
-        ui.empty("Nothing to show yet",
-                 "Generate a pick and this fills up from the invoice register.", "📊")
-    else:
-        with st.expander("Filter", expanded=False):
-            fa, fb, fc = st.columns(3)
-            dates = d_sum["TAX_INVOICE_DATE"].map(R.parse_date).dropna()
-            lo = dates.min().date() if len(dates) else datetime.now().date()
-            hi = dates.max().date() if len(dates) else datetime.now().date()
-            d_from = fa.date_input("Invoice date from", value=lo, key="dash_from")
-            d_to = fb.date_input("to", value=hi, key="dash_to")
-            d_types = fc.multiselect("Document type",
-                                     sorted(d_sum["DOC_TYPE"].astype(str).unique()),
-                                     key="dash_types")
-        dash = R.dashboard(d_sum, d_from, d_to, d_types or None)
-        k = dash["kpi"]
-        _nd = st.session_state.get("reg_dupes", 0) or dash.get("duplicates", 0)
-        if _nd:
-            st.caption(f"{_nd} duplicate row(s) left out — a duplicate is an invoice "
-                       "that was already picked, not outstanding work. Clear them on "
-                       "the Register tab.")
-
-        # ---- the answer, first ----
-        pct = k["pct"] / 100.0
-        st.progress(min(1.0, max(0.0, pct)),
-                    text=f"{k['picked']} of {k['total']} invoices picked · "
-                         f"{k['pct']:.0f}%")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Pending invoices", k["pending"], delta_color="inverse")
-        m2.metric("Pending qty", E._qty_str(k["qty_pending"]), delta_color="inverse")
-        m3.metric("Picked qty", E._qty_str(k["qty_picked"]))
-        m4.metric("Oldest pending", f"{k['oldest']} d",
-                  help="Days since the invoice date of the oldest one still waiting.")
-
-        if not k["pending"]:
-            st.success("Nothing pending — every invoice in this range is picked.")
-        else:
-            c1, c2 = st.columns([1.1, 1])
-            with c1:
-                ui.eyebrow("Why they are waiting")
-                br = dash["by_reason"]
-                if len(br):
-                    st.bar_chart(br.set_index("REASON")["QTY"], horizontal=True,
-                                 color="#F0A81C", height=max(180, 46 * len(br)))
-                    st.dataframe(br, hide_index=True, width="stretch")
-            with c2:
-                ui.eyebrow("Who is waiting")
-                bc = dash["by_customer"].head(8)
-                if len(bc):
-                    st.bar_chart(bc.set_index("CUSTOMER_NAME")["QTY"], horizontal=True,
-                                 color="#3E8FD0", height=max(180, 46 * len(bc)))
-                    st.dataframe(bc, hide_index=True, width="stretch")
-
-            ui.eyebrow("Oldest first — chase these")
-            pend = dash["pending"]
-            st.dataframe(pend, hide_index=True, width="stretch", height=340,
-                         column_config={
-                             "DAYS": st.column_config.NumberColumn(
-                                 "Days", help="Since the invoice date", format="%d d"),
-                             "QTY": st.column_config.NumberColumn("Qty"),
-                             "SHORT_QTY": st.column_config.NumberColumn("Still to pick")})
-
-            st.caption("A pending invoice only clears when it is picked — upload it "
-                       "again on the Pick tab and the register updates itself.")
-
-        # ---- every report, from here, under the same filter ----
-        st.divider()
-        ui.eyebrow("Download")
-        d_stamp = datetime.now().strftime("%Y%m%d_%H%M")
-        XL = ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        dash_sum = dash["summary"]
-        dash_det = R.details_for(d_det, dash["invoices"])
-        pend = dash["pending"]
-
-        q1, q2, q3, q4 = st.columns(4)
-        q1.download_button("Summary report (Excel)",
-                           data=_bytes(f"ds{_fkey(dash_sum)}", R.summary_excel, dash_sum),
-                           file_name=f"Invoice_Summary_{d_stamp}.xlsx", mime=XL,
-                           width="stretch", key="dash_sum_xl")
-        q2.download_button("Details report (Excel)",
-                           data=_bytes(f"dd{_fkey(dash_det)}", R.details_excel, dash_det),
-                           file_name=f"Invoice_Details_{d_stamp}.xlsx", mime=XL,
-                           width="stretch", key="dash_det_xl")
-        q3.download_button("Pending report (Excel)",
-                           data=_bytes(f"dp{_fkey(dash['pending'], dash_sum)}",
-                                       R.pending_excel, dash),
-                           file_name=f"Pending_{d_stamp}.xlsx", mime=XL,
-                           width="stretch", key="dash_pend_xl",
-                           disabled=not k["pending"])
-        q4.download_button("Pending list (CSV)", data=pend.to_csv(index=False).encode(),
-                           file_name=f"Pending_{d_stamp}.csv", mime="text/csv",
-                           width="stretch", key="dash_pend_csv",
-                           disabled=not k["pending"])
-        st.caption(f"The filter above applies to all four — "
-                   f"{len(dash_sum)} invoices · {len(dash_det)} lines · "
-                   f"{k['pending']} pending.")
+    _dashboard_tab_body()
 
 
 # =========================================================================== #
 # TAB — Invoice register
 # =========================================================================== #
 with tab_reg:
-    ui.section("Invoice register",
-               hint="every document that has been uploaded, picked or not")
-
-    reg_s, reg_d = _register_frames()
-    _ndup = st.session_state.get("reg_dupes", 0)
-    if _ndup:
-        with st.container(border=True):
-            c_a, c_b = st.columns([3, 1])
-            c_a.markdown(
-                ui.stamp(f"{_ndup} duplicate rows hidden", "warn") + " &nbsp;" +
-                ui.muted("Invoices that were already picked in an earlier run — "
-                         "they are left out of this table, both reports and the "
-                         "dashboard. Clear them to tidy the sheet itself."),
-                unsafe_allow_html=True)
-            c_b.write("")
-            if c_b.button("Clear them", width="stretch", disabled=not gs_ready):
-                try:
-                    import gsheet
-                    raw_s, raw_d = gsheet.read_register(sa_info, sheet_key, fresh=True)
-                    clean = R.strip_duplicates(raw_s, raw_d)
-                    book = gsheet.open_book(sa_info, sheet_key)
-                    with gsheet.sheet_lock(sa_info, sheet_key, "REGISTER", owner=USER):
-                        gsheet.write_table(book, gsheet.WS_INV_SUM, R.SUMMARY_COLS,
-                                           clean["summary"], prev_rows=len(raw_s))
-                        gsheet.write_table(book, gsheet.WS_INV_DET, R.DETAIL_COLS,
-                                           clean["details"], prev_rows=len(raw_d))
-                    gsheet.cache_clear(sheet_key)
-                    st.session_state.pop("reg_cache", None)
-                    st.toast(f"Removed {clean['dropped']} duplicate rows", icon="🧹")
-                    st.rerun()
-                except Exception as ex:
-                    st.error(f"Cleanup error: {ex}")
-    if st.session_state.get("reg_error"):
-        st.warning(f"Register read error: {st.session_state['reg_error']}")
-    elif not gs_ready and st.session_state.get("reg_run"):
-        st.info("No database connected — showing this session's run only.")
-
-    if not len(reg_s):
-        ui.empty("Nothing registered yet",
-                 "Generate a pick and every uploaded document lands here.", "🗒️")
-    else:
-        k1, k2, k3, k4 = st.columns(4)
-        yes = (reg_s["KORBER_PICK"].astype(str) == "Yes").sum()
-        k1.metric("Invoices", len(reg_s))
-        k2.metric("Körber picked", int(yes))
-        k3.metric("Not picked", int(len(reg_s) - yes), delta_color="inverse")
-        k4.metric("MRP", int((reg_s["MRP"].astype(str) == "Yes").sum()))
-
-        f1, f2, f3 = st.columns([2, 1, 1])
-        rq = f1.text_input("Search", placeholder="invoice no · customer · item · remark",
-                           key="reg_q")
-        fk = f2.multiselect("Körber Pick", ["Yes", "No"], key="reg_k")
-        fm = f3.multiselect("MRP", ["Yes", "No"], key="reg_m")
-
-        vs, vd = reg_s.copy(), reg_d.copy()
-        if fk:
-            vs = vs[vs["KORBER_PICK"].astype(str).isin(fk)]
-        if fm:
-            vs = vs[vs["MRP"].astype(str).isin(fm)]
-        if rq.strip():
-            vs = R.search(vs, rq)
-        vd = vd[vd["TAX_INVOICE_NO"].astype(str).isin(set(vs["TAX_INVOICE_NO"].astype(str)))]
-
-        t_sum, t_det = st.tabs(["Summary", "Details"])
-        with t_sum:
-            st.dataframe(vs[R.SUMMARY_COLS[:8]], hide_index=True, width="stretch",
-                         height=430)
-            with st.expander("All columns"):
-                st.dataframe(vs, hide_index=True, width="stretch", height=380)
-        with t_det:
-            st.caption("One row per document line, with the pallets it came off.")
-            st.dataframe(vd, hide_index=True, width="stretch", height=430)
-
-        ui.eyebrow("Download")
-        stamp2 = datetime.now().strftime("%Y%m%d_%H%M")
-        dl1, dl2 = st.columns(2)
-        dl1.download_button("Summary report (Excel)",
-                            data=_bytes(f"rs{_fkey(vs)}", R.summary_excel, vs),
-                            file_name=f"Invoice_Summary_{stamp2}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument."
-                                 "spreadsheetml.sheet", width="stretch")
-        dl2.download_button("Details report (Excel)",
-                            data=_bytes(f"rd{_fkey(vd)}", R.details_excel, vd),
-                            file_name=f"Invoice_Details_{stamp2}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument."
-                                 "spreadsheetml.sheet", width="stretch")
-        st.caption(f"Downloading {len(vs)} invoices and {len(vd)} lines — the filters "
-                   "above apply to both files. The **Dashboard** tab has the same two "
-                   "reports filtered by invoice date instead.")
-
-        # ---- remarks are operational notes, so let them be edited ----
-        with st.expander("Edit remarks"):
-            st.caption("A remark on a picked invoice is kept; picking a `No` again "
-                       "clears it automatically.")
-            ed = st.data_editor(
-                vs[["TAX_INVOICE_NO", "CUSTOMER_NAME", "KORBER_PICK", "REMARK"]],
-                hide_index=True, width="stretch", height=280, key="reg_remark",
-                column_config={
-                    "TAX_INVOICE_NO": st.column_config.TextColumn(disabled=True),
-                    "CUSTOMER_NAME": st.column_config.TextColumn(disabled=True),
-                    "KORBER_PICK": st.column_config.TextColumn(disabled=True)})
-            if st.button("Save remarks", disabled=not gs_ready):
-                try:
-                    import gsheet
-                    upd = reg_s.copy()
-                    idx = {str(v): i for i, v in enumerate(upd["TAX_INVOICE_NO"])}
-                    for _, r in ed.iterrows():
-                        i = idx.get(str(r["TAX_INVOICE_NO"]))
-                        if i is not None:
-                            upd.iat[i, upd.columns.get_loc("REMARK")] = str(r["REMARK"])
-                    gsheet.save_register(sa_info, sheet_key, upd.head(0), reg_d.head(0),
-                                         owner=USER)
-                    book = gsheet.open_book(sa_info, sheet_key)
-                    gsheet._replace_ws(book, gsheet.WS_INV_SUM, R.SUMMARY_COLS, upd)
-                    gsheet.cache_clear(sheet_key)
-                    st.session_state.pop("reg_cache", None)
-                    st.toast("Remarks saved", icon="📝")
-                    st.rerun()
-                except Exception as ex:
-                    st.error(f"Save error: {ex}")
-
-    # ---- the MRP rule lives here ----
-    with st.expander("MRP contacts — the rule behind the Yes / No"):
-        st.caption("A document is **MRP = Yes** when its `Contact Person` / `Email` "
-                   "matches one of these. Email wins when the document carries one.")
-        mrp_ed = st.data_editor(pd.DataFrame(MRP_CONTACTS, columns=["NAME", "EMAIL"]),
-                                num_rows="dynamic", width="stretch", hide_index=True,
-                                key="mrp_editor")
-        m1, m2 = st.columns(2)
-        if m1.button("Save MRP contacts", type="primary", width="stretch"):
-            st.session_state["mrp_contacts"] = R.load_contacts(
-                mrp_ed.to_dict("records"))
-            if gs_ready:
-                try:
-                    import gsheet
-                    gsheet.save_setting(sa_info, sheet_key, "MRP_CONTACTS",
-                                        R.dump_contacts(mrp_ed))
-                except Exception as ex:
-                    st.error(f"Save error: {ex}")
-            st.toast("MRP contacts saved — re-run a pick to apply", icon="✅")
-            st.rerun()
-        if m2.button("Reset to default", width="stretch"):
-            st.session_state["mrp_contacts"] = R.load_contacts(None)
-            if gs_ready:
-                try:
-                    import gsheet
-                    gsheet.save_setting(sa_info, sheet_key, "MRP_CONTACTS", "")
-                except Exception:
-                    pass
-            st.rerun()
-        st.caption("Changing this does not rewrite invoices already in the register — "
-                   "it applies from the next pick run.")
+    _register_tab_body()
 
 # =========================================================================== #
 # TAB — Loads (download / delete by LOAD_ID)

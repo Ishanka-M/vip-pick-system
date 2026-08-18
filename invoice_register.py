@@ -24,22 +24,29 @@ from doc_parser import ParsedDoc, base_item, clean_item
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 5
+API = 6
+
+# Warehouse execution status — independent of KORBER_PICK (this app's own pallet
+# allocation). These three track the physical pick / pack / dispatch, driven by
+# the Pick_Live_status report, the packing QR scan, and the sales report match.
+STATUS_COLS = ["PICKING", "PACKING", "DISPATCH"]
+STATUS_PENDING = "Pending"
+STATUS_DONE = "Completed"
 
 SUMMARY_COLS = [
     "TAX_INVOICE_DATE", "TAX_INVOICE_NO", "AR_INVOICE_NO", "CUSTOMER_NAME", "QTY",
     "KORBER_PICK", "REMARK", "MRP",
     "DOC_TYPE", "CUSTOMER_CODE", "CONTACT_PERSON", "CONTACT_EMAIL", "LINES",
     "PICKED_QTY", "PLANT", "RUN_ID", "PICKED_AT", "FIRST_SEEN", "UPDATED_AT",
-    "UPDATED_BY", "SOURCE_FILE",
-]
+    "UPDATED_BY", "SOURCE_FILE", "TOTAL_INCL_TAX",
+] + STATUS_COLS
 
 DETAIL_COLS = [
     "TAX_INVOICE_DATE", "TAX_INVOICE_NO", "AR_INVOICE_NO", "CUSTOMER_NAME", "DOC_TYPE",
     "LINE", "ITEM_CODE", "BASE_ID", "DESCRIPTION", "DOC_QTY", "UOM",
     "KORBER_PICK", "PICKED_QTY", "ITEM_NUMBER", "LOT_NUMBER", "PALLETS", "LOCATIONS",
-    "PLANT", "REMARK", "RUN_ID", "UPDATED_AT",
-]
+    "PLANT", "REMARK", "RUN_ID", "UPDATED_AT", "UNIT_PRICE", "LINE_TOTAL",
+] + STATUS_COLS
 
 DEFAULT_MRP = [{"NAME": "Sharma, Rahul", "EMAIL": "rahul.sharma1@donaldson.com"}]
 
@@ -170,6 +177,9 @@ def build(docs: list[ParsedDoc], res: dict[str, Any], contacts: list[dict],
             "RUN_ID": run_id if ok else "", "PICKED_AT": now if ok else "",
             "FIRST_SEEN": now, "UPDATED_AT": now, "UPDATED_BY": user,
             "SOURCE_FILE": doc.source_file,
+            "TOTAL_INCL_TAX": doc.total_incl_tax if doc.total_incl_tax is not None else "",
+            "PICKING": STATUS_PENDING, "PACKING": STATUS_PENDING,
+            "DISPATCH": STATUS_PENDING,
         })
 
         for ln in doc.lines:
@@ -195,6 +205,10 @@ def build(docs: list[ParsedDoc], res: dict[str, Any], contacts: list[dict],
                 if len(la) else "",
                 "PLANT": plants, "REMARK": remark, "RUN_ID": run_id if ok else "",
                 "UPDATED_AT": now,
+                "UNIT_PRICE": ln.unit_price if ln.unit_price is not None else "",
+                "LINE_TOTAL": ln.line_total if ln.line_total is not None else "",
+                "PICKING": STATUS_PENDING, "PACKING": STATUS_PENDING,
+                "DISPATCH": STATUS_PENDING,
             })
 
     out_s = pd.DataFrame(srows, columns=SUMMARY_COLS)
@@ -269,6 +283,12 @@ def merge_summary(old: pd.DataFrame | None, new: pd.DataFrame) -> dict[str, Any]
         cur = rows[idx[num]]
         was = str(cur.get("KORBER_PICK", "No"))
         rec["FIRST_SEEN"] = cur.get("FIRST_SEEN") or rec["FIRST_SEEN"]
+        # Picking/Packing/Dispatch track the physical warehouse execution, not
+        # this run's own pallet allocation — a re-upload of the same invoice
+        # must never roll a Completed status back to Pending.
+        for k in STATUS_COLS:
+            if str(cur.get(k, "")) == STATUS_DONE:
+                rec[k] = STATUS_DONE
         if was == "Yes" and rec["KORBER_PICK"] != "Yes":
             # already picked — keep the pick, just refresh what the document says
             for k in ("KORBER_PICK", "REMARK", "RUN_ID", "PICKED_AT", "PICKED_QTY",
@@ -286,15 +306,28 @@ def merge_summary(old: pd.DataFrame | None, new: pd.DataFrame) -> dict[str, Any]
 
 
 def merge_details(old: pd.DataFrame | None, new: pd.DataFrame) -> pd.DataFrame:
-    """Detail rows are replaced wholesale for the invoices in this run."""
+    """
+    Detail rows are replaced wholesale for the invoices in this run — except the
+    Picking/Packing/Dispatch status, which belongs to the physical warehouse
+    execution and must survive a re-upload of the same invoice/line.
+    """
     if new is None or not len(new):
         return (old if old is not None else pd.DataFrame(columns=DETAIL_COLS))
+    new = new.reindex(columns=DETAIL_COLS).copy()
     if old is None or not len(old):
-        return new.reindex(columns=DETAIL_COLS)
+        return new
     nums = {str(x) for x in new["TAX_INVOICE_NO"]}
-    keep = old.reindex(columns=DETAIL_COLS)
-    keep = keep[~keep["TAX_INVOICE_NO"].astype(str).isin(nums)]
-    return pd.concat([keep, new.reindex(columns=DETAIL_COLS)], ignore_index=True)
+    old = old.reindex(columns=DETAIL_COLS)
+    prior = old[old["TAX_INVOICE_NO"].astype(str).isin(nums)]
+    if len(prior):
+        for k in STATUS_COLS:
+            carried = {(str(r["TAX_INVOICE_NO"]), str(r["LINE"])): str(r[k])
+                       for _, r in prior.iterrows() if str(r.get(k, "")) == STATUS_DONE}
+            if carried:
+                key = list(zip(new["TAX_INVOICE_NO"].astype(str), new["LINE"].astype(str)))
+                new[k] = [carried.get(kk, v) for kk, v in zip(key, new[k])]
+    keep = old[~old["TAX_INVOICE_NO"].astype(str).isin(nums)]
+    return pd.concat([keep, new], ignore_index=True)
 
 
 def mark_unpicked(summary: pd.DataFrame, invoice_no: str,
@@ -314,6 +347,258 @@ def mark_unpicked(summary: pd.DataFrame, invoice_no: str,
     d.loc[m, "PICKED_QTY"] = 0.0
     d.loc[m, "UPDATED_AT"] = stamp
     return d
+
+
+# --------------------------------------------------------------------------- #
+# Picking / Packing / Dispatch — warehouse execution status
+# --------------------------------------------------------------------------- #
+# These three are independent of KORBER_PICK (this app's own pallet allocation)
+# and only ever move Pending -> Completed. A stale or re-uploaded report, or a
+# re-run of the pick, must never undo progress already confirmed on the floor.
+def _norm_col(s: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(s or "").lower())
+
+
+def _find_col(df: pd.DataFrame, *names: str) -> str | None:
+    """Best-effort header match for an uploaded report — exact normalized name
+    first, then substring, so small formatting differences don't break it."""
+    if df is None or not len(df.columns):
+        return None
+    norm = {c: _norm_col(c) for c in df.columns}
+    for name in names:
+        want = _norm_col(name)
+        for c, n in norm.items():
+            if n == want:
+                return c
+    for name in names:
+        want = _norm_col(name)
+        if not want:
+            continue
+        for c, n in norm.items():
+            if want in n:
+                return c
+    return None
+
+
+def _id_str(x: Any) -> str:
+    """
+    Excel stores an all-digit invoice / Load Id as a number, so it reads back
+    '333262712441.0' — one character different from the string version this
+    app uses everywhere else. Strip a trailing whole-number '.0' before any
+    matching is done.
+    """
+    if isinstance(x, float):
+        if pd.isna(x):
+            return ""
+        return str(int(x)) if x.is_integer() else str(x)
+    s = str(x or "").strip()
+    if re.fullmatch(r"\d+\.0", s):
+        s = s[:-2]
+    return s
+
+
+def _to_num(x: Any) -> float | None:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return None
+    s = str(x).replace(",", "").strip()
+    m = re.search(r"-?\d+(?:\.\d+)?", s)
+    return float(m.group()) if m else None
+
+
+LIVE_STATUS_REPORT_COLS = ["LOAD_ID", "MATCHED", "PICKING", "DISPATCH"]
+
+
+def apply_pick_live_status(summary: pd.DataFrame, details: pd.DataFrame,
+                           live_df: pd.DataFrame) -> dict[str, Any]:
+    """
+    Pick_Live_status report -> Picking / Dispatch, matched on Load Id == Tax
+    Invoice No.
+
+        Open Pick == 0                                   -> Picking  = Completed
+        Shipped Pick != 0  OR  Total Pick == Shipped Pick -> Dispatch = Completed
+        (the second rule needs Total Pick > 0 — two blank/zero columns are not
+        a shipment)
+    """
+    empty = pd.DataFrame(columns=LIVE_STATUS_REPORT_COLS)
+    out = {"summary": summary, "details": details, "report": empty,
+          "picking_done": 0, "dispatch_done": 0, "unmatched": [], "error": ""}
+    if live_df is None or not len(live_df) or summary is None or not len(summary):
+        return out
+
+    c_load = _find_col(live_df, "Load Id")
+    c_open = _find_col(live_df, "Open Pick")
+    c_total = _find_col(live_df, "Total Pick")
+    c_ship = _find_col(live_df, "Shipped Pick")
+    if not c_load:
+        out["error"] = "Could not find a 'Load Id' column in this file."
+        return out
+
+    rows, pick_set, disp_set = [], {}, {}
+    for _, r in live_df.iterrows():
+        lid = _id_str(r.get(c_load, "")).strip()
+        if not lid:
+            continue
+        op = _to_num(r.get(c_open)) if c_open else None
+        tp = _to_num(r.get(c_total)) if c_total else None
+        sp = _to_num(r.get(c_ship)) if c_ship else None
+        p_done = op is not None and op == 0
+        d_done = (sp is not None and sp != 0) or \
+                 (tp is not None and sp is not None and tp > 0 and tp == sp)
+        pick_set[lid] = pick_set.get(lid, False) or p_done
+        disp_set[lid] = disp_set.get(lid, False) or d_done
+
+    known = {str(x).strip() for x in summary["TAX_INVOICE_NO"]}
+    for lid in sorted(set(pick_set) | set(disp_set)):
+        rows.append({"LOAD_ID": lid, "MATCHED": lid in known,
+                    "PICKING": STATUS_DONE if pick_set.get(lid) else "",
+                    "DISPATCH": STATUS_DONE if disp_set.get(lid) else ""})
+
+    s = summary.copy()
+    inv = s["TAX_INVOICE_NO"].astype(str).str.strip()
+    n_pick = n_disp = 0
+    for lid, done in pick_set.items():
+        if not done:
+            continue
+        m = (inv == lid) & (s["PICKING"] != STATUS_DONE)
+        n_pick += int(m.sum())
+        s.loc[m, "PICKING"] = STATUS_DONE
+    for lid, done in disp_set.items():
+        if not done:
+            continue
+        m = (inv == lid) & (s["DISPATCH"] != STATUS_DONE)
+        n_disp += int(m.sum())
+        s.loc[m, "DISPATCH"] = STATUS_DONE
+
+    d = details
+    if details is not None and len(details):
+        d = details.copy()
+        dinv = d["TAX_INVOICE_NO"].astype(str).str.strip()
+        for lid, done in pick_set.items():
+            if done:
+                d.loc[(dinv == lid) & (d["PICKING"] != STATUS_DONE), "PICKING"] = STATUS_DONE
+        for lid, done in disp_set.items():
+            if done:
+                d.loc[(dinv == lid) & (d["DISPATCH"] != STATUS_DONE), "DISPATCH"] = STATUS_DONE
+
+    return {"summary": s, "details": d, "report": pd.DataFrame(rows, columns=LIVE_STATUS_REPORT_COLS),
+           "picking_done": n_pick, "dispatch_done": n_disp,
+           "unmatched": [r["LOAD_ID"] for r in rows if not r["MATCHED"]], "error": ""}
+
+
+def apply_packing_scan(summary: pd.DataFrame, details: pd.DataFrame, load_id: str,
+                       user: str = "") -> dict[str, Any]:
+    """QR scan of an OUTBOUND PICK SHEET (LOAD_ID) -> Packing = Completed."""
+    lid = str(load_id).strip()
+    out = {"found": False, "already": False, "invoice": None,
+          "summary": summary, "details": details}
+    if not lid or summary is None or not len(summary):
+        return out
+    inv = summary["TAX_INVOICE_NO"].astype(str).str.strip()
+    m = inv == lid
+    if not m.any():
+        return out
+
+    out["found"] = True
+    out["invoice"] = summary.loc[m].iloc[0].to_dict()
+    out["already"] = str(out["invoice"].get("PACKING", "")) == STATUS_DONE
+
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    s = summary.copy()
+    s.loc[m, "PACKING"] = STATUS_DONE
+    s.loc[m, "UPDATED_AT"] = stamp
+    if user:
+        s.loc[m, "UPDATED_BY"] = user
+    out["summary"] = s
+
+    if details is not None and len(details):
+        d = details.copy()
+        dm = d["TAX_INVOICE_NO"].astype(str).str.strip() == lid
+        d.loc[dm, "PACKING"] = STATUS_DONE
+        d.loc[dm, "UPDATED_AT"] = stamp
+        out["details"] = d
+    return out
+
+
+SALES_REPORT_COLS = ["TAX_INVOICE_NO", "LINE", "ITEM_CODE", "DOC_QTY", "SALES_QTY", "STATUS"]
+
+
+def apply_sales_report(summary: pd.DataFrame, details: pd.DataFrame,
+                       sales_df: pd.DataFrame) -> dict[str, Any]:
+    """
+    Invoice sales report -> confirms Picking is really done.
+
+    Matched on Tax Invoice No. + item (Item Code or Customer Item, base-ID
+    matched like everywhere else in this app) + Qty. A line whose sales-report
+    quantity exactly matches the document quantity is picking-confirmed; once
+    every line of an invoice is confirmed, the invoice itself is marked
+    Picking = Completed.
+    """
+    empty = pd.DataFrame(columns=SALES_REPORT_COLS)
+    out = {"summary": summary, "details": details, "report": empty,
+          "matched": 0, "invoices_completed": 0, "error": ""}
+    if sales_df is None or not len(sales_df) or details is None or not len(details):
+        return out
+
+    c_inv = _find_col(sales_df, "Tax Invoice No.", "Tax Invoice No")
+    c_item = _find_col(sales_df, "Item Code")
+    c_citem = _find_col(sales_df, "Customer Item")
+    c_qty = _find_col(sales_df, "QTY", "Quantity")
+    if not c_inv or not c_qty or (not c_item and not c_citem):
+        out["error"] = "Could not find Tax Invoice No. / Item Code / QTY columns."
+        return out
+
+    sales_qty: dict[tuple[str, str], float] = {}
+    for _, r in sales_df.iterrows():
+        inv = _id_str(r.get(c_inv, "")).strip()
+        if not inv:
+            continue
+        base = base_item(r.get(c_item)) if c_item else ""
+        if not base and c_citem:
+            base = base_item(r.get(c_citem))
+        if not base:
+            continue
+        qty = _to_num(r.get(c_qty)) or 0.0
+        key = (inv, base)
+        sales_qty[key] = sales_qty.get(key, 0.0) + qty
+
+    d = details.copy()
+    d["_BASE"] = d["ITEM_CODE"].map(base_item)
+    rep_rows = []
+    matched_mask = pd.Series(False, index=d.index)
+    for i, row in d.iterrows():
+        inv = str(row["TAX_INVOICE_NO"]).strip()
+        sq = sales_qty.get((inv, row["_BASE"]))
+        doc_qty = float(row["DOC_QTY"] or 0)
+        if sq is None:
+            status = "Not in sales report"
+        elif abs(sq - doc_qty) <= 0.01:
+            status = "Matched"
+            matched_mask.at[i] = True
+        else:
+            status = f"Qty mismatch (report {sq:g})"
+        rep_rows.append({"TAX_INVOICE_NO": inv, "LINE": row["LINE"],
+                         "ITEM_CODE": row["ITEM_CODE"], "DOC_QTY": doc_qty,
+                         "SALES_QTY": sq if sq is not None else "", "STATUS": status})
+
+    d.loc[matched_mask & (d["PICKING"] != STATUS_DONE), "PICKING"] = STATUS_DONE
+    d = d.drop(columns=["_BASE"])
+
+    s = summary
+    n_inv_done = 0
+    if summary is not None and len(summary):
+        s = summary.copy()
+        all_done = d.groupby("TAX_INVOICE_NO")["PICKING"].apply(
+            lambda x: bool(len(x)) and (x == STATUS_DONE).all())
+        inv_col = s["TAX_INVOICE_NO"].astype(str).str.strip()
+        for inv, done in all_done.items():
+            if not done:
+                continue
+            m = (inv_col == str(inv).strip()) & (s["PICKING"] != STATUS_DONE)
+            n_inv_done += int(m.sum())
+            s.loc[m, "PICKING"] = STATUS_DONE
+
+    return {"summary": s, "details": d, "report": pd.DataFrame(rep_rows, columns=SALES_REPORT_COLS),
+           "matched": int(matched_mask.sum()), "invoices_completed": n_inv_done, "error": ""}
 
 
 # --------------------------------------------------------------------------- #
@@ -361,7 +646,8 @@ def dashboard(summary: pd.DataFrame, date_from: Any = None, date_to: Any = None,
     is not the same problem as ten pending invoices for 2 units each.
     """
     empty = {"kpi": {k: 0 for k in ("total", "picked", "pending", "qty", "qty_picked",
-                                    "qty_pending", "pct", "oldest")},
+                                    "qty_pending", "pct", "oldest", "picking_done",
+                                    "packing_done", "dispatch_done")},
              "by_reason": pd.DataFrame(columns=["REASON", "INVOICES", "QTY"]),
              "by_customer": pd.DataFrame(columns=["CUSTOMER_NAME", "INVOICES", "QTY"]),
              "pending": pd.DataFrame(columns=PENDING_COLS),
@@ -405,6 +691,9 @@ def dashboard(summary: pd.DataFrame, date_from: Any = None, date_to: Any = None,
         "qty_pending": float(pend["QTY"].sum()),
         "pct": (float(len(done)) / len(d) * 100.0) if len(d) else 0.0,
         "oldest": int(pend["DAYS"].max()) if len(pend) and pend["DAYS"].notna().any() else 0,
+        "picking_done": int((d.get("PICKING", "") == STATUS_DONE).sum()),
+        "packing_done": int((d.get("PACKING", "") == STATUS_DONE).sum()),
+        "dispatch_done": int((d.get("DISPATCH", "") == STATUS_DONE).sum()),
     }
 
     by_reason = (pend.groupby("REASON")
