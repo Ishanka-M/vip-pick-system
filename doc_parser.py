@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
 import pandas as pd
@@ -20,7 +21,7 @@ import pdfplumber
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 5
+API = 6
 
 # --------------------------------------------------------------------------- #
 # Item-code helpers
@@ -28,16 +29,57 @@ API = 5
 _ITEM_CLEAN = re.compile(r"[^A-Z0-9\-/]")
 
 
+def _as_code(code: Any) -> str:
+    """
+    Raw cell -> a hashable string the cached helpers below can key on.
+
+    A missing cell must not become an item code: pandas hands over `nan`, which
+    is *truthy*, so `str(code or "")` used to turn an empty column into the
+    literal base id "NAN" — and every blank row then matched every other one.
+    """
+    if code is None:
+        return ""
+    if isinstance(code, float) and code != code:      # NaN
+        return ""
+    return str(code)
+
+
+@lru_cache(maxsize=200_000)
+def _clean_code(s: str) -> str:
+    s = s.strip().upper().replace("\n", "").replace(" ", "").rstrip(".")
+    return _ITEM_CLEAN.sub("", s)
+
+
 def clean_item(code: Any) -> str:
     """'  p550576-016-140. ' -> 'P550576-016-140'"""
-    s = str(code or "").strip().upper()
-    s = s.replace("\n", "").replace(" ", "")
-    s = s.rstrip(".")
-    s = _ITEM_CLEAN.sub("", s)
-    return s
+    return _clean_code(_as_code(code))
 
 
 _BASE_SUFFIX = re.compile(r"(?:\d{3})+")
+
+# Alpha markers that mean "same physical part, another spelling" — safe to drop.
+# Deliberately a closed list, NOT "any 3-letter suffix": in the real catalogue
+# KIT / FEE / AIR / CAF / GTS / IVS / IAF really do identify different items
+# (DFO-312-KIT vs DFO-324-KIT are two sizes; ADMINISTRATIVE-FEE---AIR vs ---IVS
+# are two charge codes), so a blanket rule would collapse 16 genuinely distinct
+# groups of codes into false matches.
+_BASE_MARKERS = {"INL", "REV"}
+
+
+def _is_suffix(part: str) -> bool:
+    return bool(_BASE_SUFFIX.fullmatch(part)) or part in _BASE_MARKERS
+
+
+@lru_cache(maxsize=200_000)
+def _base_code(s: str) -> str:
+    t = re.sub(r"\s+", "-", s.strip().upper().replace("\n", " ")).rstrip(".")
+    t = _ITEM_CLEAN.sub("", t)
+    if not t:
+        return ""
+    parts = [p for p in t.split("-") if p]
+    if len(parts) > 1 and all(_is_suffix(p) for p in parts[1:]):
+        return parts[0]
+    return _clean_code(s) or t
 
 
 def base_item(code: Any) -> str:
@@ -54,22 +96,18 @@ def base_item(code: Any) -> str:
         X770132 003710   -> X770132   (= X770132-003-710)
         P951413 000710   -> P951413
         P775704     710  -> P775704
-    ඒ නිසා whitespace එකත් separator එකක් විදිහට ගන්නවා, suffix කෑල්ලක් කියලා
-    ගන්නේ **digit 3ක ගුණාකාරයක්** නම් විතරයි (3, 6, 9 …).
+    ඒ නිසා whitespace එකත් separator එකක් විදිහට ගන්නවා.
+
+    Suffix කෑල්ලක් කියලා ගන්නේ **digit 3ක ගුණාකාරයක්** (3, 6, 9 …) නම්, නැත්නම්
+    `INL` / `REV` වගේ **එකම part එකේ spelling variant** එකක් නම් විතරයි:
+        1C072323-INL           -> 1C072323
+        1C072323-INL-REV-000   -> 1C072323   (දෙකම එකම part එක)
 
     එහෙම නැත්නම් මුළු code එකම — වැරදි match වළක්වන්න:
-        05-47174   -> 05-47174    (47174 = digit 5යි, 3ේ ගුණාකාරයක් නෙවෙයි)
-        1C072323-INL -> 1C072323-INL
+        05-47174     -> 05-47174      (47174 = digit 5යි, 3ේ ගුණාකාරයක් නෙවෙයි)
+        DFO-312-KIT  -> DFO-312-KIT   (312/324 = වෙනස් size, collapse කරන්න බෑ)
     """
-    s = str(code or "").strip().upper().replace("\n", " ")
-    s = re.sub(r"\s+", "-", s).rstrip(".")
-    s = _ITEM_CLEAN.sub("", s)
-    if not s:
-        return ""
-    parts = [p for p in s.split("-") if p]
-    if len(parts) > 1 and all(_BASE_SUFFIX.fullmatch(p) for p in parts[1:]):
-        return parts[0]
-    return clean_item(code) or s
+    return _base_code(_as_code(code))
 
 
 def _num(x: Any) -> float | None:

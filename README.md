@@ -32,10 +32,10 @@ streamlit run app.py
 
 | File | API |
 |---|---|
-| `gsheet.py` | 7 |
-| `invoice_register.py` | 10 |
+| `gsheet.py` | 8 |
+| `invoice_register.py` | 11 |
 | `pick_engine.py` · `pick_pdf.py` | 4 |
-| `doc_parser.py` | 5 |
+| `doc_parser.py` | 6 |
 | `ui.py` | 3 |
 | `sku_master.py` | 2 |
 
@@ -767,35 +767,47 @@ Download cache එකේ key එක frame එකේ **content hash** එකක�
 
 ---
 
-## 25. Roles — Admin / Dashboard / Packing
+## 25. Roles — Admin / Dashboard / Packing / Dispatch
 
-App එක open කරාම login screen එකක්. තුනක් තෝරගන්න:
+App එක open කරාම login screen එකක්. හතරක් තෝරගන්න:
 
 | Role | Access | Password |
 |---|---|---|
 | **Admin** | හැම එකක්ම — Pick, Dashboard, Register, Loads, SKU master, Search, Stock, History, Reset | ඔව් — default `Isha@1996`, `secrets.toml`→`[app] admin_password` එකෙන් වෙනස් කරන්න පුළුවන් (නැත්නම් reset password එකම) |
 | **Dashboard** | **Pending vs picked** සහ **Invoice register** විතරයි — upload / pick / reset කිසිම දෙයක් නෑ | නෑ |
-| **Packing** | QR scan interface එක විතරයි | නෑ |
+| **📦 Packing** | Packing station එක විතරයි — LOAD ID එකෙන් `PACKING` complete | නෑ |
+| **🚚 Dispatch** | Dispatch station එක විතරයි — LOAD ID එකෙන් `DISPATCH` complete | නෑ |
 
 Sidebar එකේ **Switch role / Log out** button එකෙන් ආපහු login screen එකට.
 Session එකක් per browser tab — වෙන කෙනෙක් login වෙන එකෙන් මේකට බලපෑමක් නෑ.
 
 ---
 
-## 26. Packing — QR scan (mobile camera)
+## 26. Packing / Dispatch — floor stations
 
-Login → **Packing**. Mobile camera එකෙන්:
+Login → **Packing** හෝ **Dispatch**. දෙකම **එකම screen එක**, update වෙන column
+එක විතරයි වෙනස (`PACKING` / `DISPATCH`). Tab දෙකක් — දෙකෙන්ම එකම වැඩේ:
 
-1. **Scan QR code** click කරාම phone එකේ native camera app එක open වෙනවා
-2. Pick sheet PDF එකේ **LOAD_ID QR** එකට camera එක point කරලා photo එකක් capture කරන්න
-3. App එක photo එකෙන් QR එක decode කරලා (OpenCV), `TAX_INVOICE_NO` එකට match කරනවා
-4. හම්බුණොත් — `INVOICE_SUMMARY` සහ `INVOICE_DETAIL` දෙකේම **PACKING = Completed**
-   ලෙස update වෙනවා, ඒ instant එකේම save
-5. **Scan the next one** button එකෙන් ඊළඟ QR එකට
+**⌨️ Type the LOAD ID**
+* LOAD ID එක type කරලා **Mark … complete** click කරන්න
+* QR එක කැඩිලා / light එක අඩු / number එක අතේ තියෙනවා නම් — මේක වේගවත්ම ක්‍රමය
+* **Barcode gun එකකුත් මෙතන වැඩ කරනවා** — ඒක id එක type කරලා Enter ගහනවා,
+  form එක ඒකෙන්ම submit වෙනවා. Submit වුණාම box එක clear වෙනවා, ඊළඟ එකට readyයි
 
-Live video scan එකක් නෙවෙයි — photo capture + decode, ඒක mobile browser හැම එකකම
-reliable විදිහට වැඩ කරන approach එක. QR එකක් හම්බුනේ නැත්නම් / LOAD_ID එක register
-එකේ නැත්නම් error message එකක්. Session එකේ scan කරපු ලැයිස්තුවක් පහළින්.
+**📷 Scan the QR code**
+1. **Scan QR code** click කරාම phone එකේ native camera එක open වෙනවා
+2. Pick sheet PDF එකේ **LOAD_ID QR** එකට point කරලා capture කරන්න
+3. OpenCV එකෙන් decode කරලා `TAX_INVOICE_NO` එකට match කරනවා
+4. **Scan the next one** button එකෙන් ඊළඟ එකට
+
+හම්බුණොත් — `INVOICE_SUMMARY` සහ `INVOICE_DETAIL` දෙකේම ඒ column එක
+**Completed** ලෙස update වෙනවා, ඒ instant එකේම save. LOAD_ID එක register එකේ
+නැත්නම් / QR එකක් හම්බුනේ නැත්නම් error එකක්. එකම එක දෙපාරක් දැම්මොත්
+*"already Completed"* කියනවා — කිසිම හානියක් නෑ.
+
+Live video scan එකක් නෙවෙයි — photo capture + decode, ඒක mobile browser හැම
+එකකම reliable විදිහට වැඩ කරන approach එක. Session එකේ complete කරපු ලැයිස්තුවක්
+පහළින්.
 
 ---
 
@@ -808,8 +820,8 @@ execution එක track කරන්නේ:
 | Column | `Completed` වෙන්නේ කොහොමද |
 |---|---|
 | **PICKING** | `Pick_Live_status` upload — `Open Pick = 0` · හෝ Invoice sales report match (පහළින්) |
-| **PACKING** | Packing role QR scan (§ 26) |
-| **DISPATCH** | `Pick_Live_status` upload — `Shipped Pick ≠ 0` හෝ `Total Pick = Shipped Pick` |
+| **PACKING** | Packing station — QR scan හෝ LOAD ID type කිරීම (§ 26) |
+| **DISPATCH** | `Pick_Live_status` upload — `Shipped Pick ≠ 0` හෝ `Total Pick = Shipped Pick` · **හෝ** Dispatch station එකෙන් manual (§ 26) |
 
 **Pending → Completed විතරයි** — කවදාවත් ආපහු Pending වෙන්නේ නෑ (invoice එක ආපහු
 upload කළත්, stale report එකක් upload කළත්). Register tab → **Update status**
@@ -854,3 +866,35 @@ document එකේ **Total Amount (Incl. Tax)** — දැන් parse වෙල
 
 Delivery Challan එකකට Unit Price column එකක් නෑ — `LINE_TOTAL` එකට Total
 Amount (incl. tax) column එකේ අගය, `TOTAL_INCL_TAX` එකට Grand Total එක.
+
+---
+
+## 29. Speed — දෙවෙනි round එක
+
+Register එක ලොකු වෙන්න වෙන්න හෙමින් වුණු තැන් හතරක්. 5 000 invoice /
+30 000 detail line එකකින් measure කරපු ඒවා:
+
+| වැඩේ | කලින් | දැන් | |
+|---|---|---|---|
+| `dashboard()` — Dashboard tab එකේ හැම rerun එකකම | 393 ms | **41 ms** | 10× |
+| `details_excel()` download | 9 485 ms | **4 537 ms** | 2× |
+| `summary_excel()` download | 1 692 ms | **834 ms** | 2× |
+| `merge_details()` — save lock එක ඇතුලේ | 136 ms | **40 ms** | 3× |
+| `base_item()` × 30 000 (warm) | 32 ms | **7 ms** | 5× |
+
+**මොකද කළේ:**
+
+* **`parse_date` vectorise කළා** — `.map(parse_date)` කියන්නේ row එකකට
+  `pd.to_datetime` call එකක්. දැන් `parse_dates()` එකෙන් column එකම එක පාරට.
+  මේක තමයි ලොකුම එක (306 ms → 2.4 ms).
+* **Excel writer එක `xlsxwriter`** — openpyxl එකට වඩා දෙගුණයක් වේගවත්, file
+  එකත් 3ෙන් 1යි (1.9 MB → 0.6 MB). Install වෙලා නැත්නම් openpyxl එකට
+  automatic fall back වෙනවා, ඒ නිසා කැඩෙන්නේ නෑ.
+* **Column width එක sample එකකින්** — 30 000 row එකක්ම මනින්නේ නැතුව මුල්
+  400න්. Width කියන්නේ cosmetic දෙයක්.
+* **`merge_details` එකේ `.iterrows()` අයින් කළා** — indexed lookup එකකට.
+  මේක save lock එක ඇතුලේ run වෙන නිසා අනිත් users ලාත් රැඳෙනවා.
+* **`base_item` / `clean_item` cache කළා** (`lru_cache`) — SKU master
+  10 000+ rows වලට හැම rerun එකකම call වෙනවා.
+* **`_register_frames()` එක rerun එකකට එක පාරයි** — කලින් Dashboard tab
+  එකයි Register tab එකයි දෙකෙන්ම call වෙලා දෙපාරක් run වුණා.

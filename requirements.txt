@@ -1,6 +1,7 @@
 streamlit>=1.50
 pandas>=2.0
 openpyxl>=3.1
+xlsxwriter>=3.1
 pdfplumber>=0.11
 gspread>=6.0
 google-auth>=2.30

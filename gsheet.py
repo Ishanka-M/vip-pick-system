@@ -29,7 +29,7 @@ import pick_engine as E
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 7
+API = 8
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -779,13 +779,18 @@ def apply_live_status(sa_info: dict, sheet_key: str, live_df,
     return res
 
 
-def scan_packing(sa_info: dict, sheet_key: str, load_id: str,
-                 owner: str = "") -> dict[str, Any]:
+def scan_status(sa_info: dict, sheet_key: str, load_id: str, column: str = "PACKING",
+                owner: str = "") -> dict[str, Any]:
+    """
+    Mark one LOAD_ID complete for a status column — the Packing and Dispatch
+    stations both land here, whether the id was scanned or typed.
+    """
     with sheet_lock(sa_info, sheet_key, "REGISTER", owner=owner):
         book = open_book(sa_info, sheet_key)
-        cur_s = read_ws(sa_info, sheet_key, WS_INV_SUM, use_cache=False)
-        cur_d = read_ws(sa_info, sheet_key, WS_INV_DET, use_cache=False)
-        res = R.apply_packing_scan(cur_s, cur_d, load_id, user=owner)
+        got = read_many(sa_info, sheet_key, [WS_INV_SUM, WS_INV_DET], use_cache=False)
+        cur_s = got.get(WS_INV_SUM, pd.DataFrame())
+        cur_d = got.get(WS_INV_DET, pd.DataFrame())
+        res = R.apply_status_scan(cur_s, cur_d, load_id, column=column, user=owner)
         if res["found"] and not res["already"]:
             write_table(book, WS_INV_SUM, R.SUMMARY_COLS, res["summary"],
                         prev_rows=len(cur_s))
@@ -793,6 +798,16 @@ def scan_packing(sa_info: dict, sheet_key: str, load_id: str,
                         prev_rows=len(cur_d))
     cache_clear(sheet_key)
     return res
+
+
+def scan_packing(sa_info: dict, sheet_key: str, load_id: str,
+                 owner: str = "") -> dict[str, Any]:
+    return scan_status(sa_info, sheet_key, load_id, "PACKING", owner)
+
+
+def scan_dispatch(sa_info: dict, sheet_key: str, load_id: str,
+                  owner: str = "") -> dict[str, Any]:
+    return scan_status(sa_info, sheet_key, load_id, "DISPATCH", owner)
 
 
 def apply_sales_report(sa_info: dict, sheet_key: str, sales_df,

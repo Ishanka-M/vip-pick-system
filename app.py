@@ -35,9 +35,9 @@ st.set_page_config(
 # Streamlit Cloud redacts exception text, so a half-updated deploy used to die
 # with an unreadable TypeError. Every module carries an API number; refuse to
 # run against a stale one and say exactly which file to replace.
-_NEEDS = {"pick_engine.py": (E, 4), "doc_parser.py": (P, 5), "pick_pdf.py": (PP, 4),
+_NEEDS = {"pick_engine.py": (E, 4), "doc_parser.py": (P, 6), "pick_pdf.py": (PP, 4),
           "sku_master.py": (SKU, 2), "ui.py": (ui, 3),
-          "invoice_register.py": (R, 10)}
+          "invoice_register.py": (R, 11)}
 _STALE = [(f, getattr(m, "API", 0), n) for f, (m, n) in _NEEDS.items()
           if getattr(m, "API", 0) < n]
 if _STALE:
@@ -189,6 +189,16 @@ def _register_frames():
         a, b = empty
     a = a if a is not None and len(a) else empty[0]
     b = b if b is not None and len(b) else empty[1]
+
+    # Normalising and de-duplicating is pure work on frames that only change
+    # when the cache is refilled — but the Dashboard tab and the Register tab
+    # each call this on every rerun, so it used to run twice per click. Key it
+    # to the frames it was built from and hand back the same result.
+    stamp = (id(a), len(a), id(b), len(b))
+    hit = st.session_state.get("_reg_norm")
+    if hit is not None and hit[0] == stamp:
+        return hit[1], hit[2]
+
     # A sheet written by an older release is missing columns added since (e.g.
     # PICKING/PACKING/DISPATCH) until the next save rewrites its header — every
     # reader downstream can assume the full, current schema because of this.
@@ -202,6 +212,7 @@ def _register_frames():
     clean = R.strip_duplicates(a, b)
     st.session_state["reg_dupes"] = clean["dropped"]
     st.session_state["reg_dupe_ids"] = clean["invoices"]
+    st.session_state["_reg_norm"] = (stamp, clean["summary"], clean["details"])
     return clean["summary"], clean["details"]
 
 
@@ -215,7 +226,7 @@ def _dashboard_tab_body() -> None:
     else:
         with st.expander("Filter", expanded=False):
             fa, fb, fc = st.columns(3)
-            dates = d_sum["TAX_INVOICE_DATE"].map(R.parse_date).dropna()
+            dates = R.parse_dates(d_sum["TAX_INVOICE_DATE"]).dropna()
             lo = dates.min().date() if len(dates) else datetime.now().date()
             hi = dates.max().date() if len(dates) else datetime.now().date()
             d_from = fa.date_input("Invoice date from", value=lo, key="dash_from")
@@ -585,7 +596,7 @@ def _register_tab_body() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Role gate — Admin (full access) / Dashboard (view only) / Packing (QR scan)
+# Role gate — Admin (full) / Dashboard (view) / Packing · Dispatch (floor stations)
 # --------------------------------------------------------------------------- #
 def _admin_pw() -> str:
     """Same idea as the reset password — a secret overrides the default."""
@@ -613,12 +624,21 @@ def _decode_qr(img_bytes: bytes) -> str:
         return ""
 
 
-def _packing_card(row: dict) -> None:
+# The two floor stations are the same screen with a different target column.
+_STATIONS = {
+    "packing":  {"column": "PACKING",  "label": "Packing",
+                 "done": "Packing complete",  "icon": "📦"},
+    "dispatch": {"column": "DISPATCH", "label": "Dispatch",
+                 "done": "Dispatch complete", "icon": "🚚"},
+}
+
+
+def _station_card(row: dict, badge: str) -> None:
     ui.doc_card(
         str(row.get("TAX_INVOICE_NO", "")),
         f"{row.get('CUSTOMER_NAME','')} · Qty {row.get('QTY','')} · "
         f"{row.get('LINES','')} lines · {row.get('DOC_TYPE','')}",
-        tone="ok", badge="Packing complete")
+        tone="ok", badge=badge)
 
 
 def _role_sidebar(label: str, extra=None) -> None:
@@ -635,7 +655,8 @@ def _role_sidebar(label: str, extra=None) -> None:
 def _render_login() -> None:
     ui.topbar("OutBound Pick Generator", "Körber One · EFL · sign in", chips=[])
     ui.section("Sign in", hint="choose how you're using the app on this device")
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
+    c3, c4 = st.columns(2)
     with c1, st.container(border=True):
         st.markdown("#### Admin")
         st.caption("Full access — pick, dashboard, register, loads, SKU master, "
@@ -656,12 +677,20 @@ def _render_login() -> None:
             st.session_state["role"] = "dashboard"
             st.rerun()
     with c3, st.container(border=True):
-        st.markdown("#### Packing")
-        st.caption("Scan the OUTBOUND PICK SHEET QR code on your phone to mark "
-                   "packing complete.")
+        st.markdown("#### 📦 Packing")
+        st.caption("Scan the OUTBOUND PICK SHEET QR code, or type the LOAD ID, "
+                   "to mark packing complete.")
         st.write("")
         if st.button("Continue as Packing", width="stretch", key="login_pack_btn"):
             st.session_state["role"] = "packing"
+            st.rerun()
+    with c4, st.container(border=True):
+        st.markdown("#### 🚚 Dispatch")
+        st.caption("Same again for dispatch — scan or type the LOAD ID as the "
+                   "load leaves.")
+        st.write("")
+        if st.button("Continue as Dispatch", width="stretch", key="login_disp_btn"):
+            st.session_state["role"] = "dispatch"
             st.rerun()
 
 
@@ -679,63 +708,125 @@ def _render_dashboard_role_ui() -> None:
         _register_tab_body()
 
 
-def _render_packing_ui() -> None:
+def _station_apply(role: str, code: str) -> None:
+    """Mark one LOAD ID complete for this station — typed or scanned, same path."""
+    cfg = _STATIONS[role]
+    try:
+        import gsheet
+        res = gsheet.scan_status(sa_info, sheet_key, code, cfg["column"],
+                                 owner=st.session_state.get("user_id", USER))
+    except Exception as ex:
+        st.session_state[f"{role}_last"] = {"kind": "error",
+                                            "msg": f"Save error: {ex}"}
+        return
+
+    if not res["found"]:
+        st.session_state[f"{role}_last"] = {
+            "kind": "error",
+            "msg": f"LOAD ID `{code}` was not found in the invoice register."}
+        return
+
+    inv = res["invoice"]
+    already = res["already"]
+    st.session_state[f"{role}_last"] = {
+        "kind": "already" if already else "ok", "code": code, "invoice": inv,
+        "msg": (f"`{code}` was already marked {cfg['label']} = Completed."
+                if already else
+                f"{cfg['label']} marked Completed for `{code}`.")}
+    if not already:
+        hist = st.session_state.setdefault(f"{role}_done", [])
+        hist.insert(0, {"LOAD ID": code,
+                        "Customer": inv.get("CUSTOMER_NAME", ""),
+                        "At": datetime.now().strftime("%H:%M:%S")})
+        st.session_state[f"{role}_done"] = hist[:20]
+    # the register on this device is now stale
+    st.session_state.pop("reg_cache", None)
+    st.session_state.pop("_reg_norm", None)
+
+
+def _render_station_ui(role: str) -> None:
+    """
+    Packing / Dispatch floor screen — one LOAD ID at a time.
+
+    Two ways in, because the floor needs both: the phone camera for the QR on
+    the pick sheet, and a plain text box for when the code is damaged, the
+    light is bad, or the operator simply has the number in front of them. The
+    text box is a form, so a keyboard-wedge barcode gun (which types the id and
+    presses Enter) submits it without anyone touching the screen.
+    """
+    cfg = _STATIONS[role]
+
     def _extra():
-        name = st.text_input("Your name", value=USER, key="packing_user")
+        name = st.text_input("Your name", value=USER, key=f"{role}_user")
         if name:
             st.session_state["user_id"] = name
 
-    _role_sidebar("Packing", _extra)
-    ui.topbar("Packing", "Scan the OUTBOUND PICK SHEET QR code · Körber One",
-             chips=[{"label": "DB", "value": "connected" if gs_ready else "local only",
-                    "tone": "ok" if gs_ready else "warn"},
-                   {"label": "USER", "value": st.session_state.get("user_id", USER),
-                    "tone": ""}])
+    _role_sidebar(cfg["label"], _extra)
+    ui.topbar(f"{cfg['icon']} {cfg['label']}",
+              f"Scan or type the LOAD ID · Körber One",
+              chips=[{"label": "DB", "value": "connected" if gs_ready else "local only",
+                      "tone": "ok" if gs_ready else "warn"},
+                     {"label": "USER", "value": st.session_state.get("user_id", USER),
+                      "tone": ""}])
     if not gs_ready:
-        ui.empty("No database connected", "Packing status cannot be saved without "
+        ui.empty("No database connected",
+                 f"{cfg['label']} status cannot be saved without "
                  "`[gcp_service_account]` / `[google_sheet]` in secrets.", "📵")
         return
 
-    ui.section("Scan", hint="point the camera at the LOAD ID QR code and capture")
-    cam_n = st.session_state.get("pk_cam_n", 0)
-    shot = st.camera_input("Scan QR code", label_visibility="collapsed",
-                           key=f"pk_cam_{cam_n}")
+    t_type, t_scan = st.tabs(["⌨️  Type the LOAD ID", "📷  Scan the QR code"])
 
-    if shot is not None:
-        code = _decode_qr(shot.getvalue())
-        if not code:
-            st.error("No QR code found in that photo — hold it steady and a "
-                     "little closer, then capture again.")
+    with t_type:
+        with st.form(f"{role}_manual", clear_on_submit=True):
+            code = st.text_input("LOAD ID", placeholder="333262712441",
+                                 key=f"{role}_manual_id")
+            go = st.form_submit_button(f"Mark {cfg['label']} complete",
+                                       type="primary", width="stretch")
+        if go:
+            if str(code or "").strip():
+                _station_apply(role, str(code).strip())
+                st.rerun()
+            else:
+                st.warning("Type a LOAD ID first.")
+        st.caption("A barcode gun works here too — it types the id and presses "
+                   "Enter, which submits the form.")
+
+    with t_scan:
+        cam_n = st.session_state.get(f"{role}_cam_n", 0)
+        shot = st.camera_input("Scan QR code", label_visibility="collapsed",
+                               key=f"{role}_cam_{cam_n}")
+        if shot is not None:
+            scanned = _decode_qr(shot.getvalue())
+            if not scanned:
+                st.error("No QR code found in that photo — hold it steady and a "
+                         "little closer, then capture again. You can also type "
+                         "the id on the other tab.")
+            elif st.session_state.get(f"{role}_last_shot") != scanned:
+                st.session_state[f"{role}_last_shot"] = scanned
+                _station_apply(role, scanned)
+                st.rerun()
+            if st.button("Scan the next one", type="primary", width="stretch",
+                         key=f"{role}_next"):
+                st.session_state[f"{role}_cam_n"] = cam_n + 1
+                st.session_state.pop(f"{role}_last_shot", None)
+                st.rerun()
+
+    last = st.session_state.get(f"{role}_last")
+    if last:
+        st.divider()
+        if last["kind"] == "error":
+            st.error(last["msg"])
+        elif last["kind"] == "already":
+            st.info(last["msg"])
+            _station_card(last["invoice"], cfg["done"])
         else:
-            try:
-                import gsheet
-                res = gsheet.scan_packing(sa_info, sheet_key, code,
-                                          owner=st.session_state.get("user_id", USER))
-            except Exception as ex:
-                st.error(f"Save error: {ex}")
-                res = None
-            if res is not None:
-                if not res["found"]:
-                    st.error(f"LOAD ID `{code}` was not found in the invoice register.")
-                elif res["already"]:
-                    st.info(f"`{code}` was already marked Packing = Completed.")
-                    _packing_card(res["invoice"])
-                else:
-                    st.success(f"Packing marked Completed for `{code}`.")
-                    _packing_card(res["invoice"])
-                    hist = st.session_state.setdefault("packing_scans", [])
-                    hist.insert(0, {"LOAD ID": code,
-                                    "Customer": res["invoice"].get("CUSTOMER_NAME", ""),
-                                    "At": datetime.now().strftime("%H:%M:%S")})
-                    st.session_state["packing_scans"] = hist[:20]
-        if st.button("Scan the next one", type="primary", width="stretch"):
-            st.session_state["pk_cam_n"] = cam_n + 1
-            st.rerun()
+            st.success(last["msg"])
+            _station_card(last["invoice"], cfg["done"])
 
-    hist = st.session_state.get("packing_scans", [])
+    hist = st.session_state.get(f"{role}_done", [])
     if hist:
         st.divider()
-        ui.eyebrow("Scanned this session")
+        ui.eyebrow(f"{cfg['label']} completed this session")
         st.dataframe(pd.DataFrame(hist), hide_index=True, width="stretch")
 
 
@@ -743,8 +834,8 @@ _role = st.session_state.get("role")
 if not _role:
     _render_login()
     st.stop()
-if _role == "packing":
-    _render_packing_ui()
+if _role in _STATIONS:
+    _render_station_ui(_role)
     st.stop()
 if _role == "dashboard":
     _render_dashboard_role_ui()

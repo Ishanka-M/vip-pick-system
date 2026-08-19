@@ -968,10 +968,19 @@ def build_wms_excel(master: pd.DataFrame, detail: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
+# xlsxwriter is markedly faster and produces much smaller files; it is
+# optional, so fall back to openpyxl when it is not installed.
+try:                                     # noqa: SIM105
+    import xlsxwriter as _xlsxwriter     # noqa: F401
+    _XL_ENGINE = "xlsxwriter"
+except Exception:                        # pragma: no cover
+    _XL_ENGINE = "openpyxl"
+
+
 def build_report_excel(res: dict[str, Any]) -> bytes:
     """Pick report — allocations, pallet balance, shortage, rejected."""
     buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+    with pd.ExcelWriter(buf, engine=_XL_ENGINE) as xw:
         for name, key in [("Doc Summary", "accepted"), ("Qty Verification", "verify"),
                           ("Pallet Allocation", "allocations"),
                           ("Pallet Balance", "balance"), ("Stock Basis", "basis"),
