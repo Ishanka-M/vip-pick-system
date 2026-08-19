@@ -37,7 +37,7 @@ st.set_page_config(
 # run against a stale one and say exactly which file to replace.
 _NEEDS = {"pick_engine.py": (E, 4), "doc_parser.py": (P, 6), "pick_pdf.py": (PP, 4),
           "sku_master.py": (SKU, 2), "ui.py": (ui, 3),
-          "invoice_register.py": (R, 11)}
+          "invoice_register.py": (R, 12)}
 _STALE = [(f, getattr(m, "API", 0), n) for f, (m, n) in _NEEDS.items()
           if getattr(m, "API", 0) < n]
 if _STALE:
@@ -50,6 +50,21 @@ if _STALE:
           "is being handed."
     )
     st.stop()
+
+# The gate above only catches a module that is *older* than app.py. It cannot
+# catch the opposite — an old app.py deployed beside new modules — which looks
+# like nothing happened at all: the new screen simply is not there. So publish
+# the build plainly enough to check in one glance after a deploy.
+BUILD = "2026-08-19 · roles+stations · backfill"
+try:                                  # gsheet is imported lazily everywhere else
+    import gsheet as _gs_mod
+    _GS_API = getattr(_gs_mod, "API", 0)
+except Exception:                     # pragma: no cover
+    _GS_API = 0
+BUILD_APIS = (f"engine {getattr(E, 'API', 0)} · parser {getattr(P, 'API', 0)} "
+              f"· register {getattr(R, 'API', 0)} · sheet {_GS_API} "
+              f"· pdf {getattr(PP, 'API', 0)} · sku {getattr(SKU, 'API', 0)} "
+              f"· ui {getattr(ui, 'API', 0)}")
 
 ui.inject()
 
@@ -328,12 +343,109 @@ def _dashboard_tab_body() -> None:
                    f"{k['pending']} pending.")
 
 
+def _backfill_ui() -> None:
+    """Register rows for documents picked before the register existed."""
+    st.caption("The register only records documents from the moment it was "
+               "switched on. Anything picked before that has pallets in "
+               "`PALLET_LEDGER` but no register row — and re-uploading it will "
+               "not help, because the duplicate gate skips a document that is "
+               "already in `DOC_REGISTRY`. Rebuild those rows here.")
+    if not gs_ready:
+        st.warning("No database connected — nothing to rebuild against.")
+        return
+
+    import gsheet
+    gap = st.session_state.get("reg_gap")
+    g1, g2 = st.columns([1, 1])
+    if g1.button("Check what is missing", width="stretch", key="bf_check"):
+        try:
+            with st.spinner("Comparing the pick history against the register..."):
+                gap = gsheet.register_gap(sa_info, sheet_key, fresh=True)
+            st.session_state["reg_gap"] = gap
+        except Exception as ex:
+            st.error(f"Check failed: {ex}")
+            gap = None
+
+    if gap:
+        ui.kpi_row([
+            {"label": "Picked (ledger)", "value": gap["picked"]},
+            {"label": "In the register", "value": gap["registered"], "tone": "ok"},
+            {"label": "Missing", "value": gap["n_missing"],
+             "tone": "warn" if gap["n_missing"] else "ok"},
+        ])
+        if not gap["n_missing"]:
+            st.success("Every picked document is in the register.")
+        else:
+            shown = ", ".join(gap["missing"][:12])
+            st.caption(f"Missing: {shown}" + (" …" if gap["n_missing"] > 12 else ""))
+            if g2.button(f"Rebuild {gap['n_missing']} row(s) from the pick history",
+                         type="primary", width="stretch", key="bf_run"):
+                try:
+                    with st.spinner("Rebuilding from PALLET_LEDGER..."):
+                        res = gsheet.backfill_register(sa_info, sheet_key, owner=USER)
+                    st.session_state.pop("reg_cache", None)
+                    st.session_state.pop("_reg_norm", None)
+                    st.session_state.pop("reg_gap", None)
+                    st.session_state["backfill_report"] = res["report"]
+                    st.success(f"{res['added']} invoice(s) added to the register.")
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"Rebuild failed: {ex}")
+
+    rep = st.session_state.get("backfill_report")
+    if rep is not None and len(rep):
+        with st.expander(f"Rebuilt from the pick history ({len(rep)})", expanded=True):
+            st.dataframe(rep, hide_index=True, width="stretch", height=320)
+        st.caption("Quantities, lines, pallets, locations and lots come straight "
+                   "from the ledger. **Customer name is blank** — only the PDF "
+                   "carries it, so upload those invoices below to fill it in.")
+
+    st.divider()
+    ui.eyebrow("Or upload the invoices themselves")
+    st.caption("Parses the PDFs and files them in the register **without running "
+               "a pick** — use it for documents the pick never saw, or to fill in "
+               "the customer name on a rebuilt row. If the ledger shows the "
+               "document was picked, it is filed as picked with its pallets.")
+    f_docs = st.file_uploader("Invoice / Delivery Challan (PDF)", type=["pdf"],
+                              accept_multiple_files=True, key="backfill_docs")
+    if f_docs and st.button(f"Register {len(f_docs)} document(s)", width="stretch",
+                            key="bf_docs_go"):
+        try:
+            with st.spinner("Reading the PDFs..."):
+                parsed = []
+                for f in f_docs:
+                    try:
+                        parsed.append(P.parse_pdf(f.getvalue(), f.name))
+                    except Exception as ex:
+                        st.error(f"{f.name} — parse error: {ex}")
+            if not parsed:
+                st.warning("Nothing could be parsed.")
+            else:
+                # no pick result: build() files them as they stand, and the
+                # ledger then upgrades any that really were picked
+                _sum, _det = R.build(parsed, {}, MRP_CONTACTS, user=USER)
+                with st.spinner("Saving to the register..."):
+                    rr = gsheet.save_register_docs(sa_info, sheet_key, _sum, _det,
+                                                   owner=USER)
+                st.session_state.pop("reg_cache", None)
+                st.session_state.pop("_reg_norm", None)
+                st.success(f"{rr['new']} new · {rr['updated']} updated — "
+                          f"{rr['picked']} of them already picked per the ledger.")
+                st.dataframe(_sum[["TAX_INVOICE_NO", "TAX_INVOICE_DATE",
+                                   "CUSTOMER_NAME", "QTY", "LINES"]],
+                            hide_index=True, width="stretch")
+                st.rerun()
+        except Exception as ex:
+            st.error(f"Register failed: {ex}")
+
+
 def _status_update_ui(reg_s: pd.DataFrame, reg_d: pd.DataFrame) -> None:
     """Pick_Live_status + Invoice sales report -> Picking / Packing / Dispatch."""
     st.caption("Upload the WMS **Pick_Live_status** report and/or the ERP "
                "**Invoice sales report** to refresh Picking / Dispatch here — "
-               "matched by Load Id / Tax Invoice No. Packing is set from the "
-               "**Packing** login's QR scan, not from here.")
+               "matched by Load Id / Tax Invoice No. Packing, and Dispatch one "
+               "load at a time, come from the **Packing** and **Dispatch** "
+               "logins instead.")
     if not gs_ready:
         st.warning("No database connected — status updates cannot be saved.")
         return
@@ -462,7 +574,14 @@ def _register_tab_body() -> None:
 
     if not len(reg_s):
         ui.empty("Nothing registered yet",
-                 "Generate a pick and every uploaded document lands here.", "🗒️")
+                 "Generate a pick and every uploaded document lands here — or "
+                 "rebuild the rows for picks that happened before the register "
+                 "existed, below.", "🗒️")
+        # the register being empty is exactly when a backfill is wanted, so this
+        # has to stay reachable outside the populated-register branch
+        st.divider()
+        ui.section("Backfill", hint="picked earlier, never registered")
+        _backfill_ui()
     else:
         yes = (reg_s["KORBER_PICK"].astype(str) == "Yes").sum()
         ui.kpi_row([
@@ -499,7 +618,8 @@ def _register_tab_body() -> None:
         _sum_view_cols = R.SUMMARY_COLS[:8] + ["TOTAL_INCL_TAX"] + R.STATUS_COLS
         _det_view_cols = R.DETAIL_COLS[:11] + ["UNIT_PRICE", "LINE_TOTAL"] + R.STATUS_COLS
 
-        t_sum, t_det, t_stat = st.tabs(["Summary", "Details", "Update status"])
+        t_sum, t_det, t_stat, t_fill = st.tabs(
+            ["Summary", "Details", "Update status", "Backfill"])
         with t_sum:
             st.dataframe(vs[_sum_view_cols], hide_index=True, width="stretch",
                          height=430)
@@ -512,6 +632,8 @@ def _register_tab_body() -> None:
                 st.dataframe(vd, hide_index=True, width="stretch", height=380)
         with t_stat:
             _status_update_ui(reg_s, reg_d)
+        with t_fill:
+            _backfill_ui()
 
         ui.eyebrow("Download")
         stamp2 = datetime.now().strftime("%Y%m%d_%H%M")
@@ -692,6 +814,7 @@ def _render_login() -> None:
         if st.button("Continue as Dispatch", width="stretch", key="login_disp_btn"):
             st.session_state["role"] = "dispatch"
             st.rerun()
+    ui.footnote(f"Build {BUILD}  ·  {BUILD_APIS}")
 
 
 def _render_dashboard_role_ui() -> None:
@@ -843,6 +966,7 @@ if _role == "dashboard":
 
 with st.sidebar:
     st.markdown("<div class='eyebrow'>Admin</div>", unsafe_allow_html=True)
+    st.caption(f"Build {BUILD}")
     if st.button("Switch role / Log out", width="stretch", key="admin_logout"):
         st.session_state.pop("role", None)
         st.rerun()

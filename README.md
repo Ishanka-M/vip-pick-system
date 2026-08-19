@@ -32,8 +32,8 @@ streamlit run app.py
 
 | File | API |
 |---|---|
-| `gsheet.py` | 8 |
-| `invoice_register.py` | 11 |
+| `gsheet.py` | 9 |
+| `invoice_register.py` | 12 |
 | `pick_engine.py` · `pick_pdf.py` | 4 |
 | `doc_parser.py` | 6 |
 | `ui.py` | 3 |
@@ -898,3 +898,69 @@ Register එක ලොකු වෙන්න වෙන්න හෙමින් 
   10 000+ rows වලට හැම rerun එකකම call වෙනවා.
 * **`_register_frames()` එක rerun එකකට එක පාරයි** — කලින් Dashboard tab
   එකයි Register tab එකයි දෙකෙන්ම call වෙලා දෙපාරක් run වුණා.
+
+---
+
+## 30. Register backfill — කලින් pick වුණු invoice
+
+**ප්‍රශ්නය:** Register එක record කරන්න පටන් ගන්නේ ඒක on කරපු මොහොතේ ඉඳන්.
+ඊට කලින් pick වුණු හැම document එකකටම `PALLET_LEDGER` එකේ pallet තියෙනවා, ඒත්
+`INVOICE_SUMMARY` එකේ row එකක් නෑ. (මේ sheet එකේ: ledger එකේ **138**,
+register එකේ **3**.)
+
+**ආපහු upload කරලා හදන්න බෑ** — ඒ document එක `DOC_REGISTRY` එකේ තියෙන නිසා
+duplicate gate එකෙන් `DUPLICATE (already processed)` කියලා skip වෙනවා. ඒ නිසා
+Register tab → **Backfill** කියලා වෙනම tab එකක්.
+
+### A. Pick history එකෙන් rebuild (file එකක් ඕන නෑ)
+
+**Check what is missing** → ledger එකයි register එකයි compare කරලා කීයක් නැද්ද
+කියලා පෙන්නනවා → **Rebuild N row(s)** click කරන්න.
+
+`PALLET_LEDGER` එකෙන් හදනවා — pick එක all-or-nothing නිසා ඒ line එකේ
+**picked qty එකම document qty එක**, ඒ නිසා හරියටම reconstruct කරන්න පුළුවන්:
+
+| Register field | කොහෙන්ද |
+|---|---|
+| Lines · Qty · Picked qty | ledger එකේ `DOC_LINE` / `QTY_PICKED` |
+| Item · Base ID · Description · Lot | ledger |
+| Pallets · Locations · Plant | ledger (line එකකට කීපයක් නම් `,` වලින්) |
+| Run id · Picked at · Source file | ledger |
+| Tax invoice date · AR invoice no | `DOC_REGISTRY` |
+| **Customer name** | **හිස්** — ඒක තියෙන්නේ PDF එකේ විතරයි (B බලන්න) |
+
+`KORBER_PICK = Yes`, remark එකට *"Backfilled from the pick history"*.
+Picking/Packing/Dispatch තුනම `Pending` — ඒවා floor එකේ ඇත්ත තත්වය, ledger
+එකෙන් කියන්න බෑ. දෙපාරක් run කරොත් දෙවෙනි එකෙන් 0ක් add වෙනවා (idempotent).
+
+> ඔයාගේ sheet එකෙන් verify කළා — 138ම invoice වල **qty, line count, doc type,
+> doc date හතරම DOC_REGISTRY එකට හරියටම ගැලපුණා (138/138)**.
+
+### B. Invoice PDF upload කරලා (customer name එකට)
+
+එකම tab එකේ පහළින් — PDF ටික upload කරලා **Register N document(s)**.
+**Pick run එකක් නැතුව** register එකට යනවා. ledger එකේ ඒ document එක තිබ්බොත්
+`Yes` විදිහට, pallet/location එක්කම; නැත්නම් `No`.
+
+මේකෙන් customer name එකත් එනවා (PDF එකේ තියෙන නිසා), ඒ නිසා A කරලා පස්සේ B
+කරොත් row එක සම්පූර්ණයි.
+
+---
+
+## 31. DOC_REGISTRY column shift — fix එක
+
+`DOC_REGISTRY` sheet එකේ header එක **පරණ 14 column** එකක්, ඒත් code එක
+**16ක්** write කරනවා (`WMS_QTY` සහ `VERIFY` පස්සේ එකතු වුණා). `_ensure()`
+header එක ලියන්නේ sheet එක **හිස්** නම් විතරයි — ඒ නිසා පරණ header එක
+එහෙමම තිබිලා, අලුත් rows වල `PICKED_QTY` එකෙන් පස්සේ **හැම value එකක්ම
+column 2ක් වමට** ගියා. ඒකයි `PROCESSED_AT` යටතේ `333-MUMBAI` තිබුණේ
+(138න් **120ක්**).
+
+**Fix:** `sheet_header()` — sheet එකේ **ඇත්ත header** එක කියවලා, නැති column
+තියෙනවා නම් ඒවා **අගට** එකතු කරනවා (මැදට නෙවෙයි — එතකොට කලින් ලියපු rows වල
+alignment එක කැඩෙන්නේ නෑ). Rows ලියන්නේ ඒ order එකට. ඒ නිසා අලුත් column
+එකක් add කරාම මේක ආපහු වෙන්නේ නෑ.
+
+> Backfill එක `DOC_REGISTRY` එකේ **මුල් columns විතරයි** කියවන්නේ
+> (`DOC_NUMBER … PICKED_QTY`) — shift එක පටන් ගන්නේ ඊට පස්සේ නිසා
+> ඒ කොටස විශ්වාසනීයයි. අනිත් හැම දෙයක්ම clean `PALLET_LEDGER` එකෙන්.

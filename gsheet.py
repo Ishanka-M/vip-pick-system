@@ -29,7 +29,7 @@ import pick_engine as E
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 8
+API = 9
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -198,6 +198,32 @@ def _ensure(book, title: str, header: list[str]):
     if not api(ws.row_values, 1):
         api(ws.update, values=[header], range_name="A1", value_input_option="RAW")
     return ws
+
+
+def sheet_header(ws, expected: list[str]) -> list[str]:
+    """
+    The header the sheet *actually* has, widened to cover `expected`.
+
+    A release that adds a column used to break the sheet silently: `_ensure`
+    only writes a header when the sheet is empty, so an old header stayed put
+    while rows were written in the new, longer column order. Every value after
+    the insertion point then landed one column to the left of its name — which
+    is how DOC_REGISTRY ended up with a plant name under `PROCESSED_AT`.
+
+    So: read the real header, and append anything missing **at the end**, where
+    it cannot disturb the alignment of rows already written. Callers then write
+    rows in this order rather than blindly in `expected` order.
+    """
+    have = [h for h in (api(ws.row_values, 1) or []) if str(h).strip()]
+    if not have:
+        api(ws.update, values=[expected], range_name="A1", value_input_option="RAW")
+        return list(expected)
+    missing = [c for c in expected if c not in have]
+    if missing:
+        merged = have + missing
+        api(ws.update, values=[merged], range_name="A1", value_input_option="RAW")
+        return merged
+    return have
 
 
 def init_sheet(sa_info: dict, sheet_key: str) -> dict[str, Any]:
@@ -510,7 +536,8 @@ def write_table(book, title: str, header: list[str], df: pd.DataFrame,
 def _append(ws, df: pd.DataFrame, header: list[str]) -> int:
     if df is None or not len(df):
         return 0
-    d = df.reindex(columns=header).fillna("")
+    # write in the sheet's own column order, not ours — see sheet_header()
+    d = df.reindex(columns=sheet_header(ws, header)).fillna("")
     values = [["" if pd.isna(v) else str(v) for v in row] for row in d.values.tolist()]
     for i in range(0, len(values), 2000):
         api(ws.append_rows, values[i:i + 2000], value_input_option="RAW",
@@ -808,6 +835,69 @@ def scan_packing(sa_info: dict, sheet_key: str, load_id: str,
 def scan_dispatch(sa_info: dict, sheet_key: str, load_id: str,
                   owner: str = "") -> dict[str, Any]:
     return scan_status(sa_info, sheet_key, load_id, "DISPATCH", owner)
+
+
+def register_gap(sa_info: dict, sheet_key: str, fresh: bool = False) -> dict[str, Any]:
+    """Which picked documents never made it into the invoice register."""
+    got = read_many(sa_info, sheet_key, [WS_LEDGER, WS_INV_SUM], use_cache=not fresh)
+    led = got.get(WS_LEDGER, pd.DataFrame())
+    sm = got.get(WS_INV_SUM, pd.DataFrame())
+    picked = set()
+    if len(led) and "DOC_NUMBER" in led.columns:
+        picked = {R._id_str(x).strip() for x in led["DOC_NUMBER"] if str(x).strip()}
+    known = set()
+    if len(sm) and "TAX_INVOICE_NO" in sm.columns:
+        known = {R._id_str(x).strip() for x in sm["TAX_INVOICE_NO"] if str(x).strip()}
+    missing = sorted(picked - known)
+    return {"picked": len(picked), "registered": len(known), "missing": missing,
+            "n_missing": len(missing)}
+
+
+def backfill_register(sa_info: dict, sheet_key: str, owner: str = "") -> dict[str, Any]:
+    """
+    Write register rows for every picked document that has none — rebuilt from
+    PALLET_LEDGER inside the same lock the register always uses.
+    """
+    with sheet_lock(sa_info, sheet_key, "REGISTER", owner=owner):
+        book = open_book(sa_info, sheet_key)
+        got = read_many(sa_info, sheet_key,
+                        [WS_LEDGER, WS_REGISTRY, WS_INV_SUM, WS_INV_DET], use_cache=False)
+        cur_s = got.get(WS_INV_SUM, pd.DataFrame())
+        cur_d = got.get(WS_INV_DET, pd.DataFrame())
+        res = R.backfill_from_history(got.get(WS_LEDGER, pd.DataFrame()),
+                                      got.get(WS_REGISTRY, pd.DataFrame()),
+                                      cur_s, cur_d, user=owner)
+        if res["added"]:
+            write_table(book, WS_INV_SUM, R.SUMMARY_COLS, res["summary"],
+                        prev_rows=len(cur_s))
+            write_table(book, WS_INV_DET, R.DETAIL_COLS, res["details"],
+                        prev_rows=len(cur_d))
+    cache_clear(sheet_key)
+    return res
+
+
+def save_register_docs(sa_info: dict, sheet_key: str, summary: pd.DataFrame,
+                       details: pd.DataFrame, owner: str = "") -> dict[str, Any]:
+    """
+    Register uploaded documents without a pick run — and, where the ledger
+    shows they were picked earlier, file them as picked with their pallets.
+    """
+    with sheet_lock(sa_info, sheet_key, "REGISTER", owner=owner):
+        book = open_book(sa_info, sheet_key)
+        got = read_many(sa_info, sheet_key,
+                        [WS_LEDGER, WS_INV_SUM, WS_INV_DET], use_cache=False)
+        cur_s = got.get(WS_INV_SUM, pd.DataFrame())
+        cur_d = got.get(WS_INV_DET, pd.DataFrame())
+        sm, det = R.enrich_from_history(summary, details, got.get(WS_LEDGER, pd.DataFrame()))
+        merged = R.merge_summary(cur_s if len(cur_s) else None, sm)
+        merged_d = R.merge_details(cur_d if len(cur_d) else None, det)
+        n_s = write_table(book, WS_INV_SUM, R.SUMMARY_COLS, merged["data"],
+                          prev_rows=len(cur_s))
+        n_d = write_table(book, WS_INV_DET, R.DETAIL_COLS, merged_d, prev_rows=len(cur_d))
+    cache_clear(sheet_key)
+    return {"summary_rows": n_s, "detail_rows": n_d, "new": merged["new"],
+            "updated": merged["updated"], "picked": int((sm["KORBER_PICK"] == "Yes").sum())
+            if len(sm) else 0}
 
 
 def apply_sales_report(sa_info: dict, sheet_key: str, sales_df,

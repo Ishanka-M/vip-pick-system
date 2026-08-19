@@ -24,7 +24,7 @@ from doc_parser import ParsedDoc, base_item, clean_item
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 11
+API = 12
 
 # Warehouse execution status — independent of KORBER_PICK (this app's own pallet
 # allocation). These three track the physical pick / pack / dispatch, driven by
@@ -542,6 +542,224 @@ def apply_dispatch_scan(summary: pd.DataFrame, details: pd.DataFrame, load_id: s
                         user: str = "") -> dict[str, Any]:
     """OUTBOUND PICK SHEET LOAD_ID -> Dispatch = Completed."""
     return apply_status_scan(summary, details, load_id, "DISPATCH", user)
+
+
+# --------------------------------------------------------------------------- #
+# Backfill — invoices picked before the register existed
+# --------------------------------------------------------------------------- #
+BACKFILL_COLS = ["TAX_INVOICE_NO", "DOC_TYPE", "TAX_INVOICE_DATE", "LINES", "QTY",
+                 "PLANT", "PICKED_AT", "SOURCE"]
+
+BACKFILL_REMARK = "Backfilled from the pick history"
+
+
+def _join_unique(s: pd.Series) -> str:
+    return ", ".join(dict.fromkeys(str(x) for x in s if str(x).strip()))
+
+
+def _first_text(s: pd.Series) -> str:
+    for x in s:
+        t = str(x).strip()
+        if t:
+            return t
+    return ""
+
+
+def backfill_from_history(ledger: pd.DataFrame, registry: pd.DataFrame | None,
+                          summary: pd.DataFrame | None, details: pd.DataFrame | None,
+                          user: str = "") -> dict[str, Any]:
+    """
+    Rebuild register rows for invoices that were picked before the register
+    existed — straight from `PALLET_LEDGER`, no files needed.
+
+    The ledger is the honest record of what was actually taken off a pallet:
+    one row per document line per pallet, with the item, lot, location and
+    quantity. A pick is all-or-nothing, so the picked quantity of a line *is*
+    the document quantity, and the register row can be reconstructed exactly.
+
+    `DOC_REGISTRY` fills in the document date and AR number. Only its first
+    few columns are read, deliberately: a stale header on that sheet shifted
+    everything after `PICKED_QTY` by two columns on older rows, so the tail is
+    not trustworthy, while `DOC_NUMBER … PICKED_QTY` are.
+
+    The customer name cannot be recovered this way — it lives only on the PDF —
+    so those rows are left blank and can be filled by re-uploading the invoice.
+    """
+    out = {"summary": summary, "details": details, "report":
+           pd.DataFrame(columns=BACKFILL_COLS), "added": 0, "invoices": []}
+    if ledger is None or not len(ledger) or "DOC_NUMBER" not in ledger.columns:
+        return out
+
+    led = ledger.copy()
+    led["_DOC"] = led["DOC_NUMBER"].map(_id_str).str.strip()
+    led = led[led["_DOC"] != ""]
+    if not len(led):
+        return out
+    led["_QTY"] = pd.to_numeric(led.get("QTY_PICKED"), errors="coerce").fillna(0.0)
+    led["_LINE"] = pd.to_numeric(led.get("DOC_LINE"), errors="coerce").fillna(0).astype(int)
+
+    known = set()
+    if summary is not None and len(summary):
+        known = set(summary["TAX_INVOICE_NO"].map(_id_str).str.strip())
+    todo = [d for d in dict.fromkeys(led["_DOC"]) if d not in known]
+    if not todo:
+        return out
+    led = led[led["_DOC"].isin(set(todo))]
+
+    # document date / AR number from the registry's trustworthy prefix
+    meta: dict[str, dict] = {}
+    if registry is not None and len(registry) and "DOC_NUMBER" in registry.columns:
+        for col in ("DOC_DATE", "REF_NUMBER"):
+            if col not in registry.columns:
+                registry = registry.assign(**{col: ""})
+        for _, r in registry.iterrows():
+            meta[_id_str(r["DOC_NUMBER"]).strip()] = {
+                "date": str(r.get("DOC_DATE", "") or "").strip(),
+                "ref": str(r.get("REF_NUMBER", "") or "").strip()}
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # ---- one detail row per document line ----
+    g = led.groupby(["_DOC", "_LINE"], sort=True)
+    det = pd.DataFrame({
+        "PICKED_QTY": g["_QTY"].sum(),
+        "ITEM_CODE": g["DOC_ITEM_CODE"].agg(_first_text) if "DOC_ITEM_CODE" in led
+        else g["_DOC"].agg(lambda _s: ""),
+        "DESCRIPTION": g["DESCRIPTION"].agg(_first_text) if "DESCRIPTION" in led
+        else g["_DOC"].agg(lambda _s: ""),
+        "ITEM_NUMBER": g["ITEM_NUMBER"].agg(_join_unique) if "ITEM_NUMBER" in led
+        else g["_DOC"].agg(lambda _s: ""),
+        "LOT_NUMBER": g["LOT_NUMBER"].agg(_join_unique) if "LOT_NUMBER" in led
+        else g["_DOC"].agg(lambda _s: ""),
+        "PALLETS": g["PALLET"].agg(_join_unique) if "PALLET" in led
+        else g["_DOC"].agg(lambda _s: ""),
+        "LOCATIONS": g["LOCATION_ID"].agg(_join_unique) if "LOCATION_ID" in led
+        else g["_DOC"].agg(lambda _s: ""),
+        "PLANT": g["PLANT"].agg(_join_unique) if "PLANT" in led
+        else g["_DOC"].agg(lambda _s: ""),
+        "UOM": g["UOM"].agg(_first_text) if "UOM" in led
+        else g["_DOC"].agg(lambda _s: ""),
+        "RUN_ID": g["RUN_ID"].agg(_first_text) if "RUN_ID" in led
+        else g["_DOC"].agg(lambda _s: ""),
+        "DOC_TYPE": g["DOC_TYPE"].agg(_first_text) if "DOC_TYPE" in led
+        else g["_DOC"].agg(lambda _s: ""),
+    }).reset_index().rename(columns={"_DOC": "TAX_INVOICE_NO", "_LINE": "LINE"})
+
+    det["BASE_ID"] = det["ITEM_CODE"].map(base_item)
+    det["DOC_QTY"] = det["PICKED_QTY"]          # all-or-nothing pick
+    det["KORBER_PICK"] = "Yes"
+    det["REMARK"] = BACKFILL_REMARK
+    det["UPDATED_AT"] = now
+    det["TAX_INVOICE_DATE"] = det["TAX_INVOICE_NO"].map(
+        lambda d: meta.get(d, {}).get("date", ""))
+    det["AR_INVOICE_NO"] = det["TAX_INVOICE_NO"].map(
+        lambda d: meta.get(d, {}).get("ref", ""))
+    for c in STATUS_COLS:
+        det[c] = STATUS_PENDING
+    det = det.reindex(columns=DETAIL_COLS, fill_value="")
+
+    # ---- one summary row per document ----
+    dg = det.groupby("TAX_INVOICE_NO", sort=True)
+    sm = pd.DataFrame({
+        "LINES": dg["LINE"].nunique(),
+        "QTY": dg["DOC_QTY"].sum(),
+        "PICKED_QTY": dg["PICKED_QTY"].sum(),
+        "PLANT": dg["PLANT"].agg(_join_unique),
+        "RUN_ID": dg["RUN_ID"].agg(_first_text),
+        "DOC_TYPE": dg["DOC_TYPE"].agg(_first_text),
+        "TAX_INVOICE_DATE": dg["TAX_INVOICE_DATE"].agg(_first_text),
+        "AR_INVOICE_NO": dg["AR_INVOICE_NO"].agg(_first_text),
+    }).reset_index()
+
+    lg = led.groupby("_DOC", sort=True)
+    picked_at = lg["PICK_DATE"].agg(_first_text) if "PICK_DATE" in led.columns else None
+    source = lg["SOURCE_FILE"].agg(_first_text) if "SOURCE_FILE" in led.columns else None
+    sm["PICKED_AT"] = (sm["TAX_INVOICE_NO"].map(picked_at).fillna("")
+                       if picked_at is not None else "")
+    sm["SOURCE_FILE"] = (sm["TAX_INVOICE_NO"].map(source).fillna("")
+                         if source is not None else "")
+    sm["KORBER_PICK"] = "Yes"
+    sm["REMARK"] = BACKFILL_REMARK
+    sm["MRP"] = "No"
+    sm["CUSTOMER_NAME"] = ""            # only the PDF has it
+    sm["FIRST_SEEN"] = sm["PICKED_AT"].where(sm["PICKED_AT"].astype(bool), now)
+    sm["UPDATED_AT"] = now
+    sm["UPDATED_BY"] = user
+    for c in STATUS_COLS:
+        sm[c] = STATUS_PENDING
+    sm = sm.reindex(columns=SUMMARY_COLS, fill_value="")
+
+    report = pd.DataFrame({
+        "TAX_INVOICE_NO": sm["TAX_INVOICE_NO"], "DOC_TYPE": sm["DOC_TYPE"],
+        "TAX_INVOICE_DATE": sm["TAX_INVOICE_DATE"], "LINES": sm["LINES"],
+        "QTY": sm["QTY"], "PLANT": sm["PLANT"], "PICKED_AT": sm["PICKED_AT"],
+        "SOURCE": "PALLET_LEDGER",
+    }).reindex(columns=BACKFILL_COLS)
+
+    merged_s = merge_summary(summary if summary is not None and len(summary) else None, sm)
+    merged_d = merge_details(details if details is not None and len(details) else None, det)
+    return {"summary": merged_s["data"], "details": merged_d, "report": report,
+            "added": len(sm), "invoices": [str(x) for x in sm["TAX_INVOICE_NO"]]}
+
+
+def enrich_from_history(summary: pd.DataFrame, details: pd.DataFrame,
+                        ledger: pd.DataFrame | None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    An uploaded invoice that was in fact picked earlier must not be filed as
+    `No`. Where the ledger has a pick for it, mark it Yes and carry the pallet
+    detail across — so re-uploading a PDF fills in the customer name the ledger
+    never had, without losing what the ledger knows.
+    """
+    if summary is None or not len(summary) or ledger is None or not len(ledger) \
+            or "DOC_NUMBER" not in ledger.columns:
+        return summary, details
+
+    led = ledger.copy()
+    led["_DOC"] = led["DOC_NUMBER"].map(_id_str).str.strip()
+    led["_QTY"] = pd.to_numeric(led.get("QTY_PICKED"), errors="coerce").fillna(0.0)
+    led["_LINE"] = pd.to_numeric(led.get("DOC_LINE"), errors="coerce").fillna(0).astype(int)
+
+    picked = led.groupby("_DOC")["_QTY"].sum()
+    runs = led.groupby("_DOC")["RUN_ID"].agg(_first_text) if "RUN_ID" in led else None
+    when = led.groupby("_DOC")["PICK_DATE"].agg(_first_text) if "PICK_DATE" in led else None
+    plants = led.groupby("_DOC")["PLANT"].agg(_join_unique) if "PLANT" in led else None
+
+    s = summary.copy()
+    key = s["TAX_INVOICE_NO"].map(_id_str).str.strip()
+    hit = key.isin(set(picked.index))
+    if hit.any():
+        s.loc[hit, "KORBER_PICK"] = "Yes"
+        s.loc[hit, "REMARK"] = ""
+        s.loc[hit, "PICKED_QTY"] = key[hit].map(picked).values
+        if runs is not None:
+            s.loc[hit, "RUN_ID"] = key[hit].map(runs).values
+        if when is not None:
+            s.loc[hit, "PICKED_AT"] = key[hit].map(when).values
+        if plants is not None:
+            s.loc[hit, "PLANT"] = key[hit].map(plants).values
+
+    d = details
+    if details is not None and len(details):
+        d = details.copy()
+        dkey = (d["TAX_INVOICE_NO"].map(_id_str).str.strip() + "|"
+                + pd.to_numeric(d["LINE"], errors="coerce").fillna(0)
+                .astype(int).astype(str))
+        lg = led.groupby([led["_DOC"], led["_LINE"]])
+        line_qty = lg["_QTY"].sum()
+        line_qty.index = [f"{a}|{b}" for a, b in line_qty.index]
+        dhit = dkey.isin(set(line_qty.index))
+        if dhit.any():
+            d.loc[dhit, "KORBER_PICK"] = "Yes"
+            d.loc[dhit, "REMARK"] = ""
+            d.loc[dhit, "PICKED_QTY"] = dkey[dhit].map(line_qty).values
+            for col, src in (("ITEM_NUMBER", "ITEM_NUMBER"), ("LOT_NUMBER", "LOT_NUMBER"),
+                             ("PALLETS", "PALLET"), ("LOCATIONS", "LOCATION_ID"),
+                             ("PLANT", "PLANT")):
+                if src in led.columns:
+                    vals = lg[src].agg(_join_unique)
+                    vals.index = [f"{a}|{b}" for a, b in vals.index]
+                    d.loc[dhit, col] = dkey[dhit].map(vals).values
+    return s, d
 
 
 SALES_REPORT_COLS = ["TAX_INVOICE_NO", "CUSTOMER_ITEM", "ITEM_CODE", "BASE_ID",
