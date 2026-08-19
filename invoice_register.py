@@ -24,7 +24,7 @@ from doc_parser import ParsedDoc, base_item, clean_item
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 12
+API = 13
 
 # Warehouse execution status — independent of KORBER_PICK (this app's own pallet
 # allocation). These three track the physical pick / pack / dispatch, driven by
@@ -408,6 +408,92 @@ def _to_num(x: Any) -> float | None:
     s = str(x).replace(",", "").strip()
     m = re.search(r"-?\d+(?:\.\d+)?", s)
     return float(m.group()) if m else None
+
+
+# --------------------------------------------------------------------------- #
+# Pull the live status straight off the Körber dashboard
+# --------------------------------------------------------------------------- #
+# The dashboard serves the same table the Excel export holds, so the fetch only
+# has to end with a DataFrame — after that it is the ordinary upload path. The
+# response could be an HTML page, a CSV, a JSON array or a real .xlsx, so sniff
+# rather than assume: a warehouse endpoint's content type is often wrong.
+FETCH_TIMEOUT = 30
+
+
+def _table_from_bytes(body: bytes, content_type: str = "") -> tuple[pd.DataFrame, str]:
+    ct = (content_type or "").lower()
+    head = body[:512].lstrip()
+
+    if body[:4] == b"PK\x03\x04":                       # a real xlsx
+        return pd.read_excel(io.BytesIO(body)), "excel"
+
+    if head[:1] in (b"{", b"[") or "json" in ct:
+        import json as _json
+        data = _json.loads(body.decode("utf-8", "replace"))
+        # the rows may sit under a key — take the first list of objects found
+        if isinstance(data, dict):
+            for v in data.values():
+                if isinstance(v, list) and v and isinstance(v[0], dict):
+                    data = v
+                    break
+        return pd.DataFrame(data), "json"
+
+    text = body.decode("utf-8", "replace")
+    if "<table" in text.lower() or "html" in ct:
+        tables = pd.read_html(io.StringIO(text))
+        if not tables:
+            raise ValueError("the page has no table in it")
+        # the widest table with a Load Id column, else simply the widest
+        best = max((t for t in tables if _find_col(t, "Load Id")),
+                   key=lambda t: t.shape[1], default=None)
+        return (best if best is not None
+                else max(tables, key=lambda t: t.shape[1])), "html"
+
+    return pd.read_csv(io.StringIO(text), sep=None, engine="python"), "csv"
+
+
+def fetch_live_status(url: str, user: str = "", password: str = "",
+                      token: str = "", timeout: int = FETCH_TIMEOUT) -> dict[str, Any]:
+    """
+    GET the dashboard and hand back the table it is showing.
+
+    Returns the same shape whatever went wrong, so the caller can show the
+    reason instead of a traceback — a warehouse box being unreachable is an
+    ordinary Tuesday, not an exception.
+    """
+    out = {"data": pd.DataFrame(), "kind": "", "rows": 0, "error": "", "url": url}
+    if not str(url or "").strip():
+        out["error"] = "No URL."
+        return out
+    try:
+        import requests
+    except Exception:
+        out["error"] = "The `requests` package is not installed."
+        return out
+
+    try:
+        headers = {"Accept": "text/html,application/json,text/csv,*/*"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        auth = (user, password) if user else None
+        r = requests.get(str(url).strip(), timeout=timeout, headers=headers, auth=auth)
+        r.raise_for_status()
+        df, kind = _table_from_bytes(r.content, r.headers.get("Content-Type", ""))
+    except Exception as ex:                                   # noqa: BLE001
+        out["error"] = f"{type(ex).__name__}: {str(ex)[:300]}"
+        return out
+
+    if df is None or not len(df):
+        out["error"] = "The response held no rows."
+        return out
+    df = df.dropna(axis=1, how="all")
+    if not _find_col(df, "Load Id"):
+        out["error"] = ("No 'Load Id' column in the table that came back — "
+                        f"found: {', '.join(str(c) for c in df.columns[:12])}")
+        out["data"], out["kind"], out["rows"] = df, kind, len(df)
+        return out
+    out.update({"data": df, "kind": kind, "rows": len(df)})
+    return out
 
 
 LIVE_STATUS_REPORT_COLS = ["LOAD_ID", "MATCHED", "PICKING", "DISPATCH"]

@@ -33,7 +33,7 @@ streamlit run app.py
 | File | API |
 |---|---|
 | `gsheet.py` | 9 |
-| `invoice_register.py` | 12 |
+| `invoice_register.py` | 13 |
 | `pick_engine.py` · `pick_pdf.py` | 4 |
 | `doc_parser.py` | 6 |
 | `ui.py` | 3 |
@@ -964,3 +964,34 @@ alignment එක කැඩෙන්නේ නෑ). Rows ලියන්නේ �
 > Backfill එක `DOC_REGISTRY` එකේ **මුල් columns විතරයි** කියවන්නේ
 > (`DOC_NUMBER … PICKED_QTY`) — shift එක පටන් ගන්නේ ඊට පස්සේ නිසා
 > ඒ කොටස විශ්වාසනීයයි. අනිත් හැම දෙයක්ම clean `PALLET_LEDGER` එකෙන්.
+
+---
+
+## 32. Körber dashboard එකෙන් කෙලින්ම Pick_Live_status ගන්න
+
+Excel එකට export කරලා upload කරනවා වෙනුවට, dashboard එකෙන් **කෙලින්ම**
+කියවන්න පුළුවන්. Register tab → **Update status** → *"Fetch from the Körber
+dashboard instead of uploading"*.
+
+1. **Dashboard URL** එක දාන්න — උදා: `http://130.61.243.161:8081/korber/pick/`
+2. **Test** — connect වෙනවද, row කීයක් ආවද, format එක මොකක්ද කියලා පෙන්නනවා
+   (ආපු table එකත් පෙන්නනවා)
+3. **Fetch & apply** — upload එකට හරියටම සමානව Picking / Dispatch update වෙනවා
+4. **Remember this URL** — `APP_SETTINGS` එකේ save වෙනවා, ඊළඟ පාරට type කරන්න ඕන නෑ
+
+Login එකක් ඕන නම් **"It needs a login"** tick කරලා username/password හෝ
+bearer token එකක් දෙන්න.
+
+**Format එක auto-detect වෙනවා** — HTML page (table එක auto තෝරගන්නවා), CSV,
+JSON (`[...]` හෝ `{"rows":[...]}`), හෝ ඇත්ත `.xlsx`. `Load Id` column එකක්
+තියෙන table එක තෝරගන්නවා; නැත්නම් මොන column ආවද කියලා error එකේ පෙන්නනවා.
+Rules ටික එකමයි — `Open Pick = 0` → Picking, `Shipped Pick ≠ 0` හෝ
+`Total Pick = Shipped Pick` → Dispatch.
+
+> **⚠️ Network එක:** app එක run වෙන machine එකෙන් ඒ host + port එකට reach
+> කරන්න පුළුවන් වෙන්න ඕන.
+> * **ඔයාලගේම server එකේ (same network)** → වැඩ කරනවා ✅
+> * **Streamlit Cloud** → ඒ port එක public internet එකට open නම් විතරයි ❌
+>
+> Timeout එකක් ආවොත් — app එක run වෙන machine එකේ browser එකෙන් ඒ URL එක
+> open වෙනවද කියලා බලන්න.

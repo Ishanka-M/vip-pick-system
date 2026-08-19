@@ -37,7 +37,7 @@ st.set_page_config(
 # run against a stale one and say exactly which file to replace.
 _NEEDS = {"pick_engine.py": (E, 4), "doc_parser.py": (P, 6), "pick_pdf.py": (PP, 4),
           "sku_master.py": (SKU, 2), "ui.py": (ui, 3),
-          "invoice_register.py": (R, 12)}
+          "invoice_register.py": (R, 13)}
 _STALE = [(f, getattr(m, "API", 0), n) for f, (m, n) in _NEEDS.items()
           if getattr(m, "API", 0) < n]
 if _STALE:
@@ -55,7 +55,7 @@ if _STALE:
 # catch the opposite — an old app.py deployed beside new modules — which looks
 # like nothing happened at all: the new screen simply is not there. So publish
 # the build plainly enough to check in one glance after a deploy.
-BUILD = "2026-08-19 · roles+stations · backfill"
+BUILD = "2026-08-19 · roles+stations · backfill · live URL"
 try:                                  # gsheet is imported lazily everywhere else
     import gsheet as _gs_mod
     _GS_API = getattr(_gs_mod, "API", 0)
@@ -439,6 +439,91 @@ def _backfill_ui() -> None:
             st.error(f"Register failed: {ex}")
 
 
+def _live_url_ui() -> None:
+    """
+    Pull Pick_Live_status straight off the Körber dashboard instead of
+    exporting it to Excel and uploading it by hand. Same rules either way —
+    only where the table comes from changes.
+    """
+    saved = st.session_state.get("live_url")
+    if saved is None:
+        saved = ""
+        if gs_ready:
+            try:
+                import gsheet
+                saved = gsheet.read_setting(sa_info, sheet_key, "LIVE_STATUS_URL", "")
+            except Exception:
+                saved = ""
+        st.session_state["live_url"] = saved
+
+    with st.expander("Fetch from the Körber dashboard instead of uploading",
+                     expanded=bool(saved)):
+        st.caption("Point this at the pick dashboard and the same table is read "
+                   "over HTTP — HTML page, CSV, JSON or Excel, whichever it "
+                   "serves. The app has to be able to reach that host: on your "
+                   "own server inside the warehouse network it can; on "
+                   "Streamlit Cloud it cannot, unless the port is open to the "
+                   "internet.")
+        url = st.text_input("Dashboard URL", value=saved, key="live_url_in",
+                            placeholder="http://130.61.243.161:8081/korber/pick/")
+        # a checkbox, not a nested expander — Streamlit has refused those in
+        # some versions and this panel already lives inside one
+        usr = pwd = tok = ""
+        if st.checkbox("It needs a login", key="live_url_auth"):
+            u1, u2 = st.columns(2)
+            usr = u1.text_input("Username", key="live_url_user")
+            pwd = u2.text_input("Password", type="password", key="live_url_pw")
+            tok = st.text_input("Or a bearer token", type="password",
+                                key="live_url_token")
+
+        b1, b2, b3 = st.columns(3)
+        if b1.button("Test", width="stretch", key="live_url_test"):
+            with st.spinner("Reading the dashboard..."):
+                got = R.fetch_live_status(url, usr, pwd, tok)
+            st.session_state["live_url_probe"] = got
+        if b2.button("Fetch & apply", type="primary", width="stretch",
+                     key="live_url_apply"):
+            with st.spinner("Reading the dashboard..."):
+                got = R.fetch_live_status(url, usr, pwd, tok)
+            if got["error"]:
+                st.session_state["live_url_probe"] = got
+            else:
+                try:
+                    import gsheet
+                    res = gsheet.apply_live_status(sa_info, sheet_key, got["data"],
+                                                   owner=USER)
+                    st.session_state.pop("reg_cache", None)
+                    st.session_state.pop("_reg_norm", None)
+                    st.session_state["live_status_result"] = res
+                    st.session_state["live_url_probe"] = got
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"Apply failed: {ex}")
+        if b3.button("Remember this URL", width="stretch", key="live_url_save"):
+            st.session_state["live_url"] = url
+            if gs_ready:
+                try:
+                    import gsheet
+                    gsheet.save_setting(sa_info, sheet_key, "LIVE_STATUS_URL", url)
+                    st.toast("URL saved", icon="🔗")
+                except Exception as ex:
+                    st.error(f"Save error: {ex}")
+
+        probe = st.session_state.get("live_url_probe")
+        if probe:
+            if probe["error"]:
+                st.error(probe["error"])
+                st.caption("If it timed out, the app cannot reach that host or "
+                           "port — check the URL in a browser **from the machine "
+                           "the app runs on**, and that the port is open to it.")
+            else:
+                st.success(f"Read {probe['rows']} row(s) as {probe['kind']}.")
+            if len(probe["data"]):
+                with st.expander("What came back"):
+                    st.dataframe(probe["data"].head(50), hide_index=True,
+                                 width="stretch")
+
+
 def _status_update_ui(reg_s: pd.DataFrame, reg_d: pd.DataFrame) -> None:
     """Pick_Live_status + Invoice sales report -> Picking / Packing / Dispatch."""
     st.caption("Upload the WMS **Pick_Live_status** report and/or the ERP "
@@ -452,6 +537,8 @@ def _status_update_ui(reg_s: pd.DataFrame, reg_d: pd.DataFrame) -> None:
 
     XL = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     stamp3 = datetime.now().strftime("%Y%m%d_%H%M")
+
+    _live_url_ui()
 
     c1, c2 = st.columns(2)
     with c1:
