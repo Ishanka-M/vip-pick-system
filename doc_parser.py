@@ -21,7 +21,7 @@ import pdfplumber
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 6
+API = 7
 
 # --------------------------------------------------------------------------- #
 # Item-code helpers
@@ -53,6 +53,27 @@ def _clean_code(s: str) -> str:
 def clean_item(code: Any) -> str:
     """'  p550576-016-140. ' -> 'P550576-016-140'"""
     return _clean_code(_as_code(code))
+
+
+@lru_cache(maxsize=200_000)
+def _tidy_code(s: str) -> str:
+    """Upper-cased and tidied, but the separators left alone."""
+    t = re.sub(r"\s+", " ", s.replace("\n", " ")).strip().upper().rstrip(".")
+    return re.sub(r"[^A-Z0-9\-/ ]", "", t).strip()
+
+
+def tidy_item(code: Any) -> str:
+    """
+    What a document line should *store* as its item code.
+
+    Not `clean_item`: that deletes the space in "P601560 710", and the space is
+    the separator `base_item` needs to see 710 as a suffix. Storing the cleaned
+    form meant every uploaded invoice line carried base "P601560710" while the
+    same part in the inventory and the SKU master carried "P601560", so the two
+    never met. Matching still goes through `clean_item`; only the stored text
+    keeps its shape.
+    """
+    return _tidy_code(_as_code(code))
 
 
 _BASE_SUFFIX = re.compile(r"(?:\d{3})+")
@@ -408,10 +429,10 @@ def _parse_invoice(pdf: pdfplumber.PDF, filename: str) -> ParsedDoc:
 
             sno = cell(i_sno)
             qty = _num(cell(i_qty))
-            item = clean_item(cell(i_item))
+            item = tidy_item(cell(i_item))
 
-            if re.fullmatch(r"\d{1,3}", sno) and qty is not None and item:
-                key = (sno, item, qty)
+            if re.fullmatch(r"\d{1,3}", sno) and qty is not None and clean_item(item):
+                key = (sno, clean_item(item), qty)
                 if key in seen:            # duplicate copy of the same page
                     cur = None
                     continue
@@ -565,11 +586,11 @@ def _parse_challan(pdf: pdfplumber.PDF, filename: str) -> ParsedDoc:
                     return _flat(raw[idx], sep)
 
                 sno = cell(i_sno)
-                item = clean_item(cell(i_item))
+                item = tidy_item(cell(i_item))
                 qty = _num(cell(i_qty))
-                if not (re.fullmatch(r"\d{1,3}", sno) and item and qty):
+                if not (re.fullmatch(r"\d{1,3}", sno) and clean_item(item) and qty):
                     continue
-                key = (sno, item, qty)
+                key = (sno, clean_item(item), qty)
                 if key in seen:                    # Original / Duplicate / Triplicate copies
                     continue
                 seen.add(key)

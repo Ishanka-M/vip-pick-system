@@ -29,7 +29,7 @@ import pick_engine as E
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 10
+API = 11
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -304,7 +304,18 @@ def _frame(rows: list[list[str]]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     head, *body = rows
+    # Unique names, always: a repeated header turns df["TAX_INVOICE_NO"] into a
+    # DataFrame instead of a Series, and every .astype/.map after it breaks in
+    # a way that reads like a data bug. The first copy keeps the real name, so
+    # reindex() still finds the column the app means.
     head = [h if h else f"COL{i}" for i, h in enumerate(head)]
+    seen: dict[str, int] = {}
+    uniq: list[str] = []
+    for h in head:
+        n = seen.get(h, 0) + 1
+        seen[h] = n
+        uniq.append(h if n == 1 else f"{h}_{n}")
+    head = uniq
     body = [r + [""] * (len(head) - len(r)) for r in body]
     return pd.DataFrame([r[:len(head)] for r in body], columns=head, dtype=object)
 
@@ -685,11 +696,17 @@ def delete_load(sa_info: dict, sheet_key: str, load_id: str,
             if n:
                 write_table(book, title, head, pd.DataFrame(keep, columns=head),
                             prev_rows=len(body))
-        # the register must stop claiming this invoice was picked
-        cur = read_ws(sa_info, sheet_key, WS_INV_SUM, use_cache=False)
+        # the register must stop claiming this invoice was picked — summary
+        # *and* details, or the two tabs disagree about the same invoice
+        got = read_many(sa_info, sheet_key, [WS_INV_SUM, WS_INV_DET], use_cache=False)
+        cur = got.get(WS_INV_SUM, pd.DataFrame())
+        cur_d = got.get(WS_INV_DET, pd.DataFrame())
         if cur is not None and len(cur):
             _replace_ws(book, WS_INV_SUM, R.SUMMARY_COLS,
                         R.mark_unpicked(cur, lid, "Load deleted"))
+        if cur_d is not None and len(cur_d):
+            _replace_ws(book, WS_INV_DET, R.DETAIL_COLS,
+                        R.mark_unpicked_details(cur_d, lid, "Load deleted"))
     cache_clear(sheet_key)
     return removed
 
@@ -783,14 +800,20 @@ def save_register(sa_info: dict, sheet_key: str, summary: pd.DataFrame,
 
 def register_unpick(sa_info: dict, sheet_key: str, invoice_no: str,
                     remark: str = "Load deleted", owner: str = "") -> int:
-    """A deleted load has to show as not picked again."""
+    """A deleted load has to show as not picked again — summary and details."""
     with sheet_lock(sa_info, sheet_key, "REGISTER", owner=owner):
         book = open_book(sa_info, sheet_key)
-        cur = read_ws(sa_info, sheet_key, WS_INV_SUM, use_cache=False)
+        got = read_many(sa_info, sheet_key, [WS_INV_SUM, WS_INV_DET], use_cache=False)
+        cur = got.get(WS_INV_SUM, pd.DataFrame())
+        cur_d = got.get(WS_INV_DET, pd.DataFrame())
         if cur is None or not len(cur):
             return 0
         upd = R.mark_unpicked(cur, invoice_no, remark)
         n = _replace_ws(book, WS_INV_SUM, R.SUMMARY_COLS, upd)
+        if cur_d is not None and len(cur_d):
+            _replace_ws(book, WS_INV_DET, R.DETAIL_COLS,
+                        R.mark_unpicked_details(cur_d, invoice_no, remark),
+                        prev_rows=len(cur_d))
     cache_clear(sheet_key)
     return n
 
@@ -830,7 +853,7 @@ def scan_status(sa_info: dict, sheet_key: str, load_id: str, column: str = "PACK
         cur_s = got.get(WS_INV_SUM, pd.DataFrame())
         cur_d = got.get(WS_INV_DET, pd.DataFrame())
         res = R.apply_status_scan(cur_s, cur_d, load_id, column=column, user=owner)
-        if res["found"] and not res["already"]:
+        if res["found"] and res.get("changed"):
             write_table(book, WS_INV_SUM, R.SUMMARY_COLS, res["summary"],
                         prev_rows=len(cur_s))
             write_table(book, WS_INV_DET, R.DETAIL_COLS, res["details"],

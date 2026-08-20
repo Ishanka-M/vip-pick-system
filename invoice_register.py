@@ -24,7 +24,7 @@ from doc_parser import ParsedDoc, base_item, clean_item
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 14
+API = 15
 
 # Warehouse execution status — independent of KORBER_PICK (this app's own pallet
 # allocation). These three track the physical pick / pack / dispatch, driven by
@@ -236,11 +236,11 @@ def strip_duplicates(summary: pd.DataFrame, details: pd.DataFrame | None = None
     if summary is None or not len(summary):
         return {"summary": summary, "details": details, "dropped": 0, "invoices": []}
     bad = is_duplicate_row(summary)
-    nums = [str(x) for x in summary.loc[bad, "TAX_INVOICE_NO"]]
+    nums = [_id_str(x) for x in summary.loc[bad, "TAX_INVOICE_NO"]]
     out_s = summary[~bad].reset_index(drop=True)
     out_d = details
     if details is not None and len(details) and nums:
-        out_d = details[~details["TAX_INVOICE_NO"].astype(str).isin(set(nums))] \
+        out_d = details[~details["TAX_INVOICE_NO"].map(_id_str).isin(set(nums))] \
             .reset_index(drop=True)
     return {"summary": out_s, "details": out_d, "dropped": int(bad.sum()),
             "invoices": nums}
@@ -259,20 +259,22 @@ def merge_summary(old: pd.DataFrame | None, new: pd.DataFrame) -> dict[str, Any]
         new = new[~is_duplicate_row(new)].reset_index(drop=True)
     if old is None or not len(old):
         return {"data": new.reindex(columns=cols), "new": len(new), "updated": 0,
-                "picked_now": [n for n, k in zip(new["TAX_INVOICE_NO"], new["KORBER_PICK"])
+                "picked_now": [_id_str(n) for n, k in
+                               zip(new["TAX_INVOICE_NO"], new["KORBER_PICK"])
                                if k == "Yes"]}
 
     o = old.reindex(columns=cols).copy()
-    o["TAX_INVOICE_NO"] = o["TAX_INVOICE_NO"].astype(str)
+    o["TAX_INVOICE_NO"] = o["TAX_INVOICE_NO"].map(_id_str)
     o = o.drop_duplicates(subset=["TAX_INVOICE_NO"], keep="last")
-    idx = {str(v): i for i, v in enumerate(o["TAX_INVOICE_NO"])}
+    idx = {_id_str(v): i for i, v in enumerate(o["TAX_INVOICE_NO"])}
     rows = o.to_dict("records")
 
     n_new = n_upd = 0
     picked_now: list[str] = []
     for _, r in new.iterrows():
-        num = str(r["TAX_INVOICE_NO"])
+        num = _id_str(r["TAX_INVOICE_NO"])
         rec = dict(r)
+        rec["TAX_INVOICE_NO"] = num
         if num not in idx:
             rows.append(rec)
             n_new += 1
@@ -313,25 +315,48 @@ def merge_details(old: pd.DataFrame | None, new: pd.DataFrame) -> pd.DataFrame:
     """
     if new is None or not len(new):
         return (old if old is not None else pd.DataFrame(columns=DETAIL_COLS))
+    # same belt and braces as merge_summary: a line that only exists because the
+    # invoice was uploaded twice is not a line, and its summary row is dropped
+    new = new[~is_duplicate_row(new)]
+    if not len(new):
+        return (old if old is not None else pd.DataFrame(columns=DETAIL_COLS))
     new = new.reindex(columns=DETAIL_COLS).copy()
     if old is None or not len(old):
         return new
-    nums = {str(x) for x in new["TAX_INVOICE_NO"]}
+    nums = {_id_str(x) for x in new["TAX_INVOICE_NO"]}
     old = old.reindex(columns=DETAIL_COLS)
-    touched = old["TAX_INVOICE_NO"].astype(str).isin(nums)
+    touched = old["TAX_INVOICE_NO"].map(_id_str).isin(nums)
     prior = old[touched]
     if len(prior):
         # Carry every Completed status forward by an indexed lookup rather than
         # a per-row scan — .iterrows() over the prior rows cost 136 ms on a
         # 30 000-line register, and this runs inside the save lock.
-        pkey = (prior["TAX_INVOICE_NO"].astype(str) + "|"
+        pkey = (prior["TAX_INVOICE_NO"].map(_id_str) + "|"
                 + prior["LINE"].astype(str))
-        nkey = (new["TAX_INVOICE_NO"].astype(str) + "|"
+        nkey = (new["TAX_INVOICE_NO"].map(_id_str) + "|"
                 + new["LINE"].astype(str))
         for k in STATUS_COLS:
             done = pkey[prior[k].astype(str) == STATUS_DONE]
             if len(done):
                 new.loc[nkey.isin(set(done)), k] = STATUS_DONE
+
+        # A line already picked stays picked. merge_summary() protects the
+        # summary's Yes the same way; without this the Details tab answered
+        # "No, pallets unknown" for an invoice the Summary tab still calls
+        # picked, and the allocation behind it was lost.
+        was_yes = pkey[prior["KORBER_PICK"].astype(str).str.strip() == "Yes"]
+        if len(was_yes):
+            keep = nkey.isin(set(was_yes)) & \
+                (new["KORBER_PICK"].astype(str).str.strip() != "Yes")
+            if keep.any():
+                cols = ["KORBER_PICK", "PICKED_QTY", "ITEM_NUMBER", "LOT_NUMBER",
+                        "PALLETS", "LOCATIONS", "PLANT", "REMARK", "RUN_ID"]
+                src = prior.set_index(pd.Index(pkey.to_numpy(dtype=object)))
+                src = src[~src.index.duplicated(keep="last")]
+                take = nkey[keep]
+                new = _writable(new, *cols)
+                for c in cols:
+                    new.loc[keep, c] = take.map(src[c]).values
     return pd.concat([old[~touched], new], ignore_index=True)
 
 
@@ -356,7 +381,7 @@ def mark_unpicked(summary: pd.DataFrame, invoice_no: str,
     if summary is None or not len(summary):
         return summary
     d = summary.copy()
-    m = d["TAX_INVOICE_NO"].astype(str) == str(invoice_no).strip()
+    m = d["TAX_INVOICE_NO"].map(_id_str) == _id_str(invoice_no).strip()
     if not m.any():
         return d
     _writable(d, "PICKED_QTY")
@@ -366,6 +391,35 @@ def mark_unpicked(summary: pd.DataFrame, invoice_no: str,
     for c in ("RUN_ID", "PICKED_AT"):
         d.loc[m, c] = ""
     d.loc[m, "PICKED_QTY"] = 0.0
+    d.loc[m, "UPDATED_AT"] = stamp
+    return d
+
+
+def mark_unpicked_details(details: pd.DataFrame, invoice_no: str,
+                          remark: str = "Load deleted") -> pd.DataFrame:
+    """
+    The detail rows have to be released with the summary.
+
+    Deleting a load hands the pallets back, so a detail line that still named a
+    pallet, lot and location would be pointing at stock that is free again —
+    and the register would answer "Yes, picked" on the Details tab while the
+    Summary tab says "No". Picking/Packing/Dispatch are *not* touched: those
+    record what the floor did, not this app's allocation.
+    """
+    if details is None or not len(details):
+        return details
+    d = details.copy()
+    m = d["TAX_INVOICE_NO"].map(_id_str) == _id_str(invoice_no).strip()
+    if not m.any():
+        return d
+    _writable(d, "PICKED_QTY")
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    d.loc[m, "KORBER_PICK"] = "No"
+    d.loc[m, "REMARK"] = f"{remark} · {stamp}"
+    d.loc[m, "PICKED_QTY"] = 0.0
+    for c in ("ITEM_NUMBER", "LOT_NUMBER", "PALLETS", "LOCATIONS", "RUN_ID"):
+        if c in d.columns:
+            d.loc[m, c] = ""
     d.loc[m, "UPDATED_AT"] = stamp
     return d
 
@@ -554,14 +608,16 @@ def apply_pick_live_status(summary: pd.DataFrame, details: pd.DataFrame,
         pick_set[lid] = pick_set.get(lid, False) or p_done
         disp_set[lid] = disp_set.get(lid, False) or d_done
 
-    known = {str(x).strip() for x in summary["TAX_INVOICE_NO"]}
+    known = {_id_str(x).strip() for x in summary["TAX_INVOICE_NO"]}
     for lid in sorted(set(pick_set) | set(disp_set)):
         rows.append({"LOAD_ID": lid, "MATCHED": lid in known,
                     "PICKING": STATUS_DONE if pick_set.get(lid) else "",
                     "DISPATCH": STATUS_DONE if disp_set.get(lid) else ""})
 
     s = summary.copy()
-    inv = s["TAX_INVOICE_NO"].astype(str).str.strip()
+    # _id_str, not astype(str): a register read from Excel rather than the sheet
+    # gives '30426013174.0' and would match nothing.
+    inv = s["TAX_INVOICE_NO"].map(_id_str).str.strip()
     n_pick = n_disp = 0
     for lid, done in pick_set.items():
         if not done:
@@ -579,7 +635,7 @@ def apply_pick_live_status(summary: pd.DataFrame, details: pd.DataFrame,
     d = details
     if details is not None and len(details):
         d = details.copy()
-        dinv = d["TAX_INVOICE_NO"].astype(str).str.strip()
+        dinv = d["TAX_INVOICE_NO"].map(_id_str).str.strip()
         for lid, done in pick_set.items():
             if done:
                 d.loc[(dinv == lid) & (d["PICKING"] != STATUS_DONE), "PICKING"] = STATUS_DONE
@@ -604,8 +660,8 @@ def apply_status_scan(summary: pd.DataFrame, details: pd.DataFrame, load_id: str
     if column not in STATUS_COLS:
         raise ValueError(f"{column!r} is not one of {STATUS_COLS}")
     lid = _id_str(load_id).strip()
-    out = {"found": False, "already": False, "invoice": None, "column": column,
-          "summary": summary, "details": details}
+    out = {"found": False, "already": False, "changed": False, "invoice": None,
+          "column": column, "summary": summary, "details": details}
     if not lid or summary is None or not len(summary):
         return out
     inv = summary["TAX_INVOICE_NO"].map(_id_str).str.strip()
@@ -624,13 +680,20 @@ def apply_status_scan(summary: pd.DataFrame, details: pd.DataFrame, load_id: str
     if user:
         s.loc[m, "UPDATED_BY"] = user
     out["summary"] = s
+    changed = not out["already"]
 
     if details is not None and len(details):
         d = details.copy()
         dm = d["TAX_INVOICE_NO"].map(_id_str).str.strip() == lid
+        # `already` speaks for the summary row only. The detail lines can still
+        # be Pending — a line added by a later re-upload, or a backfill that ran
+        # after the scan — and skipping the write on `already` left them Pending
+        # for good.
+        changed = changed or bool((dm & (d[column].astype(str) != STATUS_DONE)).any())
         d.loc[dm, column] = STATUS_DONE
         d.loc[dm, "UPDATED_AT"] = stamp
         out["details"] = d
+    out["changed"] = changed
     return out
 
 
@@ -1027,16 +1090,19 @@ def apply_sales_report(summary: pd.DataFrame, details: pd.DataFrame,
     n_inv_done = 0
     if details is not None and len(details) and matched_keys:
         d = details.copy()
-        keys = list(zip(d["TAX_INVOICE_NO"].astype(str).str.strip(),
-                        d["ITEM_CODE"].map(base_item)))
+        # _id_str on both sides: matched_keys was built with it, so plain
+        # astype(str) here would miss every invoice number Excel handed back
+        # as a float.
+        d_inv = d["TAX_INVOICE_NO"].map(_id_str).str.strip()
+        keys = list(zip(d_inv, d["ITEM_CODE"].map(base_item)))
         hit_mask = pd.Series([k in matched_keys for k in keys], index=d.index)
         d.loc[hit_mask & (d["PICKING"] != STATUS_DONE), "PICKING"] = STATUS_DONE
 
         if summary is not None and len(summary):
             s = summary.copy()
-            all_done = d.groupby("TAX_INVOICE_NO")["PICKING"].apply(
+            all_done = d.groupby(d_inv)["PICKING"].apply(
                 lambda x: bool(len(x)) and (x == STATUS_DONE).all())
-            inv_col = s["TAX_INVOICE_NO"].astype(str).str.strip()
+            inv_col = s["TAX_INVOICE_NO"].map(_id_str).str.strip()
             for inv, done in all_done.items():
                 if not done:
                     continue
@@ -1067,27 +1133,45 @@ _REASONS: list[tuple[str, str]] = [
 ]
 
 
-def parse_date(v: Any) -> Any:
-    """'12-AUG-2026' first, anything else after."""
-    d = pd.to_datetime(v, format="%d-%b-%Y", errors="coerce")
-    if pd.isna(d):
-        d = pd.to_datetime(v, dayfirst=True, errors="coerce")
-    return d
+# Tried in order, each one only on what is still unparsed. Order matters:
+#   * "12-AUG-2026" is what the Donaldson PDFs carry;
+#   * ISO must beat dayfirst, or "2026-08-01" is read as 8 January;
+#   * day-first slashes come last, because this is an Indian ERP — "01/08/2026"
+#     is 1 August, never 8 January.
+_DATE_FORMATS = ("%d-%b-%Y", "%d-%B-%Y", "%d/%b/%Y", "ISO8601",
+                 "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%Y/%m/%d")
 
 
 def parse_dates(s: pd.Series) -> pd.Series:
     """
-    Same rules as `parse_date`, one pass over the column.
+    A whole date column in one pass — every row read by the same rules.
 
-    `.map(parse_date)` calls pd.to_datetime once per row — 306 ms on a 5 000-row
-    register, on every single rerun of the Dashboard. Vectorised it is ~2 ms.
+    Not `pd.to_datetime(col, dayfirst=True)`: pandas infers a single format from
+    the first value and NaTs every row that does not share it, so one ISO date
+    at the top of the register silently blanked every `01/08/2026` below it.
+    Not `.map()` either — that is 306 ms on a 5 000-row register on every rerun
+    of the Dashboard. So: vectorised, but one explicit format at a time.
     """
-    txt = s.astype("string")
-    out = pd.to_datetime(txt, format="%d-%b-%Y", errors="coerce")
-    rest = out.isna() & txt.notna() & (txt.str.strip() != "")
-    if rest.any():
-        out.loc[rest] = pd.to_datetime(txt[rest], dayfirst=True, errors="coerce")
+    txt = pd.Series(s, dtype="object").astype("string")
+    todo = txt.notna() & (txt.str.strip() != "")
+    out = pd.Series(pd.NaT, index=txt.index, dtype="datetime64[ns]")
+    for fmt in _DATE_FORMATS:
+        if not todo.any():
+            return out
+        got = pd.to_datetime(txt[todo], format=fmt, errors="coerce")
+        hit = got.notna()
+        if hit.any():
+            out.loc[got.index[hit]] = got[hit]
+            todo = todo & ~todo.index.isin(got.index[hit])
+    if todo.any():                       # anything left: let pandas guess, row by row
+        got = pd.to_datetime(txt[todo], dayfirst=True, errors="coerce", format="mixed")
+        out.loc[got.index] = got
     return out
+
+
+def parse_date(v: Any) -> Any:
+    """One value, by exactly the same rules as the column — never diverge."""
+    return parse_dates(pd.Series([v])).iloc[0]
 
 
 def classify(remark: Any) -> str:
@@ -1178,7 +1262,7 @@ def dashboard(summary: pd.DataFrame, date_from: Any = None, date_to: Any = None,
     return {"kpi": kpi, "by_reason": by_reason, "by_customer": by_customer,
             "pending": _tidy(pend), "picked": _tidy(done),
             "summary": d.reindex(columns=SUMMARY_COLS).reset_index(drop=True),
-            "invoices": [str(x) for x in d["TAX_INVOICE_NO"]],
+            "invoices": [_id_str(x) for x in d["TAX_INVOICE_NO"]],
             "duplicates": n_dup}
 
 
@@ -1186,9 +1270,9 @@ def details_for(details: pd.DataFrame, invoices: list[str]) -> pd.DataFrame:
     """Detail lines belonging to a set of invoices — keeps the two reports in step."""
     if details is None or not len(details):
         return pd.DataFrame(columns=DETAIL_COLS)
-    keep = {str(x) for x in (invoices or [])}
+    keep = {_id_str(x) for x in (invoices or [])}
     d = details.reindex(columns=DETAIL_COLS)
-    return d[d["TAX_INVOICE_NO"].astype(str).isin(keep)].reset_index(drop=True)
+    return d[d["TAX_INVOICE_NO"].map(_id_str).isin(keep)].reset_index(drop=True)
 
 
 def pending_excel(dash: dict[str, Any]) -> bytes:

@@ -35,9 +35,9 @@ st.set_page_config(
 # Streamlit Cloud redacts exception text, so a half-updated deploy used to die
 # with an unreadable TypeError. Every module carries an API number; refuse to
 # run against a stale one and say exactly which file to replace.
-_NEEDS = {"pick_engine.py": (E, 4), "doc_parser.py": (P, 6), "pick_pdf.py": (PP, 4),
-          "sku_master.py": (SKU, 2), "ui.py": (ui, 3),
-          "invoice_register.py": (R, 14)}
+_NEEDS = {"pick_engine.py": (E, 5), "doc_parser.py": (P, 7), "pick_pdf.py": (PP, 4),
+          "sku_master.py": (SKU, 3), "ui.py": (ui, 3),
+          "invoice_register.py": (R, 15)}
 _STALE = [(f, getattr(m, "API", 0), n) for f, (m, n) in _NEEDS.items()
           if getattr(m, "API", 0) < n]
 if _STALE:
@@ -55,12 +55,22 @@ if _STALE:
 # catch the opposite — an old app.py deployed beside new modules — which looks
 # like nothing happened at all: the new screen simply is not there. So publish
 # the build plainly enough to check in one glance after a deploy.
-BUILD = "2026-08-20 · pandas-3 dtype fix"
+BUILD = "2026-08-20 · dataflow audit"
+_GS_NEEDS = 11
 try:                                  # gsheet is imported lazily everywhere else
     import gsheet as _gs_mod
     _GS_API = getattr(_gs_mod, "API", 0)
 except Exception:                     # pragma: no cover
     _GS_API = 0
+    _gs_mod = None
+# gsheet.py used to sit outside the gate, so a deploy that forgot it failed
+# silently and looked like a logic bug instead of a missing file.
+if _gs_mod is not None and _GS_API < _GS_NEEDS:
+    st.error(
+        "**These files are out of date — replace them and redeploy.**\n\n"
+        f"- `gsheet.py` — found API {_GS_API or 'none'}, needs {_GS_NEEDS}"
+    )
+    st.stop()
 BUILD_APIS = (f"engine {getattr(E, 'API', 0)} · parser {getattr(P, 'API', 0)} "
               f"· register {getattr(R, 'API', 0)} · sheet {_GS_API} "
               f"· pdf {getattr(PP, 'API', 0)} · sku {getattr(SKU, 'API', 0)} "
@@ -1550,11 +1560,39 @@ with tab_gen:
 
             res = st.session_state.get("result")
 
+            # The sheet save goes first, because it is the one that can decide
+            # a document is *not* ours to claim: another user saving the same
+            # invoice mid-run drops it here. Writing the register before that
+            # answer came back filed those documents as picked, with a RUN_ID
+            # that has no ledger, no registry row and no WMS output behind it.
+            _skipped: list[str] = []
+            if res is not None and gs_ready and autosave and len(res["master"]):
+                try:
+                    import gsheet
+                    with st.spinner("Saving to the Google Sheet..."):
+                        r = gsheet.save_run(sa_info, sheet_key, res, cfg, note=note,
+                                            owner=USER)
+                    st.success(f"Saved · master {r['master']} · detail {r['detail']} "
+                               f"· ledger {r['ledger']} rows")
+                    _skipped = list(r.get("skipped") or [])
+                    if _skipped:
+                        st.warning("Another user had already saved these - skipped: "
+                                   + ", ".join(_skipped))
+                    st.markdown(f"[Open the sheet]({r['url']})")
+                    st.session_state["saved"] = res["run_id"]
+                except gsheet.LockBusy as ex:
+                    st.warning(f"🔒 {ex}")
+                except Exception as ex:
+                    st.error(f"Save error: {ex}")
+
             # every uploaded document is registered, picked or not
             if res is not None:
                 _sum, _det = R.build(st.session_state["docs"], res, MRP_CONTACTS,
                                      user=USER,
                                      plant=", ".join(st.session_state["plants_ok"]))
+                for _n in _skipped:
+                    _sum = R.mark_unpicked(_sum, _n, "DUPLICATE (other user)")
+                    _det = R.mark_unpicked_details(_det, _n, "DUPLICATE (other user)")
                 st.session_state["reg_run"] = (_sum, _det)
                 _dups = _sum.attrs.get("skipped_duplicates", [])
                 if _dups:
@@ -1572,24 +1610,6 @@ with tab_gen:
                         st.warning(f"Register: {ex}")
                     except Exception as ex:
                         st.warning(f"Register not saved: {ex}")
-
-            if res is not None and gs_ready and autosave and len(res["master"]):
-                try:
-                    import gsheet
-                    with st.spinner("Saving to the Google Sheet..."):
-                        r = gsheet.save_run(sa_info, sheet_key, res, cfg, note=note,
-                                            owner=USER)
-                    st.success(f"Saved · master {r['master']} · detail {r['detail']} "
-                               f"· ledger {r['ledger']} rows")
-                    if r.get("skipped"):
-                        st.warning("Another user had already saved these - skipped: "
-                                   + ", ".join(r["skipped"]))
-                    st.markdown(f"[Open the sheet]({r['url']})")
-                    st.session_state["saved"] = res["run_id"]
-                except gsheet.LockBusy as ex:
-                    st.warning(f"🔒 {ex}")
-                except Exception as ex:
-                    st.error(f"Save error: {ex}")
 
     # ---------------- results ---------------- #
     res = st.session_state.get("result")

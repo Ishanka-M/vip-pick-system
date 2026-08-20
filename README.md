@@ -1025,3 +1025,158 @@ number එකක් ලියන **හැම තැනම**:
 ඒ එක්කම `_writable()` කියලා guard එකකුත් තියෙනවා — number ලියන්න කලින්
 ඒ column එක විතරක් widen කරනවා (30 000 row frame එකක් මුළුමනින්ම copy
 කරන්නේ නෑ).
+
+---
+
+## 34. Dataflow / data mapping audit — හම්බුණු bug 10ක් සහ fix
+
+"System එක මුල ඉඳන් check කරලා bugs තියෙනවා නම් හදන්න" කියලා කරපු
+**systematic** audit එකක ප්‍රතිඵලය. Accident වලින් හම්බුණ ඒවා නෙවෙයි —
+හැම boundary එකකම (PDF → DocLine → engine → register → sheet → dashboard)
+column mapping එක mechanically cross-check කරලා හම්බුණු ඒවා.
+
+හැම එකකටම `test_dataflow.py` එකේ test එකක් තියෙනවා, ඒ නිසා ආපහු කැඩුනොත්
+වහාම හසුවෙනවා.
+
+### Critical — pick එකට කෙලින්ම බලපානවා
+
+**1. Base ID එක layer දෙකක දෙවිදිහකට හැදුනා**
+
+| තැන | `P601560 710` → base | |
+|---|---|---|
+| Invoice line (`DocLine.base`) | `P601560` | ✅ |
+| Inventory (`normalize_inventory`) | `P601560710` | ❌ |
+| SKU master | `P601560` | ✅ |
+
+`normalize_inventory` එකේ base එක හදාගත්තේ **clean කරපු** item number
+එකෙන් — ඒකෙන් space එක delete වෙලා තිබ්බා, base_item එකට suffix එක
+වෙන් කරගන්න **ඕනේ ඒ space එකමයි**. ඒ නිසා invoice එකේ තිබ්බ item එකට
+ඒකේම stock එක හම්බුනේ නෑ → **"Item not in inventory / plant" →
+STOCK SHORT**. Space තියෙන හැම code එකකටම (SKU_MASTER එකේ 10 377න්
+631ක්) මේක වෙනවා.
+
+*Fix:* base එක **raw code** එකෙන් හදනවා (`item_number_raw`), අනිත්
+හැම තැනම වගේම.
+
+**2. PDF parser එකම item code එක කඩලා දැම්මා**
+
+`item_code=clean_item(cell)` — parse කරන වෙලාවෙම space එක නැති වුණා.
+ඒ නිසා `INVOICE_DETAIL.BASE_ID` එකත් වැරදි වුණා, sales reconciliation
+එකත් වැරදි key එකකින් හෙව්වා.
+
+*Fix:* අලුත් `tidy_item()` — upper case + trim, **separator ඒ විදිහටම**.
+Match කරද්දී තාමත් `clean_item()` හරහා, ඒ නිසා match key එක වෙනස් නෑ.
+
+*ඒ එක්කම:* engine එකේ pool එකට exact-code fallback එකක් — document
+එකේ `P601560710` (කඩන්න බැරි එක) සහ inventory එකේ `P601560 710`,
+දෙකම එකම `clean_item` key එකට යනවා, ඒ නිසා දැන් හම්බෙනවා.
+
+### High — data එක වැරදියට පෙන්නනවා
+
+**3. Date parsing — column එකේ පළවෙනි row එකෙන් හැම row එකක්ම කැඩුනා**
+
+`pd.to_datetime(column, dayfirst=True)` කරද්දී pandas **පළවෙනි value
+එකෙන් format එකක් අනුමාන කරලා** ඒකට නොගැලපෙන හැම row එකක්ම `NaT`
+කරනවා. ඒ නිසා register එකේ උඩම `2026-08-01` වගේ ISO date එකක් තිබ්බොත්
+ඊට යටින් තිබ්බ **හැම `01/08/2026` එකක්ම blank** වුණා. ඒ විතරක් නෙවෙයි —
+`dayfirst` නිසා `2026-08-01` කියෙව්වේ **8 January** කියලා.
+
+තව: `parse_date` (එකක්) සහ `parse_dates` (column එක) **එකම value එකට
+උත්තර දෙකක්** දුන්නා.
+
+*Fix:* format list එකක් **පිළිවෙලට**, තාම parse නොවුණු row වලට විතරක්.
+`parse_date` දැන් `parse_dates` එකෙන්ම හදලා — ආපහු වෙන් වෙන්න බෑ.
+Speed එකට බලපෑමක් නෑ (5 000 row = 18 ms).
+
+**4. Invoice number එක තැන් දෙකක දෙවිදිහකට match වුණා**
+
+සමහර තැන් `_id_str` (Excel එකෙන් එන `30426013174.0` එකේ `.0` අයින්
+කරන එක), සමහර තැන් plain `astype(str)`. Excel හරහා ආපු register එකක්
+**එකම invoice එකට row දෙකක්** හැදුවා, dashboard එකට ඒකේම detail line
+හම්බුනේ නෑ.
+
+*Fix:* හැම path එකකම `_id_str`, සහ normalize වුණු එකම store වෙනවා.
+
+**5. Sales report එක reconcile කරලා update කරේ නෑ**
+
+Key හදද්දී `_id_str`, ආපහු register එකට ලියද්දී `astype(str)` — float
+විදිහට ආපු invoice number වලට **match වුණාට update වුණේ නෑ**.
+
+### Medium — SUMMARY සහ DETAIL එකිනෙකට විරුද්ධ වුණා
+
+**6. Load එකක් delete කරද්දී DETAIL එක තාම "picked" කිව්වා**
+
+`delete_load` / `register_unpick` දෙකම `INVOICE_SUMMARY` විතරයි reset
+කරේ. `INVOICE_DETAIL` එකේ pallet, lot, location එහෙමම තිබ්බා — release
+වුණු stock එකකට. Summary tab එකේ `No`, Details tab එකේ `Yes`.
+
+*Fix:* අලුත් `mark_unpicked_details()` — pallet/lot/location/qty clear
+වෙනවා. **Picking/Packing/Dispatch clear වෙන්නේ නෑ** (ඒවා floor එකේ
+වැඩේ, මේ app එකේ allocation එක නෙවෙයි).
+
+**7. Re-upload එකකදී DETAIL එක "No" වුණා, SUMMARY එක "Yes" වුණා**
+
+`merge_summary` දැනටමත් තියෙන `Yes` එක රකිනවා. `merge_details` detail
+row ටික **මුළුමනින්ම replace** කරා → allocation එක නැති වුණා.
+
+*Fix:* merge_details එකත් pick එක carry කරගෙන යනවා.
+
+**8. Scan එකක් DETAIL එකට reach වුණේ නෑ**
+
+`scan_status` write එක skip කරේ summary row එක දැනටමත් `Completed`
+නම්. ඒත් detail line එකක් තාම `Pending` වෙන්න පුළුවන් (scan එකෙන්
+පස්සේ re-upload එකක් / backfill එකක් ආවොත්) → ඒක **හැමදාටම** Pending.
+
+*Fix:* summary එකේ තත්වය නෙවෙයි, **ඇත්තටම වෙනස් වුණාද** කියලා බලනවා.
+
+### Medium — save order
+
+**9. Sheet එක "නෑ" කියන්න කලින්ම register එකට "picked" කියලා ලිව්වා**
+
+`save_run` තමයි "මේ document එක තව කෙනෙක් දැනටමත් save කරලා" කියලා
+තීරණය කරන්නේ. ඒත් register එක ලිව්වේ **ඒකට කලින්**. ඒ නිසා ඒ documents
+ledger එකක්, registry row එකක්, WMS output එකක් නැති RUN_ID එකක් යටතේ
+"picked" විදිහට file වුණා.
+
+*Fix:* save කරලා, skip වුණු ඒවා demote කරලා, ඊට පස්සේ register එකට.
+
+### Low — silent failure modes
+
+**10. `gsheet.py` version gate එකෙන් පිටත තිබ්බා**
+
+`gsheet.py` replace කරන්න අමතක වුණොත් app එක **කිසිම දෙයක් නොකියා**
+පරණ code එකෙන් දිගටම දුවනවා — logic bug එකක් වගේ පේනවා. දැන් අනිත්
+module වගේම gate එකේ.
+
+*ඒ එක්කම:* sheet header එකේ එකම නම දෙපාරක් තිබ්බොත් `df["COL"]` එකෙන්
+Series එකක් වෙනුවට DataFrame එකක් එනවා, ඊට පස්සේ තියෙන හැම
+`.astype` / `.map` එකක්ම කැඩෙනවා. `_frame()` දැන් නම් unique කරනවා
+(`A`, `A_2`) — පළවෙනි එකට හරි නම එහෙමම තියෙනවා.
+
+### `test_engine.py` → `test_dataflow.py`
+
+පරණ `test_engine.py` එකේ තිබ්බේ `pick_engine.run_pipeline()` කියලා
+**මේ app එකේ නැති** API එකක් (HJ/SAP carton multiplier, Requirement
+file). Import එකවත් වුණේ නෑ, ඒ නිසා ඒකෙන් **කිසිම දෙයක් check වුණේ නෑ**.
+
+අලුත් `test_dataflow.py` එකේ test 23ක් — ඉහත හැම bug එකකටම එකක්:
+
+```bash
+python test_dataflow.py          # හෝ
+python -m pytest test_dataflow.py
+```
+
+| Module | දැන් API |
+|---|---|
+| `doc_parser.py` | 7 |
+| `pick_engine.py` | 5 |
+| `invoice_register.py` | 15 |
+| `gsheet.py` | 11 |
+| `sku_master.py` | 3 |
+| `pick_pdf.py` | 4 |
+| `ui.py` | 3 |
+
+**File 8ම replace කරන්න** — `app.py`, `doc_parser.py`, `pick_engine.py`,
+`invoice_register.py`, `gsheet.py`, `sku_master.py`, `ui.py`,
+`test_dataflow.py`. Login screen එකේ පහළ BUILD එකේ
+`2026-08-20 · dataflow audit` කියලා තියෙනවා නම් හරි.

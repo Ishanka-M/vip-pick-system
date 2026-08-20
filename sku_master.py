@@ -18,7 +18,7 @@ from doc_parser import base_item, clean_item
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 2
+API = 3
 
 CORE = ["ITEM_NUMBER", "BASE_ID", "MATCH_KEY", "ITEM_DESCRIPTION"]
 AUDIT = ["UPDATED_AT", "UPDATED_BY", "SOURCE"]
@@ -221,12 +221,18 @@ def lookup(master: pd.DataFrame | None) -> dict[str, str]:
     if master is None or not len(master):
         return out
     for _, r in master.iterrows():
-        item = clean_item(r.get("MATCH_KEY") or r.get("ITEM_NUMBER"))
+        raw = r.get("ITEM_NUMBER") or r.get("MATCH_KEY")
+        item = clean_item(r.get("MATCH_KEY") or raw)
         desc = str(r.get("ITEM_DESCRIPTION", "") or "").strip()
         if not item or not desc:
             continue
         out[item] = desc
-        out.setdefault(base_item(item), desc)
+        # off the raw code — clean_item() has already eaten the space that
+        # base_item() splits on, so base_item(item) is not the same base id the
+        # rest of the system uses.
+        base = str(r.get("BASE_ID", "") or "").strip() or base_item(raw)
+        if base:
+            out.setdefault(base, desc)
     return out
 
 

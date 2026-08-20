@@ -25,7 +25,7 @@ from doc_parser import ParsedDoc, base_item, clean_item
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 4
+API = 5
 
 # --------------------------------------------------------------------------- #
 # WMS templates
@@ -177,7 +177,12 @@ def normalize_inventory(df: pd.DataFrame) -> pd.DataFrame:
     out["item_number_raw"] = out["item_number"].astype(str).str.strip().replace(
         {"nan": "", "None": ""})
     out["item_number"] = out["item_number"].map(clean_item)      # matching key
-    out["base_id"] = out["item_number"].map(base_item)
+    # base_id must come off the *raw* code: clean_item() deletes the space in
+    # "P601560 710", and base_item() needs that separator to see 710 as a
+    # suffix. Deriving it from the cleaned key gave "P601560710" here while the
+    # document side gave "P601560" — the same item never matched, and the
+    # document was rejected as "Item not in inventory".
+    out["base_id"] = out["item_number_raw"].map(base_item)
     out["_fifo"] = pd.to_datetime(out["fifo_date"], errors="coerce", dayfirst=True)
     for c in ("pallet", "location_id", "lot_number", "plant", "uom", "status",
               "stored_attribute_id"):
@@ -466,7 +471,13 @@ def run_pick(
 
         for ln in doc.lines:
             need = float(ln.qty)
-            base_pool = inv[inv["base_id"] == ln.base].copy()
+            # Base id first, but the *exact* code always matches itself too:
+            # "P601560710" on the document and "P601560 710" in the inventory
+            # clean to the same key even though only one of them can be split
+            # into a base. Without this the line reads "Item not in inventory".
+            key = clean_item(ln.item_code)
+            base_pool = inv[(inv["base_id"] == ln.base)
+                            | (inv["item_number"] == key)].copy()
             base_pool["avail"] = base_pool["row_key"].map(trial).fillna(0.0)
             base_pool = base_pool[base_pool["avail"] > 0]
             open_mask = _open(base_pool)
@@ -514,7 +525,7 @@ def run_pick(
                     "DOC_NUMBER": num, "DOC_LINE": ln.line_no,
                     "DOC_ITEM_CODE": ln.item_code, "BASE_ID": ln.base,
                     "ITEM_NUMBER": r["item_number_raw"] or r["item_number"],
-                    "DESCRIPTION": _desc(r["description"], r["item_number"],
+                    "DESCRIPTION": _desc(r["description"], r["item_number_raw"],
                                          ln.description),
                     "PALLET": r["pallet"], "LOCATION_ID": r["location_id"],
                     "LOT_NUMBER": r["lot_number"], "PLANT": r["plant"],
