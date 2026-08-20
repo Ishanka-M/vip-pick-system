@@ -24,7 +24,7 @@ from doc_parser import ParsedDoc, base_item, clean_item
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 13
+API = 14
 
 # Warehouse execution status — independent of KORBER_PICK (this app's own pallet
 # allocation). These three track the physical pick / pack / dispatch, driven by
@@ -335,6 +335,21 @@ def merge_details(old: pd.DataFrame | None, new: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([old[~touched], new], ignore_index=True)
 
 
+def _writable(df: pd.DataFrame, *cols: str) -> pd.DataFrame:
+    """
+    Widen the columns we are about to write into.
+
+    pandas 3 refuses to put a number in a `str`-dtype column, and a frame read
+    from the sheet is all strings. Only the columns being written are cast, so
+    a 30 000-row register does not get copied wholesale for the sake of one
+    cell.
+    """
+    for c in cols:
+        if c in df.columns and df[c].dtype != object:
+            df[c] = df[c].astype(object)
+    return df
+
+
 def mark_unpicked(summary: pd.DataFrame, invoice_no: str,
                   remark: str = "Load deleted") -> pd.DataFrame:
     """Deleting a load frees the stock, so the register has to say No again."""
@@ -344,6 +359,7 @@ def mark_unpicked(summary: pd.DataFrame, invoice_no: str,
     m = d["TAX_INVOICE_NO"].astype(str) == str(invoice_no).strip()
     if not m.any():
         return d
+    _writable(d, "PICKED_QTY")
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     d.loc[m, "KORBER_PICK"] = "No"
     d.loc[m, "REMARK"] = f"{remark} · {stamp}"
@@ -810,7 +826,7 @@ def enrich_from_history(summary: pd.DataFrame, details: pd.DataFrame,
     when = led.groupby("_DOC")["PICK_DATE"].agg(_first_text) if "PICK_DATE" in led else None
     plants = led.groupby("_DOC")["PLANT"].agg(_join_unique) if "PLANT" in led else None
 
-    s = summary.copy()
+    s = _writable(summary.copy(), "PICKED_QTY")
     key = s["TAX_INVOICE_NO"].map(_id_str).str.strip()
     hit = key.isin(set(picked.index))
     if hit.any():
@@ -826,7 +842,7 @@ def enrich_from_history(summary: pd.DataFrame, details: pd.DataFrame,
 
     d = details
     if details is not None and len(details):
-        d = details.copy()
+        d = _writable(details.copy(), "PICKED_QTY")
         dkey = (d["TAX_INVOICE_NO"].map(_id_str).str.strip() + "|"
                 + pd.to_numeric(d["LINE"], errors="coerce").fillna(0)
                 .astype(int).astype(str))

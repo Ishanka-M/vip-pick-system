@@ -29,7 +29,7 @@ import pick_engine as E
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 9
+API = 10
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -289,12 +289,24 @@ def _titles(book, sheet_key: str, ttl: float = 300.0) -> set[str]:
 
 
 def _frame(rows: list[list[str]]) -> pd.DataFrame:
+    """
+    Sheet values -> DataFrame, deliberately **object** dtype.
+
+    A sheet hands back nothing but strings, and pandas 3 now infers the `str`
+    dtype for that — a dtype that *rejects* a number being written into it
+    ("Invalid value '0.0' for dtype 'str'"). Every routine here writes the odd
+    number back into a frame it read from the sheet (deleting a load sets
+    PICKED_QTY to 0, the backfill writes quantities), and all of it worked
+    until pandas 3 arrived. Keeping these frames as object restores the
+    behaviour the rest of the module is written against; values are turned back
+    into strings on the way out anyway.
+    """
     if not rows:
         return pd.DataFrame()
     head, *body = rows
     head = [h if h else f"COL{i}" for i, h in enumerate(head)]
     body = [r + [""] * (len(head) - len(r)) for r in body]
-    return pd.DataFrame([r[:len(head)] for r in body], columns=head)
+    return pd.DataFrame([r[:len(head)] for r in body], columns=head, dtype=object)
 
 
 def read_many(sa_info: dict, sheet_key: str, titles: list[str],

@@ -37,7 +37,7 @@ st.set_page_config(
 # run against a stale one and say exactly which file to replace.
 _NEEDS = {"pick_engine.py": (E, 4), "doc_parser.py": (P, 6), "pick_pdf.py": (PP, 4),
           "sku_master.py": (SKU, 2), "ui.py": (ui, 3),
-          "invoice_register.py": (R, 13)}
+          "invoice_register.py": (R, 14)}
 _STALE = [(f, getattr(m, "API", 0), n) for f, (m, n) in _NEEDS.items()
           if getattr(m, "API", 0) < n]
 if _STALE:
@@ -55,7 +55,7 @@ if _STALE:
 # catch the opposite — an old app.py deployed beside new modules — which looks
 # like nothing happened at all: the new screen simply is not there. So publish
 # the build plainly enough to check in one glance after a deploy.
-BUILD = "2026-08-19 · roles+stations · backfill · live URL"
+BUILD = "2026-08-20 · pandas-3 dtype fix"
 try:                                  # gsheet is imported lazily everywhere else
     import gsheet as _gs_mod
     _GS_API = getattr(_gs_mod, "API", 0)

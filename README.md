@@ -32,8 +32,8 @@ streamlit run app.py
 
 | File | API |
 |---|---|
-| `gsheet.py` | 9 |
-| `invoice_register.py` | 13 |
+| `gsheet.py` | 10 |
+| `invoice_register.py` | 14 |
 | `pick_engine.py` · `pick_pdf.py` | 4 |
 | `doc_parser.py` | 6 |
 | `ui.py` | 3 |
@@ -995,3 +995,33 @@ Rules ටික එකමයි — `Open Pick = 0` → Picking, `Shipped Pick �
 >
 > Timeout එකක් ආවොත් — app එක run වෙන machine එකේ browser එකෙන් ඒ URL එක
 > open වෙනවද කියලා බලන්න.
+
+---
+
+## 33. pandas 3 — `Invalid value '0.0' for dtype 'str'`
+
+Load එකක් delete කරද්දී මේ error එක එනවා නම්:
+
+```
+Delete error: Invalid value '0.0' for dtype 'str'.
+Value should be a string or missing value, got 'float' instead.
+```
+
+**හේතුව:** Google Sheet එකෙන් එන්නේ string විතරයි. **pandas 3.0** ඒවාට
+`str` dtype එකක් දෙනවා — ඒ dtype එක number එකක් **භාර ගන්නේ නෑ**. කලින්
+(pandas 2) ඒවා `object` වුණා, ඕනම දෙයක් භාර ගත්තා. Streamlit Cloud එකට
+pandas 3 ආපු දවසේ ඉඳන් මේක කැඩෙනවා.
+
+මේකෙන් කැඩෙන්නේ delete විතරක් නෙවෙයි — sheet එකෙන් කියවපු frame එකකට
+number එකක් ලියන **හැම තැනම**:
+
+| තැන | ලියන්නේ |
+|---|---|
+| Load delete → `mark_unpicked` | `PICKED_QTY = 0` |
+| Backfill → `enrich_from_history` | `PICKED_QTY` (summary + detail) |
+
+**Fix — root එකේම:** `gsheet._frame()` දැන් `dtype=object` එකෙන් frame එක
+හදනවා, ඒ නිසා sheet එකෙන් එන හැම frame එකක්ම කලින් වගේම හැසිරෙනවා.
+ඒ එක්කම `_writable()` කියලා guard එකකුත් තියෙනවා — number ලියන්න කලින්
+ඒ column එක විතරක් widen කරනවා (30 000 row frame එකක් මුළුමනින්ම copy
+කරන්නේ නෑ).
