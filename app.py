@@ -35,42 +35,48 @@ st.set_page_config(
 # Streamlit Cloud redacts exception text, so a half-updated deploy used to die
 # with an unreadable TypeError. Every module carries an API number; refuse to
 # run against a stale one and say exactly which file to replace.
-_NEEDS = {"pick_engine.py": (E, 6), "doc_parser.py": (P, 7), "pick_pdf.py": (PP, 5),
-          "sku_master.py": (SKU, 3), "ui.py": (ui, 3),
-          "invoice_register.py": (R, 16)}
-_STALE = [(f, getattr(m, "API", 0), n) for f, (m, n) in _NEEDS.items()
-          if getattr(m, "API", 0) < n]
-if _STALE:
-    st.error(
-        "**These files are out of date — replace them and redeploy.**\n\n"
-        + "\n".join(f"- `{f}` — found API {have or 'none'}, needs {need}"
-                     for f, have, need in _STALE)
-        + "\n\nEvery module in this app has to come from the same release. "
-          "Updating `app.py` on its own leaves the engine without the fields it "
-          "is being handed."
-    )
-    st.stop()
-
-# The gate above only catches a module that is *older* than app.py. It cannot
+#
+# The gate below only catches a module that is *older* than app.py. It cannot
 # catch the opposite — an old app.py deployed beside new modules — which looks
 # like nothing happened at all: the new screen simply is not there. So publish
 # the build plainly enough to check in one glance after a deploy.
 BUILD = "2026-08-21 · partial pick"
-_GS_NEEDS = 12
-try:                                  # gsheet is imported lazily everywhere else
+
+# gsheet is imported lazily everywhere else, but it has to be checked with the
+# rest or a deploy that forgot it fails silently and reads like a logic bug.
+try:
     import gsheet as _gs_mod
-    _GS_API = getattr(_gs_mod, "API", 0)
-except Exception:                     # pragma: no cover
-    _GS_API = 0
+except Exception:                     # pragma: no cover — no credentials, etc.
     _gs_mod = None
-# gsheet.py used to sit outside the gate, so a deploy that forgot it failed
-# silently and looked like a logic bug instead of a missing file.
-if _gs_mod is not None and _GS_API < _GS_NEEDS:
+_GS_API = getattr(_gs_mod, "API", 0)
+
+# Every file in the release, in one list. Checking them together matters:
+# reporting them one at a time sends the user round the loop again for the
+# next file, and the answer is always the same — replace the whole set.
+_NEEDS = {"pick_engine.py": (E, 6), "doc_parser.py": (P, 7), "pick_pdf.py": (PP, 5),
+          "sku_master.py": (SKU, 3), "ui.py": (ui, 3),
+          "invoice_register.py": (R, 16),
+          "gsheet.py": (_gs_mod, 12)}
+_ALL = [(f, getattr(m, "API", 0), n) for f, (m, n) in _NEEDS.items() if m is not None]
+_STALE = [(f, have, need) for f, have, need in _ALL if have < need]
+if _STALE:
     st.error(
-        "**These files are out of date — replace them and redeploy.**\n\n"
-        f"- `gsheet.py` — found API {_GS_API or 'none'}, needs {_GS_NEEDS}"
+        f"**{len(_STALE)} of these files are out of date — replace them and "
+        "redeploy.**\n\n"
+        + "\n".join(f"- ❌ `{f}` — found API {have or 'none'}, needs {need}"
+                     for f, have, need in _STALE)
+        + ("\n\nUp to date already:\n"
+           + "\n".join(f"- ✅ `{f}` — API {have}"
+                       for f, have, need in _ALL if have >= need)
+           if len(_STALE) < len(_ALL) else "")
+        + f"\n\nEvery module has to come from the same release "
+          f"(**{BUILD}**). Replace **all** of the files in the release, not "
+          "just the ones listed above — `app.py` on its own leaves the engine "
+          "without the fields it is being handed, and a newer module beside an "
+          "older `app.py` cannot be detected here at all."
     )
     st.stop()
+
 BUILD_APIS = (f"engine {getattr(E, 'API', 0)} · parser {getattr(P, 'API', 0)} "
               f"· register {getattr(R, 'API', 0)} · sheet {_GS_API} "
               f"· pdf {getattr(PP, 'API', 0)} · sku {getattr(SKU, 'API', 0)} "

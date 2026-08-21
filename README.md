@@ -1176,10 +1176,9 @@ python -m pytest test_dataflow.py
 | `pick_pdf.py` | 4 |
 | `ui.py` | 3 |
 
-**File 8ම replace කරන්න** — `app.py`, `doc_parser.py`, `pick_engine.py`,
-`invoice_register.py`, `gsheet.py`, `sku_master.py`, `ui.py`,
-`test_dataflow.py`. Login screen එකේ පහළ BUILD එකේ
-`2026-08-20 · dataflow audit` කියලා තියෙනවා නම් හරි.
+**File ඔක්කොම replace කරන්න** — `app.py`, `doc_parser.py`, `pick_engine.py`,
+`invoice_register.py`, `gsheet.py`, `sku_master.py`, `ui.py`, `pick_pdf.py`,
+`test_dataflow.py`. Login screen එකේ පහළ BUILD එක බලලා verify කරන්න.
 
 ---
 
@@ -1322,3 +1321,54 @@ python test_dataflow.py
 | `ui.py` | 3 |
 
 BUILD: `2026-08-21 · partial pick`
+
+---
+
+## 36. "These files are out of date" — version gate එක
+
+App එක පටන් ගද්දී මේක ආවොත්:
+
+```
+4 of these files are out of date — replace them and redeploy.
+ ❌ pick_engine.py      — found API 5, needs 6
+ ❌ pick_pdf.py         — found API 4, needs 5
+ ❌ invoice_register.py — found API 15, needs 16
+ ❌ gsheet.py           — found API 11, needs 12
+ ✅ doc_parser.py — API 7   ✅ sku_master.py — API 3   ✅ ui.py — API 3
+```
+
+**තේරුම:** `app.py` අලුත් එකෙන් replace වෙලා, ඒත් ලයිස්තුවේ තියෙන file
+තාම **පරණ** ඒවා. App එක crash වෙන්න දෙනවා වෙනුවට කලින්ම නවත්තලා
+මොකක්ද replace කරන්න ඕනේ කියලා කියනවා.
+
+**Fix:** release එකේ **file ඔක්කොම** replace කරන්න — flag වුණු ඒවා
+විතරක් නෙවෙයි. එකම release එකේ file ටික එකට යන්න ඕන.
+
+### ⚠️ මේ gate එකෙන් **හසු නොවෙන** එක
+
+Gate එකට හසුවෙන්නේ **module එක `app.py` එකට වඩා පරණ නම්** විතරයි.
+ඊට **අනිත් පැත්ත** — module අලුත්, `app.py` පරණ — හසුවෙන්නේ නෑ.
+එතකොට error එකක් නෑ, අලුත් screen එක **හම්බෙන්නෙත් නෑ**, "මොකුත්ම
+වුණේ නෑ" වගේ පේනවා.
+
+ඒ නිසා deploy කරාට පස්සේ **login screen එකේ පහළ BUILD එක** බලන්න:
+
+```
+2026-08-21 · partial pick
+```
+
+ඒක අලුත් එක නම් `app.py` හරි. Admin sidebar එකේ හැම module එකකේම API
+number එකත් තියෙනවා:
+
+```
+engine 6 · parser 7 · register 16 · sheet 12 · pdf 5 · sku 3 · ui 3
+```
+
+### `gsheet.py` — කලින් හැංගිලා තිබ්බා
+
+කලින් `gsheet.py` check වුණේ **වෙනම, දෙවෙනි gate එකකින්**. පළවෙනි gate
+එක `st.stop()` කරන නිසා `gsheet.py` පරණ නම් ඒක **පේන්නේම නෑ** — මුල්
+තුන හදලා redeploy කරාට පස්සේ තමයි "දැන් gsheet.py" කියලා එන්නේ.
+
+දැන් ඔක්කොම **එකම ලයිස්තුවේ**, එක screen එකකින් සම්පූර්ණ පිළිතුර
+එනවා — up-to-date ඒවත් ✅ දාලා පෙන්නනවා.
