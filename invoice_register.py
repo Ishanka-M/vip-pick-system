@@ -24,7 +24,7 @@ from doc_parser import ParsedDoc, base_item, clean_item
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 15
+API = 16
 
 # Warehouse execution status — independent of KORBER_PICK (this app's own pallet
 # allocation). These three track the physical pick / pack / dispatch, driven by
@@ -32,6 +32,19 @@ API = 15
 STATUS_COLS = ["PICKING", "PACKING", "DISPATCH"]
 STATUS_PENDING = "Pending"
 STATUS_DONE = "Completed"
+
+# KORBER_PICK — this app's own pallet allocation for the document.
+#   No      nothing was picked
+#   Partial some of it went out; the rest is still owed and the document will
+#           come back through the pick for its balance
+#   Yes     the whole document quantity has been picked
+PICK_NO, PICK_PART, PICK_YES = "No", "Partial", "Yes"
+# higher wins on merge — a re-upload must never walk a document backwards
+PICK_RANK = {PICK_NO: 0, PICK_PART: 1, PICK_YES: 2}
+
+
+def pick_rank(v: Any) -> int:
+    return PICK_RANK.get(str(v or "").strip().title(), 0)
 
 SUMMARY_COLS = [
     "TAX_INVOICE_DATE", "TAX_INVOICE_NO", "AR_INVOICE_NO", "CUSTOMER_NAME", "QTY",
@@ -63,6 +76,10 @@ DUP_SKIP_PAT = r"duplicate\s*\(\s*(already processed|other user)"
 # --------------------------------------------------------------------------- #
 # MRP contacts
 # --------------------------------------------------------------------------- #
+def _qty_str(q: float) -> str:
+    return str(int(round(q))) if abs(q - round(q)) < 1e-9 else f"{q:g}"
+
+
 def _norm_name(v: Any) -> str:
     """'Sharma, Rahul' == 'rahul sharma' — order and punctuation don't matter."""
     parts = re.split(r"[,\s]+", str(v or "").strip().lower())
@@ -142,6 +159,17 @@ def build(docs: list[ParsedDoc], res: dict[str, Any], contacts: list[dict],
     alloc = res.get("allocations")
     alloc = alloc if alloc is not None and len(alloc) else pd.DataFrame()
 
+    # partial pick: what each document / line had already received before this
+    # run, and which documents went out short
+    prev_map = {str(k): {int(l): float(q) for l, q in (v or {}).items()}
+                for k, v in (res.get("picked_before") or {}).items()}
+    partial_now = {str(x) for x in (res.get("partial") or [])}
+    acc = res.get("accepted")
+    short_by_doc: dict[str, float] = {}
+    if acc is not None and len(acc) and "SHORT_QTY" in acc.columns:
+        short_by_doc = {str(n): float(q or 0.0)
+                        for n, q in zip(acc["DOC_NUMBER"], acc["SHORT_QTY"])}
+
     srows: list[dict] = []
     drows: list[dict] = []
     seen: set[str] = set()
@@ -157,19 +185,39 @@ def build(docs: list[ParsedDoc], res: dict[str, Any], contacts: list[dict],
             continue
         is_inv = doc.doc_type.upper().startswith("INVOICE")
         ok = num in picked
-        remark = "" if ok else reasons.get(num, "Not picked")
         doc_qty = float(sum(l.qty for l in doc.lines))
+        prev = prev_map.get(num, {})
 
         a = alloc[alloc["DOC_NUMBER"].astype(str) == num] if len(alloc) else pd.DataFrame()
+        # what the document has had altogether — this run plus any earlier
+        # partial pick, or the earlier partial alone if this run took nothing
         picked_qty = float(pd.to_numeric(a["QTY_PICKED"], errors="coerce").sum()) \
             if len(a) else 0.0
+        picked_qty += float(sum(prev.values()))
         plants = ", ".join(sorted({str(x) for x in a["PLANT"]})) if len(a) else plant
+
+        if ok and num in partial_now:
+            state = PICK_PART
+            short = short_by_doc.get(num, max(0.0, doc_qty - picked_qty))
+            remark = f"PARTIAL PICK — {_qty_str(short)} of {_qty_str(doc_qty)} still owed"
+        elif ok:
+            state = PICK_YES
+            remark = ""
+        elif picked_qty > 0:
+            # not picked in this run, but an earlier run took part of it
+            state = PICK_PART
+            remark = (f"PARTIAL PICK — {_qty_str(max(0.0, doc_qty - picked_qty))} of "
+                      f"{_qty_str(doc_qty)} still owed · "
+                      f"{reasons.get(num, 'not picked this run')}")[:400]
+        else:
+            state = PICK_NO
+            remark = reasons.get(num, "Not picked")
 
         srows.append({
             "TAX_INVOICE_DATE": doc.doc_date, "TAX_INVOICE_NO": num,
             "AR_INVOICE_NO": doc.ref_number if is_inv else "",
             "CUSTOMER_NAME": doc.customer, "QTY": doc_qty,
-            "KORBER_PICK": "Yes" if ok else "No", "REMARK": remark,
+            "KORBER_PICK": state, "REMARK": remark,
             "MRP": mrp_flag(doc, contacts),
             "DOC_TYPE": doc.doc_type, "CUSTOMER_CODE": doc.customer_code,
             "CONTACT_PERSON": doc.contact_person, "CONTACT_EMAIL": doc.contact_email,
@@ -185,16 +233,24 @@ def build(docs: list[ParsedDoc], res: dict[str, Any], contacts: list[dict],
         for ln in doc.lines:
             la = a[pd.to_numeric(a["DOC_LINE"], errors="coerce") == ln.line_no] \
                 if len(a) else pd.DataFrame()
+            ln_picked = (float(pd.to_numeric(la["QTY_PICKED"], errors="coerce").sum())
+                         if len(la) else 0.0) + float(prev.get(ln.line_no, 0.0))
+            # a line of a partial document is answered on its own numbers:
+            # a short line is Partial (or No), a line that went in full is Yes
+            if ln_picked <= 0:
+                ln_state = PICK_NO
+            elif ln_picked + 1e-9 >= float(ln.qty):
+                ln_state = PICK_YES
+            else:
+                ln_state = PICK_PART
             drows.append({
                 "TAX_INVOICE_DATE": doc.doc_date, "TAX_INVOICE_NO": num,
                 "AR_INVOICE_NO": doc.ref_number if is_inv else "",
                 "CUSTOMER_NAME": doc.customer, "DOC_TYPE": doc.doc_type,
                 "LINE": ln.line_no, "ITEM_CODE": ln.item_code, "BASE_ID": ln.base,
                 "DESCRIPTION": ln.description, "DOC_QTY": float(ln.qty),
-                "UOM": ln.uom, "KORBER_PICK": "Yes" if ok else "No",
-                "PICKED_QTY": float(pd.to_numeric(la["QTY_PICKED"],
-                                                  errors="coerce").sum())
-                if len(la) else 0.0,
+                "UOM": ln.uom, "KORBER_PICK": ln_state,
+                "PICKED_QTY": ln_picked,
                 "ITEM_NUMBER": ", ".join(dict.fromkeys(str(x) for x in la["ITEM_NUMBER"]))
                 if len(la) else "",
                 "LOT_NUMBER": ", ".join(dict.fromkeys(str(x) for x in la["LOT_NUMBER"]))
@@ -253,6 +309,10 @@ def merge_summary(old: pd.DataFrame | None, new: pd.DataFrame) -> dict[str, Any]
     A `No` that is picked later becomes `Yes` and loses its remark. A `Yes` is
     not pushed back to `No` by a later run that happened to skip it as a
     duplicate — only deleting the load does that (`mark_unpicked`).
+
+    `Partial` sits between the two: a partly picked document may still be
+    completed later (`Partial` -> `Yes`), but a later run that takes nothing
+    must not erase what already went out (`Partial` never falls back to `No`).
     """
     cols = SUMMARY_COLS
     if new is not None and len(new):          # belt and braces — never store one
@@ -278,7 +338,7 @@ def merge_summary(old: pd.DataFrame | None, new: pd.DataFrame) -> dict[str, Any]
         if num not in idx:
             rows.append(rec)
             n_new += 1
-            if rec["KORBER_PICK"] == "Yes":
+            if rec["KORBER_PICK"] == PICK_YES:
                 picked_now.append(num)
             continue
 
@@ -291,14 +351,17 @@ def merge_summary(old: pd.DataFrame | None, new: pd.DataFrame) -> dict[str, Any]
         for k in STATUS_COLS:
             if str(cur.get(k, "")) == STATUS_DONE:
                 rec[k] = STATUS_DONE
-        if was == "Yes" and rec["KORBER_PICK"] != "Yes":
-            # already picked — keep the pick, just refresh what the document says
+        now = str(rec.get("KORBER_PICK", PICK_NO))
+        if pick_rank(now) < pick_rank(was):
+            # already further along — keep the pick, just refresh what the
+            # document itself says
             for k in ("KORBER_PICK", "REMARK", "RUN_ID", "PICKED_AT", "PICKED_QTY",
                       "PLANT"):
                 rec[k] = cur.get(k, "")
-        elif was != "Yes" and rec["KORBER_PICK"] == "Yes":
-            rec["REMARK"] = ""
-            picked_now.append(num)
+        elif pick_rank(now) > pick_rank(was):
+            if now == PICK_YES:
+                rec["REMARK"] = ""
+                picked_now.append(num)
         rows[idx[num]] = rec
         n_upd += 1
 
@@ -340,14 +403,18 @@ def merge_details(old: pd.DataFrame | None, new: pd.DataFrame) -> pd.DataFrame:
             if len(done):
                 new.loc[nkey.isin(set(done)), k] = STATUS_DONE
 
-        # A line already picked stays picked. merge_summary() protects the
-        # summary's Yes the same way; without this the Details tab answered
-        # "No, pallets unknown" for an invoice the Summary tab still calls
-        # picked, and the allocation behind it was lost.
-        was_yes = pkey[prior["KORBER_PICK"].astype(str).str.strip() == "Yes"]
+        # A line never walks backwards — Yes stays Yes, and a Partial line is
+        # not reset to No by a later run that took nothing. merge_summary()
+        # protects the summary the same way; without this the Details tab
+        # answered "No, pallets unknown" for an invoice the Summary tab still
+        # calls picked, and the allocation behind it was lost.
+        prior_rank = prior["KORBER_PICK"].map(pick_rank)
+        new_rank = new["KORBER_PICK"].map(pick_rank)
+        best = dict(zip(pkey, prior_rank))
+        was_yes = pkey[prior_rank > 0]
         if len(was_yes):
             keep = nkey.isin(set(was_yes)) & \
-                (new["KORBER_PICK"].astype(str).str.strip() != "Yes")
+                (new_rank.values < nkey.map(best).fillna(0).values)
             if keep.any():
                 cols = ["KORBER_PICK", "PICKED_QTY", "ITEM_NUMBER", "LOT_NUMBER",
                         "PALLETS", "LOCATIONS", "PLANT", "REMARK", "RUN_ID"]
@@ -771,16 +838,20 @@ def backfill_from_history(ledger: pd.DataFrame, registry: pd.DataFrame | None,
         return out
     led = led[led["_DOC"].isin(set(todo))]
 
-    # document date / AR number from the registry's trustworthy prefix
+    # document date / AR number from the registry's trustworthy prefix, plus
+    # the document quantity where the registry has it — a partial pick took
+    # less than the document asked for, so the ledger alone would understate it
     meta: dict[str, dict] = {}
     if registry is not None and len(registry) and "DOC_NUMBER" in registry.columns:
-        for col in ("DOC_DATE", "REF_NUMBER"):
+        for col in ("DOC_DATE", "REF_NUMBER", "DOC_QTY", "PICK_STATUS"):
             if col not in registry.columns:
                 registry = registry.assign(**{col: ""})
         for _, r in registry.iterrows():
             meta[_id_str(r["DOC_NUMBER"]).strip()] = {
                 "date": str(r.get("DOC_DATE", "") or "").strip(),
-                "ref": str(r.get("REF_NUMBER", "") or "").strip()}
+                "ref": str(r.get("REF_NUMBER", "") or "").strip(),
+                "doc_qty": _to_num(r.get("DOC_QTY")),
+                "partial": str(r.get("PICK_STATUS", "")).strip().upper() == "PARTIAL"}
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -811,8 +882,11 @@ def backfill_from_history(ledger: pd.DataFrame, registry: pd.DataFrame | None,
     }).reset_index().rename(columns={"_DOC": "TAX_INVOICE_NO", "_LINE": "LINE"})
 
     det["BASE_ID"] = det["ITEM_CODE"].map(base_item)
-    det["DOC_QTY"] = det["PICKED_QTY"]          # all-or-nothing pick
-    det["KORBER_PICK"] = "Yes"
+    # A full pick is all-or-nothing, so the picked quantity of a line *is* the
+    # document quantity. A partial pick is the exception, and the ledger cannot
+    # tell them apart on its own — DOC_REGISTRY's PICK_STATUS can.
+    det["DOC_QTY"] = det["PICKED_QTY"]
+    det["KORBER_PICK"] = PICK_YES
     det["REMARK"] = BACKFILL_REMARK
     det["UPDATED_AT"] = now
     det["TAX_INVOICE_DATE"] = det["TAX_INVOICE_NO"].map(
@@ -843,8 +917,17 @@ def backfill_from_history(ledger: pd.DataFrame, registry: pd.DataFrame | None,
                        if picked_at is not None else "")
     sm["SOURCE_FILE"] = (sm["TAX_INVOICE_NO"].map(source).fillna("")
                          if source is not None else "")
-    sm["KORBER_PICK"] = "Yes"
-    sm["REMARK"] = BACKFILL_REMARK
+    # a document the registry marked PARTIAL still owes its balance
+    part = sm["TAX_INVOICE_NO"].map(lambda d: bool(meta.get(d, {}).get("partial")))
+    want = sm["TAX_INVOICE_NO"].map(lambda d: meta.get(d, {}).get("doc_qty"))
+    sm["QTY"] = [float(w) if (pt and w) else float(q)
+                 for pt, w, q in zip(part, want, sm["QTY"])]
+    sm["KORBER_PICK"] = [PICK_PART if pt else PICK_YES for pt in part]
+    sm["REMARK"] = [
+        (f"{BACKFILL_REMARK} · PARTIAL PICK — "
+         f"{_qty_str(max(0.0, float(q) - float(g)))} of {_qty_str(float(q))} still owed")
+        if pt else BACKFILL_REMARK
+        for pt, q, g in zip(part, sm["QTY"], sm["PICKED_QTY"])]
     sm["MRP"] = "No"
     sm["CUSTOMER_NAME"] = ""            # only the PDF has it
     sm["FIRST_SEEN"] = sm["PICKED_AT"].where(sm["PICKED_AT"].astype(bool), now)
@@ -893,9 +976,17 @@ def enrich_from_history(summary: pd.DataFrame, details: pd.DataFrame,
     key = s["TAX_INVOICE_NO"].map(_id_str).str.strip()
     hit = key.isin(set(picked.index))
     if hit.any():
-        s.loc[hit, "KORBER_PICK"] = "Yes"
-        s.loc[hit, "REMARK"] = ""
-        s.loc[hit, "PICKED_QTY"] = key[hit].map(picked).values
+        got = key[hit].map(picked).astype(float)
+        want = pd.to_numeric(s.loc[hit, "QTY"], errors="coerce").fillna(0.0)
+        # the ledger says what came off the pallets; if that is less than the
+        # document asks for, this is a partial pick, not a completed one
+        full = (got.values + 1e-9) >= want.values
+        s.loc[hit, "KORBER_PICK"] = [PICK_YES if f else PICK_PART for f in full]
+        s.loc[hit, "REMARK"] = [
+            "" if f else f"PARTIAL PICK — {_qty_str(max(0.0, w - g))} of "
+                         f"{_qty_str(w)} still owed"
+            for f, g, w in zip(full, got.values, want.values)]
+        s.loc[hit, "PICKED_QTY"] = got.values
         if runs is not None:
             s.loc[hit, "RUN_ID"] = key[hit].map(runs).values
         if when is not None:
@@ -914,9 +1005,12 @@ def enrich_from_history(summary: pd.DataFrame, details: pd.DataFrame,
         line_qty.index = [f"{a}|{b}" for a, b in line_qty.index]
         dhit = dkey.isin(set(line_qty.index))
         if dhit.any():
-            d.loc[dhit, "KORBER_PICK"] = "Yes"
-            d.loc[dhit, "REMARK"] = ""
-            d.loc[dhit, "PICKED_QTY"] = dkey[dhit].map(line_qty).values
+            got = dkey[dhit].map(line_qty).astype(float)
+            want = pd.to_numeric(d.loc[dhit, "DOC_QTY"], errors="coerce").fillna(0.0)
+            full = (got.values + 1e-9) >= want.values
+            d.loc[dhit, "KORBER_PICK"] = [PICK_YES if f else PICK_PART for f in full]
+            d.loc[dhit, "REMARK"] = ["" if f else "PARTIAL PICK" for f in full]
+            d.loc[dhit, "PICKED_QTY"] = got.values
             for col, src in (("ITEM_NUMBER", "ITEM_NUMBER"), ("LOT_NUMBER", "LOT_NUMBER"),
                              ("PALLETS", "PALLET"), ("LOCATIONS", "LOCATION_ID"),
                              ("PLANT", "PLANT")):
@@ -1124,6 +1218,7 @@ PENDING_COLS = ["DAYS", "TAX_INVOICE_DATE", "TAX_INVOICE_NO", "CUSTOMER_NAME", "
 
 # order matters — the first pattern that matches a remark wins
 _REASONS: list[tuple[str, str]] = [
+    ("Partially picked", r"partial pick"),
     ("On another pick task", r"another pick task|on pick task"),
     ("Stock short", r"stock short"),
     ("Pallet over-pick", r"over-pick"),
@@ -1193,9 +1288,10 @@ def dashboard(summary: pd.DataFrame, date_from: Any = None, date_to: Any = None,
     both ways: invoices and quantity, because one pending invoice for 1 000 units
     is not the same problem as ten pending invoices for 2 units each.
     """
-    empty = {"kpi": {k: 0 for k in ("total", "picked", "pending", "qty", "qty_picked",
-                                    "qty_pending", "pct", "oldest", "picking_done",
-                                    "packing_done", "dispatch_done")},
+    empty = {"kpi": {k: 0 for k in ("total", "picked", "pending", "partial", "qty",
+                                    "qty_picked", "qty_pending", "qty_owed", "pct",
+                                    "oldest", "picking_done", "packing_done",
+                                    "dispatch_done")},
              "by_reason": pd.DataFrame(columns=["REASON", "INVOICES", "QTY"]),
              "by_customer": pd.DataFrame(columns=["CUSTOMER_NAME", "INVOICES", "QTY"]),
              "pending": pd.DataFrame(columns=PENDING_COLS),
@@ -1227,16 +1323,23 @@ def dashboard(summary: pd.DataFrame, date_from: Any = None, date_to: Any = None,
     today = pd.Timestamp(datetime.now().date())
     d["DAYS"] = (today - d["_DATE"]).dt.days
     d["REASON"] = d["REMARK"].map(classify)
-    d.loc[d["KORBER_PICK"] == "Yes", "REASON"] = "Picked"
+    d.loc[d["KORBER_PICK"] == PICK_YES, "REASON"] = "Picked"
+    d.loc[d["KORBER_PICK"] == PICK_PART, "REASON"] = "Partially picked"
     d["SHORT_QTY"] = (d["QTY"] - d["PICKED_QTY"]).clip(lower=0)
 
-    pend = d[d["KORBER_PICK"] != "Yes"].copy()
-    done = d[d["KORBER_PICK"] == "Yes"].copy()
+    # A partly picked invoice is not finished, so it stays on the pending side —
+    # but only the balance is still owed, and that is what the floor has to
+    # chase. qty_owed answers "how much is actually left to pick".
+    part = d[d["KORBER_PICK"] == PICK_PART].copy()
+    pend = d[d["KORBER_PICK"] != PICK_YES].copy()
+    done = d[d["KORBER_PICK"] == PICK_YES].copy()
 
     kpi = {
         "total": int(len(d)), "picked": int(len(done)), "pending": int(len(pend)),
+        "partial": int(len(part)),
         "qty": float(d["QTY"].sum()), "qty_picked": float(done["QTY"].sum()),
         "qty_pending": float(pend["QTY"].sum()),
+        "qty_owed": float(pend["SHORT_QTY"].sum()),
         "pct": (float(len(done)) / len(d) * 100.0) if len(d) else 0.0,
         "oldest": int(pend["DAYS"].max()) if len(pend) and pend["DAYS"].notna().any() else 0,
         "picking_done": int((d.get("PICKING", "") == STATUS_DONE).sum()),

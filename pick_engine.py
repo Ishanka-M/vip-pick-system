@@ -25,7 +25,7 @@ from doc_parser import ParsedDoc, base_item, clean_item
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 5
+API = 6
 
 # --------------------------------------------------------------------------- #
 # WMS templates
@@ -334,6 +334,9 @@ class EngineConfig:
     pick_id_zero_only: bool = True       # Pick Id 0 විතරක් — 0 නොවන එක locked
     # user confirm කරලා release කරපු ඒවා: {doc number: [pick id, …]}  ("*" = ඔක්කොම)
     release_locked: dict[str, list[str]] = field(default_factory=dict)
+    # Partial pick — තියෙන ප්‍රමාණය විතරක් යවන්න user confirm කරපු documents.
+    # ["*"] = ඔක්කොම. හිස් නම් කලින් වගේම all-or-nothing.
+    partial_docs: list[str] = field(default_factory=list)
     strategy: str = "FIFO"              # FIFO | LEAST_PALLETS | SINGLE_PALLET_FIRST
     exact_item_first: bool = True
     use_ledger: bool = True             # pallet balance එකට ledger එක බලනවද
@@ -376,12 +379,22 @@ def run_pick(
     ledger: pd.DataFrame | None = None,
     processed_docs: set[str] | None = None,
     sku_desc: dict[str, str] | None = None,
+    picked_before: dict[str, dict[int, float]] | None = None,
 ) -> dict[str, Any]:
-    """මුළු pipeline එක — validate -> duplicate -> allocate -> WMS output."""
+    """
+    මුළු pipeline එක — validate -> duplicate -> allocate -> WMS output.
+
+    `picked_before` = {doc number: {line no: qty}} — කලින් run එකක partial
+    විදිහට pick කරපු ප්‍රමාණය. ඒ ටික අඩු කරලා **ඉතුරු ටික විතරයි** මේ run
+    එකේ pick වෙන්නේ.
+    """
     run_id = datetime.now().strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:4]
     stamp = cfg.pick_date.strftime("%Y-%m-%d %H:%M:%S")
     processed_docs = {str(x).strip() for x in (processed_docs or set())}
     sku_desc = sku_desc or {}
+    prev_map = {str(k).strip(): {int(l): float(q) for l, q in (v or {}).items()}
+                for k, v in (picked_before or {}).items()}
+    partial_ok = {str(x).strip() for x in (cfg.partial_docs or [])}
 
     def _desc(inv_d: Any, item: Any, doc_d: Any = "") -> str:
         """Description — inventory -> SKU master -> document."""
@@ -415,6 +428,7 @@ def run_pick(
     rejected: list[dict] = []
     shortages: list[dict] = []
     accepted: list[dict] = []
+    partials: list[str] = []
     detail_rows: list[dict] = []
     master_rows: list[dict] = []
 
@@ -454,6 +468,8 @@ def run_pick(
         trial = {k: v for k, v in remaining.items()}
         doc_alloc: list[dict] = []
         doc_short: list[dict] = []
+        prev = prev_map.get(num, {})
+        go_partial = bool(partial_ok) and ("*" in partial_ok or num in partial_ok)
         allow = released.get(num, set())
         all_released = "*" in allow
         used_ids: set[str] = set()
@@ -470,7 +486,11 @@ def run_pick(
             return ok
 
         for ln in doc.lines:
-            need = float(ln.qty)
+            # only the balance is still owed when an earlier run took some
+            done_before = float(prev.get(ln.line_no, 0.0))
+            need = float(ln.qty) - done_before
+            if need <= QTY_TOL:
+                continue                       # this line was completed earlier
             # Base id first, but the *exact* code always matches itself too:
             # "P601560710" on the document and "P601560 710" in the inventory
             # clean to the same key even though only one of them can be split
@@ -506,8 +526,14 @@ def run_pick(
                     "REQUIRED": need, "AVAILABLE": have,
                     "ON_PICK_TASK": lock_q, "PICK_IDS": lock_id,
                     "SHORT": max(0.0, need - have), "REASON": why,
+                    "PICKED_NOW": have if go_partial else 0.0,
                 })
-                continue
+                # A partial pick takes whatever is on the floor and leaves the
+                # rest owed; without the user's confirmation the line is simply
+                # not picked and the whole document falls over below.
+                if not go_partial or have <= QTY_TOL:
+                    continue
+                need = have
 
             for _, r in _order_pool(pool, need, ln.item_code, cfg).iterrows():
                 if need <= 1e-9:
@@ -538,16 +564,20 @@ def run_pick(
                 })
 
         # ---------- whole document must be complete ----------
+        # …unless the user has confirmed a partial pick for this document, and
+        # there is actually something to send.
+        miss = ", ".join(
+            f"L{s['DOC_LINE']} {s['DOC_ITEM_CODE']} (need {s['REQUIRED']:g}, "
+            f"have {s['AVAILABLE']:g})" for s in doc_short
+        )
         if doc_short:
             shortages.extend(doc_short)
-            miss = ", ".join(
-                f"L{s['DOC_LINE']} {s['DOC_ITEM_CODE']} (need {s['REQUIRED']:g}, "
-                f"have {s['AVAILABLE']:g})" for s in doc_short
-            )
-            rejected.append({"DOC_NUMBER": num, "DOC_TYPE": doc.doc_type,
-                             "REASON": "STOCK SHORT - not picked",
-                             "DETAIL": miss, "SOURCE_FILE": doc.source_file})
-            continue
+            if not (go_partial and doc_alloc):
+                rejected.append({"DOC_NUMBER": num, "DOC_TYPE": doc.doc_type,
+                                 "REASON": "STOCK SHORT - not picked",
+                                 "DETAIL": miss, "SOURCE_FILE": doc.source_file})
+                continue
+        is_partial = bool(doc_short)
 
         # ---------- WMS Detail (pallet allocations -> order lines) ----------
         groups: dict[tuple, dict] = {}
@@ -600,13 +630,16 @@ def run_pick(
             continue
 
         # ---------- QUANTITY VERIFY — Invoice / DC qty එකට හරියටම ----------
-        v_rows, v_bad = _verify_doc(doc, doc_alloc, doc_detail)
+        v_rows, v_bad = _verify_doc(doc, doc_alloc, doc_detail, prev=prev,
+                                    partial=is_partial)
         verify_rows.extend(v_rows)
         if v_bad:
             rejected.append({"DOC_NUMBER": num, "DOC_TYPE": doc.doc_type,
                              "REASON": "QTY VERIFY FAILED",
                              "DETAIL": " · ".join(v_bad), "SOURCE_FILE": doc.source_file})
             continue
+        if is_partial:
+            partials.append(num)
 
         # ---------- commit ----------
         remaining = trial
@@ -629,14 +662,24 @@ def run_pick(
         if rel_note:
             doc_check = (doc_check + " · " if doc_check != "OK" else "") + \
                 f"RELEASED from pick task {rel_note}"
+        if is_partial:
+            doc_check = (doc_check + " · " if doc_check != "OK" else "") + \
+                f"PARTIAL PICK — short: {miss}"
+        doc_qty = float(sum(l.qty for l in doc.lines))
+        now_qty = float(sum(a["QTY_PICKED"] for a in doc_alloc))
+        prev_qty = float(sum(prev.values()))
         accepted.append({
             "DOC_NUMBER": num, "LOAD_ID": num, "DOC_TYPE": doc.doc_type,
             "DOC_DATE": doc.doc_date, "RELEASED": rel_note,
             "REF_NUMBER": doc.ref_number, "DOC_CHECK": doc_check, "LINES": len(doc.lines),
-            "WMS_LINES": line_no, "DOC_QTY": sum(l.qty for l in doc.lines),
-            "PICKED_QTY": sum(a["QTY_PICKED"] for a in doc_alloc),
+            "WMS_LINES": line_no, "DOC_QTY": doc_qty,
+            "PICKED_QTY": now_qty,
             "WMS_QTY": sum(float(r["QTY"]) for r in doc_detail),
-            "VERIFY": "✅ OK",
+            # what the document has received in total, this run and before it
+            "PREV_QTY": prev_qty, "TOTAL_PICKED": prev_qty + now_qty,
+            "SHORT_QTY": max(0.0, doc_qty - prev_qty - now_qty),
+            "PICK_STATUS": "PARTIAL" if is_partial else "FULL",
+            "VERIFY": "⚠️ PARTIAL" if is_partial else "✅ OK",
             "PALLETS": len({a["PALLET"] for a in doc_alloc}),
             "PLANTS": ", ".join(sorted({a["PLANT"] for a in doc_alloc})),
             "SOURCE_FILE": doc.source_file,
@@ -663,6 +706,8 @@ def run_pick(
         "locked": _locked_view(locked, released),
         "accepted": pd.DataFrame(accepted),
         "balance": pallet_balance(basis, alloc_df, cap),
+        "partial": partials,
+        "picked_before": prev_map,
         "cfg": cfg,
     }
 
@@ -680,11 +725,19 @@ VERIFY_COLS = ["DOC_NUMBER", "DOC_TYPE", "LINE", "ITEM_CODE", "ITEM_NUMBER",
 _TOL = 1e-6
 
 
-def _verify_doc(doc, doc_alloc: list[dict], doc_detail: list[dict]) -> tuple[list[dict], list[str]]:
+def _verify_doc(doc, doc_alloc: list[dict], doc_detail: list[dict],
+                prev: dict[int, float] | None = None,
+                partial: bool = False) -> tuple[list[dict], list[str]]:
     """
     Line by line + document total + WMS file total — තුනම match වෙන්න ඕන.
     Fail වුණොත් document එක reject වෙනවා.
+
+    Full pick එකකදී line එකකට **owed** = doc qty − කලින් pick කරපු ප්‍රමාණය,
+    ඒක හරියටම pick වෙන්න ඕන. Partial pick එකකදී අඩුවෙන් යවන එක **තීරණයක්**,
+    ඒ නිසා check කරන්නේ "WMS file එකට ගියේ ඇත්තටම pallet එකෙන් අරන් තියෙන
+    ප්‍රමාණයමද, ඕන ප්‍රමාණයට වඩා වැඩිද" කියන එක.
     """
+    prev = prev or {}
     picked: dict[int, float] = {}
     items: dict[int, set[str]] = {}
     for a in doc_alloc:
@@ -696,39 +749,97 @@ def _verify_doc(doc, doc_alloc: list[dict], doc_detail: list[dict]) -> tuple[lis
 
     for ln in doc.lines:
         p = picked.get(ln.line_no, 0.0)
-        diff = p - float(ln.qty)
-        ok = abs(diff) <= _TOL
-        if not ok:
-            bad.append(f"L{ln.line_no} {ln.item_code}: doc {ln.qty:g} ≠ picked {p:g}")
+        before = float(prev.get(ln.line_no, 0.0))
+        owed = float(ln.qty) - before
+        diff = p - owed
+        if partial:
+            # under is allowed and expected; over never is
+            ok = diff <= _TOL
+            status = "✅ OK" if abs(diff) <= _TOL else "⚠️ SHORT"
+            if not ok:
+                bad.append(f"L{ln.line_no} {ln.item_code}: picked {p:g} > owed {owed:g}")
+        else:
+            ok = abs(diff) <= _TOL
+            status = "✅ OK" if ok else "❌ MISMATCH"
+            if not ok:
+                bad.append(f"L{ln.line_no} {ln.item_code}: doc {owed:g} ≠ picked {p:g}")
         rows.append({
             "DOC_NUMBER": doc.doc_number, "DOC_TYPE": doc.doc_type,
             "LINE": str(ln.line_no), "ITEM_CODE": ln.item_code,
             "ITEM_NUMBER": ", ".join(sorted(items.get(ln.line_no, set()))),
-            "DOC_QTY": float(ln.qty), "PICKED_QTY": p,
-            "WMS_QTY": p, "DIFF": diff, "STATUS": "✅ OK" if ok else "❌ MISMATCH",
+            "DOC_QTY": float(ln.qty), "PICKED_QTY": p + before,
+            "WMS_QTY": p, "DIFF": (p + before) - float(ln.qty), "STATUS": status,
         })
 
     doc_total = float(sum(l.qty for l in doc.lines))
+    prev_total = float(sum(prev.get(l.line_no, 0.0) for l in doc.lines))
+    owed_total = doc_total - prev_total
     pick_total = float(sum(picked.values()))
     wms_total = float(sum(float(r["QTY"]) for r in doc_detail))
 
-    if abs(pick_total - doc_total) > _TOL:
-        bad.append(f"Document total: doc {doc_total:g} ≠ picked {pick_total:g}")
-    if abs(wms_total - doc_total) > _TOL:
-        bad.append(f"WMS file total: doc {doc_total:g} ≠ OutBound Detail {wms_total:g}")
-    if doc.declared_qty is not None and abs(doc.declared_qty - pick_total) > _TOL:
-        bad.append(f"Document 'Total Quantity' {doc.declared_qty:g} ≠ picked {pick_total:g}")
+    # This one holds either way: the WMS file must carry exactly what came off
+    # the pallets, no more and no less.
+    if abs(wms_total - pick_total) > _TOL:
+        bad.append(f"WMS file total: picked {pick_total:g} ≠ OutBound Detail {wms_total:g}")
+    if partial:
+        if pick_total > owed_total + _TOL:
+            bad.append(f"Document total: picked {pick_total:g} > owed {owed_total:g}")
+    else:
+        if abs(pick_total - owed_total) > _TOL:
+            bad.append(f"Document total: doc {owed_total:g} ≠ picked {pick_total:g}")
+        # the document's own "Total Quantity" only speaks for the whole document
+        if not prev and doc.declared_qty is not None \
+                and abs(doc.declared_qty - pick_total) > _TOL:
+            bad.append(f"Document 'Total Quantity' {doc.declared_qty:g} "
+                       f"≠ picked {pick_total:g}")
 
     rows.append({
         "DOC_NUMBER": doc.doc_number, "DOC_TYPE": doc.doc_type, "LINE": "TOTAL",
         "ITEM_CODE": f"{len(doc.lines)} lines",
         "ITEM_NUMBER": (f"doc says {doc.declared_qty:g}"
                         if doc.declared_qty is not None else ""),
-        "DOC_QTY": doc_total, "PICKED_QTY": pick_total, "WMS_QTY": wms_total,
-        "DIFF": pick_total - doc_total,
-        "STATUS": "✅ OK" if not bad else "❌ MISMATCH",
+        "DOC_QTY": doc_total, "PICKED_QTY": pick_total + prev_total, "WMS_QTY": wms_total,
+        "DIFF": (pick_total + prev_total) - doc_total,
+        "STATUS": ("❌ MISMATCH" if bad else
+                   ("⚠️ PARTIAL" if partial else "✅ OK")),
     })
     return rows, bad
+
+
+PARTIAL_COLS = ["DOC_NUMBER", "DOC_TYPE", "SHORT_LINES", "REQUIRED",
+                "AVAILABLE_NOW", "STILL_SHORT", "ITEMS"]
+
+
+def partialable(res: dict[str, Any]) -> pd.DataFrame:
+    """
+    Documents refused for stock that could still put something on a truck —
+    the answer to "we cannot wait, send what we have".
+
+    The numbers cover the **short lines only**; the lines that were fine are
+    picked in full either way. A document with nothing at all on its short
+    lines is not a partial pick, it is no pick, so it is left out.
+    """
+    sh = res.get("shortage")
+    rej = res.get("rejected", pd.DataFrame())
+    if sh is None or not len(sh) or rej is None or not len(rej):
+        return pd.DataFrame(columns=PARTIAL_COLS)
+    stuck = {str(r["DOC_NUMBER"]) for _, r in rej.iterrows()
+             if "STOCK SHORT" in str(r.get("REASON", ""))}
+    if not stuck:
+        return pd.DataFrame(columns=PARTIAL_COLS)
+
+    rows: list[dict] = []
+    for num, g in sh[sh["DOC_NUMBER"].astype(str).isin(stuck)].groupby("DOC_NUMBER"):
+        need = float(pd.to_numeric(g["REQUIRED"], errors="coerce").fillna(0).sum())
+        have = float(pd.to_numeric(g["AVAILABLE"], errors="coerce").fillna(0).sum())
+        rows.append({
+            "DOC_NUMBER": str(num), "DOC_TYPE": str(g.iloc[0].get("DOC_TYPE", "")),
+            "SHORT_LINES": int(len(g)), "REQUIRED": need, "AVAILABLE_NOW": have,
+            "STILL_SHORT": max(0.0, need - have),
+            "ITEMS": ", ".join(dict.fromkeys(str(x) for x in g["DOC_ITEM_CODE"]))[:200],
+        })
+    out = pd.DataFrame(rows, columns=PARTIAL_COLS)
+    return out[out["AVAILABLE_NOW"] > 0].reset_index(drop=True)
 
 
 RELEASE_COLS = ["DOC_NUMBER", "DOC_TYPE", "SHORT_LINES", "SHORT_QTY", "ON_PICK_TASK",
@@ -819,6 +930,10 @@ def doc_bundle(res: dict[str, Any], load_id: str) -> dict[str, Any]:
             "PALLETS": info.get("PALLETS", 0),
             "VERIFY": info.get("VERIFY", ""),
             "RELEASED": info.get("RELEASED", ""),
+            "PICK_STATUS": info.get("PICK_STATUS", "FULL"),
+            "PICKED_QTY": info.get("PICKED_QTY", 0),
+            "PREV_QTY": info.get("PREV_QTY", 0),
+            "SHORT_QTY": info.get("SHORT_QTY", 0),
             "SOURCE_FILE": info.get("SOURCE_FILE", ""),
             "RUN_ID": res.get("run_id", ""),
             "PICK_DATE": res.get("pick_date", ""),

@@ -32,7 +32,7 @@ from reportlab.platypus import (Image, KeepTogether, Paragraph, SimpleDocTemplat
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 4
+API = 5
 
 # --------------------------------------------------------------------------- #
 # palette
@@ -200,6 +200,31 @@ def build_pick_sheet(info: dict[str, Any], alloc: pd.DataFrame,
         ("QTY CHECK", info.get("VERIFY", "")),
     ], cols=5, width=W))
     story.append(Spacer(1, 5))
+
+    _partial = str(info.get("PICK_STATUS", "")).strip().upper() == "PARTIAL"
+    if _partial:
+        # The person on the floor has to know the sheet is deliberately short,
+        # or they will chase the missing pieces as a picking error.
+        story.append(_kv_table([
+            ("PICK STATUS", "PARTIAL"),
+            ("PICKING NOW", _n(info.get("PICKED_QTY", ""))),
+            ("ALREADY SENT", _n(info.get("PREV_QTY", ""))),
+            ("STILL OWED", _n(info.get("SHORT_QTY", ""))),
+        ], cols=4, width=W))
+        note = Table([[Paragraph(
+            "<b>PARTIAL PICK — THIS IS NOT THE WHOLE DOCUMENT</b> &nbsp; Only the "
+            "quantity shown under <b>PICKING NOW</b> is being picked today; "
+            "<b>" + _txt(_n(info.get("SHORT_QTY", ""))) + "</b> is still owed on this "
+            "document and will be picked in a later run. The quantities below are the "
+            "ones to load — do not top them up from the invoice.", P_CELL)]],
+            colWidths=[W])
+        note.setStyle(TableStyle([
+            ("BOX", (0, 0), (-1, -1), 0.8, ACC),
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#FFF6E6")),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6)]))
+        story += [Spacer(1, 3), note, Spacer(1, 5)]
 
     if str(info.get("RELEASED", "")).strip():
         note = Table([[Paragraph(

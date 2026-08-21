@@ -361,6 +361,168 @@ def test_sales_report_reconciles_against_the_wms():
     assert len(R.sales_reconciliation_excel(rep)) > 0
 
 
+
+
+# --------------------------------------------------------------------------- #
+# partial pick — "we cannot wait, send what we have"
+# --------------------------------------------------------------------------- #
+def _short_case():
+    """AAA has plenty, BBB is 4 short of the 12 the document asks for."""
+    inv = pd.DataFrame([
+        {"Item Number": "AAA", "Lot Number": "L", "Pallet ID": "PAL1",
+         "Location Id": "A", "Actual Qty": 100, "Plant": "PL1", "Status": "Available",
+         "Pick Id": "0", "UOM": "EA", "Description": "d"},
+        {"Item Number": "BBB", "Lot Number": "L", "Pallet ID": "PAL2",
+         "Location Id": "A", "Actual Qty": 4, "Plant": "PL1", "Status": "Available",
+         "Pick Id": "0", "UOM": "EA", "Description": "d"},
+    ])
+    return inv, _doc("I1", [("AAA", 10), ("BBB", 12)])
+
+
+def test_all_or_nothing_is_still_the_default():
+    inv, doc = _short_case()
+    res = PE.run_pick([doc], inv, PE.EngineConfig())
+    assert len(res["accepted"]) == 0
+    assert len(res["allocations"]) == 0
+    assert "STOCK SHORT" in res["rejected"].iloc[0]["REASON"]
+
+
+def test_partialable_offers_only_what_can_actually_ship():
+    inv, doc = _short_case()
+    res = PE.run_pick([doc], inv, PE.EngineConfig())
+    offer = PE.partialable(res)
+    assert list(offer["DOC_NUMBER"]) == ["I1"]
+    row = offer.iloc[0]
+    assert row["REQUIRED"] == 12 and row["AVAILABLE_NOW"] == 4 and row["STILL_SHORT"] == 8
+    # a document with nothing at all on its short line is not on offer
+    nothing = PE.run_pick([_doc("I2", [("ZZZ", 5)])], inv, PE.EngineConfig())
+    assert len(PE.partialable(nothing)) == 0
+
+
+def test_a_confirmed_partial_picks_what_is_there():
+    inv, doc = _short_case()
+    res = PE.run_pick([doc], inv, PE.EngineConfig(partial_docs=["I1"]))
+    assert res["partial"] == ["I1"]
+    a = res["accepted"].iloc[0]
+    assert a["PICK_STATUS"] == "PARTIAL"
+    assert a["DOC_QTY"] == 22 and a["PICKED_QTY"] == 14 and a["SHORT_QTY"] == 8
+    # the WMS files carry what is really being picked, not the invoice quantity
+    assert res["detail"]["QTY"].astype(float).sum() == 14
+    assert res["allocations"]["QTY_PICKED"].sum() == 14
+    assert "PARTIAL PICK" in a["DOC_CHECK"]
+
+
+def test_a_partial_never_takes_more_than_the_document_asks():
+    inv, doc = _short_case()
+    res = PE.run_pick([doc], inv, PE.EngineConfig(partial_docs=["*"]))
+    per_line = res["allocations"].groupby("DOC_LINE")["QTY_PICKED"].sum()
+    for ln in doc.lines:
+        assert per_line.get(ln.line_no, 0.0) <= ln.qty + 1e-9
+
+
+def test_nothing_on_the_floor_is_not_a_partial_pick():
+    inv, _ = _short_case()
+    res = PE.run_pick([_doc("I2", [("ZZZ", 5)])], inv, PE.EngineConfig(partial_docs=["*"]))
+    assert len(res["accepted"]) == 0
+    assert "STOCK SHORT" in res["rejected"].iloc[0]["REASON"]
+
+
+def test_the_balance_is_picked_later_and_only_the_balance():
+    inv, doc = _short_case()
+    first = PE.run_pick([doc], inv, PE.EngineConfig(partial_docs=["I1"]))
+    prev = G.picked_lines_from(first["allocations"])
+    assert prev == {"I1": {1: 10.0, 2: 4.0}}
+    # BBB has been restocked
+    inv2 = inv.copy(); inv2.loc[inv2["Item Number"] == "BBB", "Actual Qty"] = 50
+    second = PE.run_pick([doc], inv2, PE.EngineConfig(), picked_before=prev)
+    a = second["accepted"].iloc[0]
+    assert a["PICK_STATUS"] == "FULL"
+    assert a["PICKED_QTY"] == 8 and a["PREV_QTY"] == 14 and a["TOTAL_PICKED"] == 22
+    assert a["SHORT_QTY"] == 0
+    assert second["detail"]["QTY"].astype(float).sum() == 8      # the balance only
+    assert set(second["allocations"]["DOC_LINE"]) == {2}         # line 1 was done
+
+
+def test_a_partly_picked_document_stays_open_for_its_balance():
+    reg = pd.DataFrame([
+        {"DOC_NUMBER": "FULL1", "PICK_STATUS": "FULL"},
+        {"DOC_NUMBER": "PART1", "PICK_STATUS": "PARTIAL"},
+        {"DOC_NUMBER": "PART2", "PICK_STATUS": "PARTIAL"},
+        {"DOC_NUMBER": "PART2", "PICK_STATUS": "FULL"},      # balance went out
+    ])
+    assert G.open_docs(reg) == {"FULL1", "PART2"}
+    # rows written before partial picks existed have no status and were all full
+    assert G.open_docs(pd.DataFrame([{"DOC_NUMBER": "OLD1"}])) == {"OLD1"}
+
+
+def test_the_register_calls_a_partial_document_partial():
+    inv, doc = _short_case()
+    res = PE.run_pick([doc], inv, PE.EngineConfig(partial_docs=["I1"]))
+    s, d = R.build([doc], res, R.DEFAULT_MRP, user="t", plant="PL1")
+    row = s.iloc[0]
+    assert row["KORBER_PICK"] == R.PICK_PART
+    assert row["QTY"] == 22 and row["PICKED_QTY"] == 14
+    assert "still owed" in str(row["REMARK"])
+    # line by line: the full line is Yes, the short line is Partial
+    assert d.loc[d["LINE"] == 1, "KORBER_PICK"].iloc[0] == R.PICK_YES
+    assert d.loc[d["LINE"] == 2, "KORBER_PICK"].iloc[0] == R.PICK_PART
+    assert d.loc[d["LINE"] == 2, "PICKED_QTY"].iloc[0] == 4
+
+
+def test_the_register_closes_the_document_when_the_balance_goes_out():
+    inv, doc = _short_case()
+    first = PE.run_pick([doc], inv, PE.EngineConfig(partial_docs=["I1"]))
+    s1, d1 = R.build([doc], first, R.DEFAULT_MRP)
+    inv2 = inv.copy(); inv2.loc[inv2["Item Number"] == "BBB", "Actual Qty"] = 50
+    second = PE.run_pick([doc], inv2, PE.EngineConfig(),
+                         picked_before=G.picked_lines_from(first["allocations"]))
+    s2, d2 = R.build([doc], second, R.DEFAULT_MRP)
+    assert s2.iloc[0]["KORBER_PICK"] == R.PICK_YES
+    assert s2.iloc[0]["PICKED_QTY"] == 22          # both runs together
+    merged = R.merge_summary(s1, s2)["data"]
+    assert merged.iloc[0]["KORBER_PICK"] == R.PICK_YES
+    md = R.merge_details(d1, d2)
+    assert set(md["KORBER_PICK"]) == {R.PICK_YES}
+
+
+def test_a_partial_is_never_walked_back_to_not_picked():
+    inv, doc = _short_case()
+    part = PE.run_pick([doc], inv, PE.EngineConfig(partial_docs=["I1"]))
+    s1, d1 = R.build([doc], part, R.DEFAULT_MRP)
+    # a later run with no stock at all takes nothing
+    nothing = PE.run_pick([doc], inv.assign(**{"Actual Qty": [0, 0]}), PE.EngineConfig())
+    s2, d2 = R.build([doc], nothing, R.DEFAULT_MRP)
+    merged = R.merge_summary(s1, s2)["data"]
+    assert merged.iloc[0]["KORBER_PICK"] == R.PICK_PART
+    assert float(merged.iloc[0]["PICKED_QTY"]) == 14.0
+    md = R.merge_details(d1, d2)
+    assert md.loc[md["LINE"] == 1, "KORBER_PICK"].iloc[0] == R.PICK_YES
+    assert md.loc[md["LINE"] == 2, "PICKED_QTY"].iloc[0] == 4
+
+
+def test_the_dashboard_counts_a_partial_as_still_owed():
+    inv, doc = _short_case()
+    res = PE.run_pick([doc], inv, PE.EngineConfig(partial_docs=["I1"]))
+    s, _d = R.build([doc], res, R.DEFAULT_MRP)
+    k = R.dashboard(s)["kpi"]
+    assert k["total"] == 1 and k["picked"] == 0 and k["partial"] == 1
+    assert k["pending"] == 1                    # not finished
+    assert k["qty_owed"] == 8                   # but only the balance is left
+    assert R.dashboard(s)["pending"].iloc[0]["REASON"] == "Partially picked"
+
+
+def test_the_pick_sheet_says_it_is_partial():
+    import pick_pdf as PP
+    inv, doc = _short_case()
+    res = PE.run_pick([doc], inv, PE.EngineConfig(partial_docs=["I1"]))
+    b = PE.doc_bundle(res, "I1")
+    assert b["info"]["PICK_STATUS"] == "PARTIAL"
+    assert b["info"]["SHORT_QTY"] == 8
+    pdf = PP.build_pick_sheet(b["info"], b["allocations"], b["verify"])
+    assert pdf[:4] == b"%PDF"
+    assert len(pdf) > 1000
+
+
 if __name__ == "__main__":
     import sys
     fails = 0

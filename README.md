@@ -1180,3 +1180,145 @@ python -m pytest test_dataflow.py
 `invoice_register.py`, `gsheet.py`, `sku_master.py`, `ui.py`,
 `test_dataflow.py`. Login screen එකේ පහළ BUILD එකේ
 `2026-08-20 · dataflow audit` කියලා තියෙනවා නම් හරි.
+
+---
+
+## 35. Partial pick — "දැන් තියෙන ටික යවමු"
+
+Invoice එකක line එකක් හරි stock short නම් කලින් **මුළු document එකම**
+block වුණා (all-or-nothing). Customer එකාට wait කරන්න බැරි වුණාම දැන්
+**තියෙන ප්‍රමාණය යවලා, ඉතුරු ටික ණයට තියාගන්න** පුළුවන්.
+
+### පාවිච්චි කරන විදිහ
+
+1. සාමාන්‍ය විදිහට **Generate pick** කරන්න.
+2. Stock short නම් Result එකට යටින් **"Send what we have"** කියලා
+   section එකක් එනවා — මොන document එකෙන් දැන් කීයක් යවන්න පුළුවන්ද
+   කියලා පේනවා.
+
+   | DOC_NUMBER | SHORT_LINES | REQUIRED | AVAILABLE_NOW | STILL_SHORT |
+   |---|---|---|---|---|
+   | 30426013174 | 1 | 12 | 4 | 8 |
+
+   මේ අංක **short lines වලට විතරයි** — full stock තියෙන lines කොහොමත්
+   සම්පූර්ණයෙන් යනවා.
+3. Document තෝරලා **"The customer has agreed to a short delivery"**
+   tick කරලා **Pick what is available** ඔබන්න.
+4. Pick එක ආපහු run වෙනවා. දැන් OutBound MASTER / Detail file වල
+   තියෙන්නේ **ඇත්තටම යවන ප්‍රමාණය** — invoice qty එක නෙවෙයි.
+
+Tick box එක **confirmation එක**. ඒක නොදාම partial pick එකක් වෙන්නේ නෑ,
+default එක තාමත් all-or-nothing.
+
+### Pick Sheet එකේ
+
+Partial pick එකක Pick Sheet එකේ උඩම **PARTIAL** කියලා පැහැදිලිව
+තියෙනවා:
+
+| PICK STATUS | PICKING NOW | ALREADY SENT | STILL OWED |
+|---|---|---|---|
+| PARTIAL | 14 | 0 | 8 |
+
+> **PARTIAL PICK — THIS IS NOT THE WHOLE DOCUMENT.** Only the quantity
+> shown under PICKING NOW is being picked today … do not top them up
+> from the invoice.
+
+Floor එකේ කෙනෙක් "අඩුයි නේ" කියලා invoice එකෙන් හදන්න යන එක නවත්තන්න.
+
+### ඉතුරු ටික පස්සේ pick කරන එක
+
+Stock ආවම **ඒම invoice එකම ආපහම upload කරලා Generate pick** කරන්න.
+System එකම ඉතුරු ටික විතරක් ගන්නවා:
+
+* `DOC_REGISTRY` එකේ `PICK_STATUS = PARTIAL` නම් ඒ document එක
+  **duplicate විදිහට block වෙන්නේ නෑ** — තාම ණයක් තියෙනවා.
+* `PALLET_LEDGER` එකෙන් **line එකකට කලින් කීයක් ගියාද** කියලා බලලා ඒක
+  අඩු කරනවා.
+* සම්පූර්ණ වුණු line එක **හැර යනවා**, අඩුවෙන් ගිය line එකට **ඉතුරු
+  ටික විතරක්** ඉල්ලනවා.
+
+උදාහරණයක් — Invoice: AAA 10 + BBB 12 (= 22). BBB තියෙන්නේ 4යි:
+
+| Run | AAA | BBB | OutBound Detail | PICK_STATUS | ණයට |
+|---|---|---|---|---|---|
+| 1 (partial) | 10 | 4 | **14** | PARTIAL | 8 |
+| 2 (stock ආවම) | — | 8 | **8** | FULL | 0 |
+
+Run 2 එකේදී AAA line එක **කොහෙත්ම නැවත pick වෙන්නේ නෑ**.
+
+### Register එකේ — තුන්වෙනි තත්වය
+
+`KORBER_PICK` එකට දැන් **`Partial`** කියලා තත්වයක් තියෙනවා:
+
+| තත්වය | තේරුම |
+|---|---|
+| `No` | කිසිම දෙයක් pick වෙලා නෑ |
+| `Partial` | ටිකක් ගිහින්, ඉතුරු ටික තාම ණයට |
+| `Yes` | මුළු document එකම pick වෙලා |
+
+* **ආපස්සට යන්නේ නෑ.** `Partial` එකක් පස්සේ run එකකින් `No` වෙන්නේ නෑ —
+  `Yes` වෙන්න විතරයි පුළුවන් (`Partial` → `Yes`). Load එකක් delete
+  කරොත් විතරයි `No` වෙන්නේ.
+* **INVOICE_DETAIL එකේ line එකකට එකේම උත්තරය.** Partial document එකක
+  සම්පූර්ණයෙන් ගිය line එක `Yes`, අඩුවෙන් ගිය එක `Partial`, කිසිසේත්ම
+  නොගිය එක `No`.
+* **REMARK** එකේ `PARTIAL PICK — 8 of 22 still owed` කියලා තියෙනවා.
+
+### Dashboard එකේ
+
+* **Partial** — ටිකක් ගිහින් තියෙන invoice ගාන.
+* **Still to pick** — ඇත්තටම **ඉතුරු** ප්‍රමාණය (මුළු invoice qty එක
+  නෙවෙයි). Partial invoice එකක් pending කියලා ගණන් ගන්නවා, ඒත් ණය
+  ප්‍රමාණය විතරයි මේකට එකතු වෙන්නේ.
+* "Why they are waiting" chart එකේ **Partially picked** කියලා අලුත්
+  reason එකක්.
+
+### DOC_REGISTRY එකේ අලුත් column 3ක්
+
+| Column | තේරුම |
+|---|---|
+| `PICK_STATUS` | `FULL` හෝ `PARTIAL` |
+| `TOTAL_PICKED` | Document එකට **මුළුමනින්ම** ගිය ප්‍රමාණය (හැම run එකම) |
+| `SHORT_QTY` | තාම ණයට තියෙන ප්‍රමාණය |
+
+`PICKED_QTY` කියන්නේ **ඒ run එකේදී විතරක්** ගිය ප්‍රමාණය.
+
+මේ column තුන sheet එකේ **අන්තිමට add වෙනවා** (§31 බලන්න), ඒ නිසා
+තියෙන row වල data එහෙමම තියෙනවා. පරණ row වල `PICK_STATUS` හිස්ය —
+ඒවා ඔක්කොම full pick, ඒ නිසා හිස් එකක් = `FULL` විදිහට කියවනවා.
+
+### Qty verify එක
+
+Full pick එකකදී line · document total · WMS file total **තුනම හරියටම**
+match වෙන්න ඕන — ඒක වෙනස් වෙලා නෑ.
+
+Partial pick එකකදී අඩුවෙන් යවන එක **තීරණයක්**, error එකක් නෙවෙයි.
+ඒ නිසා check වෙන්නේ:
+
+* WMS file එකට ගියේ **ඇත්තටම pallet එකෙන් ගත්ත ප්‍රමාණයමද** ✔
+* ඕන ප්‍රමාණයට වඩා **වැඩියෙන් ගත්තේ නැද්ද** ✔
+
+Short line එකට `⚠️ SHORT` කියලා පෙන්නනවා — `❌ MISMATCH` නෙවෙයි.
+
+### Test
+
+`test_dataflow.py` එකේ partial pick එකට test 10ක් තියෙනවා (එකතුව 35):
+default all-or-nothing, offer එකේ අංක, WMS file එකේ qty, ණය ගණන,
+balance run එකේ line skip වීම, `Partial` ආපස්සට නොයාම, dashboard
+ගණන්, pick sheet එකේ PARTIAL banner.
+
+```bash
+python test_dataflow.py
+```
+
+| Module | දැන් API |
+|---|---|
+| `doc_parser.py` | 7 |
+| `pick_engine.py` | 6 |
+| `invoice_register.py` | 16 |
+| `gsheet.py` | 12 |
+| `pick_pdf.py` | 5 |
+| `sku_master.py` | 3 |
+| `ui.py` | 3 |
+
+BUILD: `2026-08-21 · partial pick`

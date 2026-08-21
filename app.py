@@ -35,9 +35,9 @@ st.set_page_config(
 # Streamlit Cloud redacts exception text, so a half-updated deploy used to die
 # with an unreadable TypeError. Every module carries an API number; refuse to
 # run against a stale one and say exactly which file to replace.
-_NEEDS = {"pick_engine.py": (E, 5), "doc_parser.py": (P, 7), "pick_pdf.py": (PP, 4),
+_NEEDS = {"pick_engine.py": (E, 6), "doc_parser.py": (P, 7), "pick_pdf.py": (PP, 5),
           "sku_master.py": (SKU, 3), "ui.py": (ui, 3),
-          "invoice_register.py": (R, 15)}
+          "invoice_register.py": (R, 16)}
 _STALE = [(f, getattr(m, "API", 0), n) for f, (m, n) in _NEEDS.items()
           if getattr(m, "API", 0) < n]
 if _STALE:
@@ -55,8 +55,8 @@ if _STALE:
 # catch the opposite — an old app.py deployed beside new modules — which looks
 # like nothing happened at all: the new screen simply is not there. So publish
 # the build plainly enough to check in one glance after a deploy.
-BUILD = "2026-08-20 · dataflow audit"
-_GS_NEEDS = 11
+BUILD = "2026-08-21 · partial pick"
+_GS_NEEDS = 12
 try:                                  # gsheet is imported lazily everywhere else
     import gsheet as _gs_mod
     _GS_API = getattr(_gs_mod, "API", 0)
@@ -274,7 +274,12 @@ def _dashboard_tab_body() -> None:
                          f"{k['pct']:.0f}%")
         ui.kpi_row([
             {"label": "Pending invoices", "value": k["pending"], "tone": "warn"},
-            {"label": "Pending qty", "value": E._qty_str(k["qty_pending"]), "tone": "warn"},
+            # a partly picked invoice is pending, but only its balance is left —
+            # "still to pick" is the number the floor actually works to
+            {"label": "Still to pick", "value": E._qty_str(k.get("qty_owed", 0)),
+             "tone": "warn", "hint": "the balance, not the whole invoice"},
+            {"label": "Partial", "value": k.get("partial", 0), "tone": "warn",
+             "hint": "part of the invoice has already gone out"},
             {"label": "Picked qty", "value": E._qty_str(k["qty_picked"]), "tone": "ok"},
             {"label": "Oldest pending", "value": f"{k['oldest']} d",
              "hint": "days since invoice date"},
@@ -680,11 +685,14 @@ def _register_tab_body() -> None:
         ui.section("Backfill", hint="picked earlier, never registered")
         _backfill_ui()
     else:
-        yes = (reg_s["KORBER_PICK"].astype(str) == "Yes").sum()
+        _pk = reg_s["KORBER_PICK"].astype(str).str.strip().str.title()
+        yes = int((_pk == R.PICK_YES).sum())
+        part = int((_pk == R.PICK_PART).sum())
         ui.kpi_row([
             {"label": "Invoices", "value": len(reg_s)},
-            {"label": "Körber picked", "value": int(yes), "tone": "ok"},
-            {"label": "Not picked", "value": int(len(reg_s) - yes), "tone": "warn"},
+            {"label": "Körber picked", "value": yes, "tone": "ok"},
+            {"label": "Partial", "value": part, "tone": "warn"},
+            {"label": "Not picked", "value": int(len(reg_s) - yes - part), "tone": "warn"},
             {"label": "MRP", "value": int((reg_s["MRP"].astype(str) == "Yes").sum())},
             {"label": "Picking done",
              "value": int((reg_s["PICKING"].astype(str) == R.STATUS_DONE).sum()),
@@ -700,7 +708,8 @@ def _register_tab_body() -> None:
         f1, f2, f3 = st.columns([2, 1, 1])
         rq = f1.text_input("Search", placeholder="invoice no · customer · item · remark",
                            key="reg_q")
-        fk = f2.multiselect("Körber Pick", ["Yes", "No"], key="reg_k")
+        fk = f2.multiselect("Körber Pick", [R.PICK_YES, R.PICK_PART, R.PICK_NO],
+                            key="reg_k")
         fm = f3.multiselect("MRP", ["Yes", "No"], key="reg_m")
 
         vs, vd = reg_s.copy(), reg_d.copy()
@@ -1456,7 +1465,7 @@ with tab_gen:
         with st.spinner("Reading the inventory..."):
             st.session_state["inv_raw"] = pd.read_excel(f_inv, dtype=str)
         st.session_state["inv_sig"] = (f_inv.name, f_inv.size)
-        for _k in ("plants_ok", "result", "release_locked"):
+        for _k in ("plants_ok", "result", "release_locked", "partial_docs"):
             st.session_state.pop(_k, None)
     inv_raw = st.session_state.get("inv_raw")
 
@@ -1512,6 +1521,7 @@ with tab_gen:
             exact_item_first=exact_first, use_ledger=use_ledger,
             pick_id_zero_only=pick_id_gate,
             release_locked=st.session_state.get("release_locked", {}),
+            partial_docs=st.session_state.get("partial_docs", []),
             blank_fill=blank_fill,
             fill_item_number_col=fill_item_col, merge_same_item_lines=merge_lines,
             override_doc_check=override,
@@ -1536,10 +1546,13 @@ with tab_gen:
         if go or _auto:
             ledger = None
             done_docs: set[str] = set()
+            prev_lines: dict[str, dict[int, float]] = {}
             if gs_ready:
                 try:
                     import gsheet
                     ledger, done_docs = gsheet.read_for_run(sa_info, sheet_key)
+                    # a partly picked document comes back for its balance only
+                    prev_lines = gsheet.picked_lines_from(ledger)
                 except Exception as ex:
                     st.warning(f"Could not read the Google Sheet ({ex}) - "
                                "ledger and duplicate check were skipped.")
@@ -1547,7 +1560,8 @@ with tab_gen:
                 with st.status("Calculating the pick...", expanded=False) as sbox:
                     res = E.run_pick(st.session_state["docs"], inv_raw, cfg,
                                      ledger=ledger, processed_docs=done_docs,
-                                     sku_desc=SKU.lookup(st.session_state.get("sku_df")))
+                                     sku_desc=SKU.lookup(st.session_state.get("sku_df")),
+                                     picked_before=prev_lines)
                     sbox.update(label=f"Picked {len(res['accepted'])} of "
                                       f"{len(st.session_state['docs'])} documents",
                                 state="complete")
@@ -1618,21 +1632,27 @@ with tab_gen:
         acc, rej = res["accepted"], res["rejected"]
         alloc = res["allocations"]
 
+        n_part = len(res.get("partial") or [])
         ui.section("Result", "05", f"RUN {res['run_id']} · {res['pick_date']}")
-        if len(acc) and not len(rej):
-            st.markdown(ui.stamp("all picked", "ok") + " &nbsp;" +
-                        ui.muted("every document was picked"),
-                        unsafe_allow_html=True)
-        elif len(acc):
-            st.markdown(ui.stamp(f"{len(acc)} picked", "ok") + " &nbsp;" +
-                        ui.stamp(f"{len(rej)} blocked", "stop"),
-                        unsafe_allow_html=True)
-        else:
-            st.markdown(ui.stamp("nothing picked", "stop") + " &nbsp;" +
-                        ui.muted("see the reason below"), unsafe_allow_html=True)
+        marks = []
+        if len(acc):
+            marks.append(ui.stamp(f"{len(acc) - n_part} picked in full", "ok")
+                         if n_part else ui.stamp(f"{len(acc)} picked", "ok"))
+        if n_part:
+            marks.append(ui.stamp(f"{n_part} partial", "warn"))
+        if len(rej):
+            marks.append(ui.stamp(f"{len(rej)} blocked", "stop"))
+        if len(acc) and not len(rej) and not n_part:
+            marks = [ui.stamp("all picked", "ok") + " &nbsp;" +
+                     ui.muted("every document was picked")]
+        if not len(acc):
+            marks = [ui.stamp("nothing picked", "stop") + " &nbsp;" +
+                     ui.muted("see the reason below")]
+        st.markdown(" &nbsp;".join(marks), unsafe_allow_html=True)
 
         m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Documents", len(acc))
+        m1.metric("Documents", len(acc),
+                  f"{n_part} partial" if n_part else None, delta_color="off")
         m2.metric("Blocked", len(rej), delta_color="inverse")
         m3.metric("Order lines", len(res["detail"]))
         m4.metric("Pallets", int(alloc["PALLET"].nunique()) if len(alloc) else 0)
@@ -1640,11 +1660,30 @@ with tab_gen:
                   f"{pd.to_numeric(alloc['QTY_PICKED'], errors='coerce').sum():g}"
                   if len(alloc) else "0")
 
+        if n_part:
+            owed = (float(pd.to_numeric(acc["SHORT_QTY"], errors="coerce").sum())
+                    if "SHORT_QTY" in acc.columns else 0.0)
+            st.warning(
+                f"**Partial pick — {', '.join(res['partial'])}.** "
+                f"{E._qty_str(owed)} units are still owed. The OutBound files below "
+                "carry only what is actually being picked, and the register shows "
+                "these invoices as **Partial** until the balance goes out.")
+            st.dataframe(
+                acc.loc[acc["DOC_NUMBER"].astype(str).isin(set(res["partial"])),
+                        [c for c in ("DOC_NUMBER", "DOC_TYPE", "DOC_QTY", "PREV_QTY",
+                                     "PICKED_QTY", "TOTAL_PICKED", "SHORT_QTY")
+                         if c in acc.columns]],
+                hide_index=True, width="stretch")
+
         vdf = res.get("verify", pd.DataFrame())
         bad_v = vdf[vdf["STATUS"].astype(str).str.contains("MISMATCH")] if len(vdf) else vdf
-        if len(vdf) and not len(bad_v):
+        if len(vdf) and not len(bad_v) and not n_part:
             st.success("Quantity verified — line · document total · WMS file total "
                        "all three match the Invoice / DC quantity exactly.")
+        elif len(vdf) and not len(bad_v):
+            st.success("Quantity verified — the OutBound file total matches what is "
+                       "coming off the pallets, line by line. The short lines are "
+                       "marked ⚠️ SHORT, not a mismatch.")
         elif len(bad_v):
             st.error("Quantity mismatch - these documents were not picked:")
             st.dataframe(bad_v, hide_index=True, width="stretch")
@@ -1655,6 +1694,56 @@ with tab_gen:
                 if len(res["shortage"]):
                     st.caption("Stock short lines:")
                     st.dataframe(res["shortage"], hide_index=True, width="stretch")
+
+        # ------------------------------------------------------------------ #
+        # Partial pick — send what is on the floor now
+        # ------------------------------------------------------------------ #
+        part = E.partialable(res)
+        if len(part):
+            st.divider()
+            ui.section("Send what we have",
+                       hint="urgent — pick the available quantity and owe the rest")
+            st.markdown(
+                ui.stamp("confirmation needed", "warn") + " &nbsp;" +
+                ui.muted("These documents are short. A partial pick sends the "
+                         "quantity that is on the floor today; the balance stays "
+                         "owed and the document comes back through the pick when "
+                         "the stock arrives."),
+                unsafe_allow_html=True)
+            st.dataframe(part, hide_index=True, width="stretch")
+            st.caption("The numbers above are for the **short lines only** — every "
+                       "line that has full stock goes out in full either way.")
+
+            pc1, pc2 = st.columns([2, 1])
+            take_p = pc1.multiselect("Documents to pick partially",
+                                     part["DOC_NUMBER"].tolist(),
+                                     default=part["DOC_NUMBER"].tolist(),
+                                     key="partial_pick")
+            sure_p = pc1.checkbox(
+                "The customer has agreed to a short delivery for these documents",
+                key="partial_confirm")
+            pc2.write("")
+            if pc2.button("Pick what is available", type="primary", width="stretch",
+                          disabled=not (take_p and sure_p)):
+                st.session_state["partial_docs"] = sorted(
+                    set(st.session_state.get("partial_docs", [])) | set(take_p))
+                st.session_state["rerun_pick"] = True
+                st.toast(f"Partial pick for {len(take_p)} document(s) — picking again",
+                         icon="📦")
+                st.rerun()
+            if not sure_p:
+                pc1.caption("The tick box is the confirmation — nothing goes out "
+                            "short until it is on.")
+
+        if st.session_state.get("partial_docs"):
+            done_p = ", ".join(st.session_state["partial_docs"])
+            st.caption(f"Partial pick confirmed in this run: {done_p} — the balance "
+                       "stays owed, and DOC_REGISTRY keeps the document open so it "
+                       "can be picked again.")
+            if st.button("Undo the partial pick"):
+                st.session_state.pop("partial_docs", None)
+                st.session_state["rerun_pick"] = True
+                st.rerun()
 
         # ------------------------------------------------------------------ #
         # Shortage — PDF (merged with the invoice) + email

@@ -29,7 +29,7 @@ import pick_engine as E
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 11
+API = 12
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -51,7 +51,10 @@ WS_LOCK = "_LOCKS"
 LEDGER_COLS = E.ALLOC_COLS
 REGISTRY_COLS = ["DOC_NUMBER", "DOC_TYPE", "DOC_DATE", "REF_NUMBER", "DOC_CHECK",
                  "LINES", "WMS_LINES", "DOC_QTY", "PICKED_QTY", "WMS_QTY", "VERIFY",
-                 "PALLETS", "PLANTS", "RUN_ID", "PROCESSED_AT", "SOURCE_FILE"]
+                 "PALLETS", "PLANTS", "RUN_ID", "PROCESSED_AT", "SOURCE_FILE",
+                 # partial pick: PICKED_QTY is what *this* run took, TOTAL_PICKED
+                 # is what the document has received altogether
+                 "PICK_STATUS", "TOTAL_PICKED", "SHORT_QTY"]
 REJECT_COLS = ["RUN_ID", "PROCESSED_AT", "DOC_NUMBER", "DOC_TYPE", "REASON", "DETAIL",
                "SOURCE_FILE"]
 RUNLOG_COLS = ["RUN_ID", "PROCESSED_AT", "USER_NOTE", "PLANTS", "STRATEGY", "DOCS_OK",
@@ -372,10 +375,65 @@ def read_ledger(sa_info: dict, sheet_key: str) -> pd.DataFrame:
 
 
 def read_processed_docs(sa_info: dict, sheet_key: str, fresh: bool = False) -> set[str]:
+    """
+    Documents that must not be picked again.
+
+    A **partially** picked document is not one of them: it still has a balance
+    owed, so it has to come back through the pick. It is only closed once a
+    later run brings it up to the full document quantity.
+    """
     df = read_ws(sa_info, sheet_key, WS_REGISTRY, use_cache=not fresh)
     if df is None or not len(df) or "DOC_NUMBER" not in df.columns:
         return set()
-    return {str(x).strip() for x in df["DOC_NUMBER"] if str(x).strip()}
+    # A document is closed once it has at least one FULL row. Rows written
+    # before partial picks existed carry no status at all, and those were all
+    # full picks — so a blank status counts as closed.
+    return open_docs(df)
+
+
+PICKED_LINE_COLS = ("DOC_NUMBER", "DOC_LINE", "QTY_PICKED")
+
+
+def picked_lines_from(ledger: pd.DataFrame | None) -> dict[str, dict[int, float]]:
+    """
+    {doc number: {line no: qty already picked}} — straight from PALLET_LEDGER.
+
+    A partially picked document comes back for its balance, and the engine has
+    to know what each line has had already or it would pick the whole line
+    again. The ledger is the honest record: deleting a load removes its rows,
+    so a released document correctly reads as nothing picked.
+    """
+    df = ledger
+    out: dict[str, dict[int, float]] = {}
+    if df is None or not len(df) or not all(c in df.columns for c in PICKED_LINE_COLS):
+        return out
+    d = df[list(PICKED_LINE_COLS)].copy()
+    d["DOC_NUMBER"] = d["DOC_NUMBER"].map(R._id_str).str.strip()
+    d["DOC_LINE"] = pd.to_numeric(d["DOC_LINE"], errors="coerce")
+    d["QTY_PICKED"] = pd.to_numeric(d["QTY_PICKED"], errors="coerce").fillna(0.0)
+    d = d[(d["DOC_NUMBER"] != "") & d["DOC_LINE"].notna()]
+    if not len(d):
+        return out
+    g = d.groupby(["DOC_NUMBER", "DOC_LINE"])["QTY_PICKED"].sum()
+    for (num, line), qty in g.items():
+        out.setdefault(str(num), {})[int(line)] = float(qty)
+    return out
+
+
+def read_picked_lines(sa_info: dict, sheet_key: str,
+                      fresh: bool = False) -> dict[str, dict[int, float]]:
+    return picked_lines_from(read_ws(sa_info, sheet_key, WS_LEDGER, use_cache=not fresh))
+
+
+def open_docs(registry: pd.DataFrame | None) -> set[str]:
+    """Documents already picked in full — the ones a new run must refuse."""
+    if registry is None or not len(registry) or "DOC_NUMBER" not in registry.columns:
+        return set()
+    nums = registry["DOC_NUMBER"].astype(str).str.strip()
+    if "PICK_STATUS" in registry.columns:
+        # a PARTIAL row leaves the document open for its balance
+        nums = nums[registry["PICK_STATUS"].astype(str).str.strip().str.upper() != "PARTIAL"]
+    return {n for n in nums if n}
 
 
 def read_setting(sa_info: dict, sheet_key: str, key: str, default: str = "") -> str:
@@ -766,10 +824,7 @@ def read_register(sa_info: dict, sheet_key: str,
 def read_for_run(sa_info: dict, sheet_key: str) -> tuple[pd.DataFrame, set[str]]:
     """Ledger + processed-document list in one request."""
     got = read_many(sa_info, sheet_key, [WS_LEDGER, WS_REGISTRY])
-    reg = got.get(WS_REGISTRY, pd.DataFrame())
-    done = ({str(x).strip() for x in reg["DOC_NUMBER"] if str(x).strip()}
-            if len(reg) and "DOC_NUMBER" in reg.columns else set())
-    return got.get(WS_LEDGER, pd.DataFrame()), done
+    return got.get(WS_LEDGER, pd.DataFrame()), open_docs(got.get(WS_REGISTRY))
 
 
 def _replace_ws(book, title: str, header: list[str], df: pd.DataFrame,
