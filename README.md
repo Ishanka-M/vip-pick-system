@@ -1576,3 +1576,102 @@ CAN_PICK_NOW = (සම්පූර්ණයෙන් allocate වුණු lines
 `ALREADY_SENT` — කලින් partial pick එකකින් ගිය ප්‍රමාණය (§35).
 
 BUILD: `2026-08-22b · partial offer fix` · `pick_engine.py` API **7**
+
+---
+
+## 40. Pick email එකේ — Doc Qty එකෙන් කීයක් pick කරාද
+
+Partial pick එකකදී email එකෙන් **ඇත්තටම යවන ප්‍රමාණය** කියන්න ඕන.
+
+### කලින් තිබ්බ ප්‍රශ්නය
+
+Email එකේ පහළ තිබ්බේ:
+
+```
+Total picked qty: 22
+```
+
+ඒත් ඒක ගණන් හැදුවේ **document qty එකෙන්** — pick කරපු ප්‍රමාණයෙන්
+නෙවෙයි. Full pick එකකදී දෙකම එකයි, ඒ නිසා අවුලක් තිබ්බේ නෑ. ඒත්
+**partial pick** එකකදී 14ක් යවලා email එකෙන් **22ක් යවනවා** කියලා
+කිව්වා. Gate එකේදී තර්කයක් හැදෙන්නේ ඒකෙන්.
+
+### දැන් එන email එක
+
+```
+Subject: PARTIAL OutBound Pick · LOAD ID 30426013174
+
+PARTIAL PICK — 30426013174. 14 of 25 pcs are being picked;
+11 pcs are still owed and will follow when the stock arrives.
+
+LOAD ID       : 30426013174   [PARTIAL]
+Document      : INVOICE 30426013174  (22-AUG-2026)
+Plant         : PL1
+Document qty  : 25 pcs over 3 lines
+Picking now   : 14 pcs
+Still owed    : 11 pcs
+Pallets       : 2
+Qty check     : ⚠️ PARTIAL
+
+Line summary — document qty vs picked:
+Ln  Item Code    Item Number  Doc Qty  Picked  Short
+--  -----------  -----------  -------  ------  -----
+1   P601560 710  P601560 710       10      10      0
+2   1C072323     1C072323          12       4      8
+3   R010077                         3       0      3
+
+Pick details:
+Ln  Item Number  Pallet  Location  Qty  Balance
+--  -----------  ------  --------  ---  -------
+ 1  P601560 710  PAL1    A1         10       90
+ 2  1C072323     PAL2    A2          4        0
+
+Total document qty: 25
+Total picked qty  : 14
+Still owed        : 11
+```
+
+* **Subject** එකට `PARTIAL` කියලා ඉස්සරහින් එනවා
+* **Banner** එකක් — HTML එකේ කහ පාට box එකක්
+* **Line summary** — line එකකට **Doc Qty · Picked · Short**. Short line
+  HTML එකේ කහ පාටින් shade වෙනවා
+* **Footer** එකේ අංක තුනම වෙන වෙනම — එකම number එකකින් වැඩ තුනක්
+  ගන්නේ නෑ
+
+### Balance run එකේදී
+
+ඉතුරු ටික pick කරද්දී **කලින් ගිය ප්‍රමාණයත්** එනවා:
+
+```
+Document qty  : 22 pcs over 2 lines
+Picking now   : 8 pcs
+Already sent  : 14 pcs (earlier pick)
+
+Line summary — document qty vs picked:
+Ln  Item Code  Item Number  Doc Qty  Picked  Short
+--  ---------  -----------  -------  ------  -----
+1   AAA                          10      10      0
+2   BBB        BBB               12      12      0
+
+Total document qty: 22
+Total picked qty  : 8
+Already sent      : 14 (earlier pick)
+Delivered in all  : 22
+```
+
+Line summary එකේ `Picked` කියන්නේ **document එකට මුළුමනින්ම ගිය
+ප්‍රමාණය** (මේ run එක + කලින්), ඒ නිසා `Short 0` කියලා පේනවා —
+document එක දැන් සම්පූර්ණයි.
+
+### Full pick එකකට
+
+Partial නොවුණාම `PARTIAL` කිසිම තැනක නෑ, `Still owed` line එකත් නෑ.
+`Doc Qty` සහ `Picked` දෙකම එකයි, `Short` හැම line එකකම 0.
+
+### Pick Sheet PDF එකේ
+
+PDF එකේ **කලින් ඉඳන්ම** `QUANTITY VERIFICATION — Doc Qty vs Picked Qty`
+table එකක් තියෙනවා, ඒ එක්කම §35 එකේ `PARTIAL` header block එකත්. ඒ නිසා
+PDF එකට වෙනසක් ඕන වුණේ නෑ.
+
+BUILD: `2026-08-23 · partial pick email` · `pick_pdf.py` API **6**

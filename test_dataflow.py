@@ -747,6 +747,87 @@ def test_the_offer_counts_what_an_earlier_partial_already_sent():
         assert PE.no_partial(second).iloc[0]["ALREADY_SENT"] == 14
 
 
+
+# --------------------------------------------------------------------------- #
+# the pick email — document qty vs what is actually being picked
+# --------------------------------------------------------------------------- #
+def _mail(res, load_id):
+    import pick_pdf as PP
+    b = PE.doc_bundle(res, load_id)
+    return PP.pick_email_text([b["info"]], b["allocations"], "Thanks,",
+                              verify=b["verify"])
+
+
+def test_the_email_never_calls_the_document_qty_picked():
+    """A full pick: the two happen to be equal, and both are stated."""
+    inv, doc = _short_case()
+    inv.loc[inv["Item Number"] == "BBB", "Actual Qty"] = 100
+    res = PE.run_pick([doc], inv, PE.EngineConfig())
+    subj, body, html = _mail(res, "I1")
+    assert not subj.startswith("PARTIAL")
+    assert "Document qty  : 22 pcs over 2 lines" in body
+    assert "Picking now   : 22 pcs" in body
+    assert "Total document qty: 22" in body
+    assert "Total picked qty  : 22" in body
+    assert "Still owed" not in body
+
+
+def test_the_partial_email_says_what_is_short_line_by_line():
+    inv, doc = _short_case()                 # AAA 10 ok, BBB 12 asked / 4 there
+    res = PE.run_pick([doc], inv, PE.EngineConfig(partial_docs=["I1"]))
+    subj, body, html = _mail(res, "I1")
+    assert subj.startswith("PARTIAL ")
+    assert "PARTIAL PICK — I1. 14 of 22 pcs are being picked; 8 pcs are still owed" in body
+    assert "[PARTIAL]" in body
+    assert "Document qty  : 22 pcs over 2 lines" in body
+    assert "Picking now   : 14 pcs" in body
+    assert "Still owed    : 8 pcs" in body
+    # the line table carries doc qty / picked / short for every line
+    assert "Line summary — document qty vs picked" in body
+    rows = [l for l in body.splitlines() if l.startswith(("1 ", "2 "))]
+    assert any(r.split() == ["1", "AAA", "AAA", "10", "10", "0"] for r in rows), rows
+    assert any(r.split() == ["2", "BBB", "BBB", "12", "4", "8"] for r in rows), rows
+    assert "Total document qty: 22" in body
+    assert "Total picked qty  : 14" in body
+    assert "Still owed        : 8" in body
+    # and the HTML part says the same
+    assert "PARTIAL PICK" in html and "Still owed" in html
+
+
+def test_the_balance_email_shows_what_went_out_earlier():
+    inv, doc = _short_case()
+    first = PE.run_pick([doc], inv, PE.EngineConfig(partial_docs=["I1"]))
+    inv2 = inv.copy(); inv2.loc[inv2["Item Number"] == "BBB", "Actual Qty"] = 50
+    second = PE.run_pick([doc], inv2, PE.EngineConfig(),
+                         picked_before=G.picked_lines_from(first["allocations"]))
+    subj, body, _html = _mail(second, "I1")
+    assert not subj.startswith("PARTIAL")          # this run completes it
+    assert "Picking now   : 8 pcs" in body
+    assert "Already sent  : 14 pcs (earlier pick)" in body
+    assert "Total picked qty  : 8" in body
+    assert "Already sent      : 14 (earlier pick)" in body
+    assert "Delivered in all  : 22" in body
+    assert "Still owed" not in body
+    # every line is now complete against the document
+    assert "12      12      0" in body or "12  12  0" in body.replace("  ", "  ")
+
+
+def test_the_email_totals_add_up_across_several_documents():
+    import pick_pdf as PP
+    inv = pd.concat([_inv(["AAA"], qty=100), _inv(["BBB"], qty=4)], ignore_index=True)
+    docs = [_doc("I1", [("AAA", 10)]), _doc("I2", [("AAA", 5), ("BBB", 12)])]
+    res = PE.run_pick(docs, inv, PE.EngineConfig(partial_docs=["I2"]))
+    infos = [PE.doc_bundle(res, l)["info"] for l in PE.load_ids(res)]
+    _s, body, _h = PP.pick_email_text(infos, res["allocations"], "Thanks,",
+                                      verify=res["verify"])
+    doc_qty = sum(float(i["TOTAL_QTY"]) for i in infos)
+    picked = sum(float(i["PICKED_QTY"]) for i in infos)
+    assert f"Total document qty: {int(doc_qty)}" in body      # 27
+    assert f"Total picked qty  : {int(picked)}" in body       # 19
+    assert picked == res["allocations"]["QTY_PICKED"].sum()
+    assert "Still owed        : 8" in body
+
+
 if __name__ == "__main__":
     import sys
     fails = 0

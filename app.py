@@ -40,7 +40,7 @@ st.set_page_config(
 # catch the opposite — an old app.py deployed beside new modules — which looks
 # like nothing happened at all: the new screen simply is not there. So publish
 # the build plainly enough to check in one glance after a deploy.
-BUILD = "2026-08-22b · partial offer fix"
+BUILD = "2026-08-23 · partial pick email"
 
 # gsheet is imported lazily everywhere else, but it has to be checked with the
 # rest or a deploy that forgot it fails silently and reads like a logic bug.
@@ -53,7 +53,7 @@ _GS_API = getattr(_gs_mod, "API", 0)
 # Every file in the release, in one list. Checking them together matters:
 # reporting them one at a time sends the user round the loop again for the
 # next file, and the answer is always the same — replace the whole set.
-_NEEDS = {"pick_engine.py": (E, 7), "doc_parser.py": (P, 8), "pick_pdf.py": (PP, 5),
+_NEEDS = {"pick_engine.py": (E, 7), "doc_parser.py": (P, 8), "pick_pdf.py": (PP, 6),
           "sku_master.py": (SKU, 3), "ui.py": (ui, 3),
           "invoice_register.py": (R, 17),
           "gsheet.py": (_gs_mod, 12)}
@@ -2179,7 +2179,13 @@ with tab_gen:
                 if len(alloc) else alloc
 
             if infos:
-                subj0, body0, html0 = PP.pick_email_text(infos, m_alloc, mail_sign)
+                # the verify frame is where "document qty vs picked" lives, line
+                # by line — without it the email can only speak per document
+                m_ver = res.get("verify", pd.DataFrame())
+                if len(m_ver):
+                    m_ver = m_ver[m_ver["DOC_NUMBER"].astype(str).isin(pick_for_mail)]
+                subj0, body0, html0 = PP.pick_email_text(infos, m_alloc, mail_sign,
+                                                         verify=m_ver)
                 pick_chart = (PP.pick_line_chart_png(m_alloc) if CHART_LINE
                               else PP.pick_chart_png(m_alloc, "Picked qty by item"))
                 e1, e2 = st.columns([2, 1])

@@ -32,7 +32,7 @@ from reportlab.platypus import (Image, KeepTogether, Paragraph, SimpleDocTemplat
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 5
+API = 6
 
 # --------------------------------------------------------------------------- #
 # palette
@@ -826,12 +826,48 @@ def _addr_list(raw: Any) -> list[str]:
     return out
 
 
+def _plural(n: Any, word: str) -> str:
+    try:
+        k = int(float(n))
+    except (TypeError, ValueError):
+        return f"{n} {word}s"
+    return f"{k} {word}" if k == 1 else f"{k} {word}s"
+
+
+def _is_partial(d: dict[str, Any]) -> bool:
+    return str(d.get("PICK_STATUS", "")).strip().upper() == "PARTIAL"
+
+
+def _picked_of(d: dict[str, Any]) -> float:
+    """What this document is actually having picked in this run."""
+    try:
+        return float(d.get("PICKED_QTY") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def pick_email_text(docs_info: list[dict[str, Any]], alloc: pd.DataFrame,
-                    signature: str = "") -> tuple[str, str, str]:
-    """(subject, plain body, html body)"""
+                    signature: str = "",
+                    verify: pd.DataFrame | None = None) -> tuple[str, str, str]:
+    """
+    (subject, plain body, html body)
+
+    The reader's first question is "how much of my order is on this truck",
+    so every document says its document quantity and what is actually being
+    picked against it — the two are the same only when the pick is complete.
+    A partial pick says so in the subject, in a banner, and per line, because
+    an email that quietly shows the invoice quantity next to a short delivery
+    is the one that causes the argument at the gate.
+    """
     loads = [d.get("LOAD_ID", "") for d in docs_info]
-    total = sum(float(d.get("TOTAL_QTY", 0) or 0) for d in docs_info)
-    subject = ("OutBound Pick · LOAD ID " + ", ".join(loads[:3])
+    doc_total = sum(float(d.get("TOTAL_QTY", 0) or 0) for d in docs_info)
+    total = sum(_picked_of(d) for d in docs_info)
+    owed = sum(float(d.get("SHORT_QTY", 0) or 0) for d in docs_info)
+    prev_total = sum(float(d.get("PREV_QTY", 0) or 0) for d in docs_info)
+    part_ids = [str(d.get("LOAD_ID", "")) for d in docs_info if _is_partial(d)]
+
+    subject = (("PARTIAL " if part_ids else "") + "OutBound Pick · LOAD ID "
+               + ", ".join(loads[:3])
                + (f" +{len(loads) - 3}" if len(loads) > 3 else ""))
 
     lines = ["Hi,", "", "Below pick details for the OutBound order(s):", ""]
@@ -839,43 +875,112 @@ def pick_email_text(docs_info: list[dict[str, Any]], alloc: pd.DataFrame,
         "<div style='font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#0F1F33'>",
         "<p>Hi,</p><p>Below pick details for the OutBound order(s):</p>",
     ]
+    if part_ids:
+        _note = (f"PARTIAL PICK — {', '.join(part_ids)}. "
+                 f"{_n(total)} of {_n(doc_total)} pcs are being picked; "
+                 f"{_n(owed)} pcs are still owed and will follow when the stock "
+                 "arrives.")
+        lines += [_note, ""]
+        html.append(
+            "<p style='background:#FFF6E6;border:1px solid #E0A100;border-radius:6px;"
+            f"padding:10px 12px;margin:8px 0'><b>{_note}</b></p>")
 
     for d in docs_info:
         lid = d.get("LOAD_ID", "")
+        prev = float(d.get("PREV_QTY", 0) or 0)
+        short = float(d.get("SHORT_QTY", 0) or 0)
+        picked = _picked_of(d)
         lines += [
-            f"LOAD ID       : {lid}",
+            f"LOAD ID       : {lid}"
+            + ("   [PARTIAL]" if _is_partial(d) else ""),
             f"Document      : {d.get('DOC_TYPE','')} {d.get('DOC_NUMBER','')}"
             f"  ({d.get('DOC_DATE','')})",
             f"Plant         : {d.get('PLANT','')}",
-            f"Lines / Qty   : {d.get('LINES','')} lines · {_n(d.get('TOTAL_QTY'))} pcs",
+            f"Document qty  : {_n(d.get('TOTAL_QTY'))} pcs over "
+            f"{_plural(d.get('LINES'), 'line')}",
+            f"Picking now   : {_n(picked)} pcs",
+        ]
+        if prev:
+            lines.append(f"Already sent  : {_n(prev)} pcs (earlier pick)")
+        if short:
+            lines.append(f"Still owed    : {_n(short)} pcs")
+        lines += [
             f"Pallets       : {d.get('PALLETS','')}",
             f"Qty check     : {d.get('VERIFY','')}",
         ]
         if str(d.get("RELEASED", "")).strip():
             lines.append(f"Released      : taken from pick task {d.get('RELEASED')}")
         lines.append("")
+        _bd = "border:1px solid #B9C6D6"
         html.append(
             "<table cellpadding='5' cellspacing='0' style='border-collapse:collapse;"
-            "border:1px solid #B9C6D6;margin-bottom:8px;font-size:12.5px'>"
-            f"<tr><td style='background:#0F1F33;color:#fff' colspan='2'><b>LOAD ID {lid}</b></td></tr>"
-            f"<tr><td style='border:1px solid #B9C6D6'>Document</td>"
-            f"<td style='border:1px solid #B9C6D6'>{d.get('DOC_TYPE','')} "
+            f"{_bd};margin-bottom:8px;font-size:12.5px'>"
+            f"<tr><td style='background:#0F1F33;color:#fff' colspan='2'><b>LOAD ID {lid}"
+            + ("  ·  PARTIAL" if _is_partial(d) else "")
+            + "</b></td></tr>"
+            f"<tr><td style='{_bd}'>Document</td>"
+            f"<td style='{_bd}'>{d.get('DOC_TYPE','')} "
             f"{d.get('DOC_NUMBER','')} ({d.get('DOC_DATE','')})</td></tr>"
-            f"<tr><td style='border:1px solid #B9C6D6'>Plant</td>"
-            f"<td style='border:1px solid #B9C6D6'>{d.get('PLANT','')}</td></tr>"
-            f"<tr><td style='border:1px solid #B9C6D6'>Lines / Qty</td>"
-            f"<td style='border:1px solid #B9C6D6'>{d.get('LINES','')} lines · "
-            f"{_n(d.get('TOTAL_QTY'))} pcs</td></tr>"
-            f"<tr><td style='border:1px solid #B9C6D6'>Pallets</td>"
-            f"<td style='border:1px solid #B9C6D6'>{d.get('PALLETS','')}</td></tr>"
-            f"<tr><td style='border:1px solid #B9C6D6'>Qty check</td>"
-            f"<td style='border:1px solid #B9C6D6'>{d.get('VERIFY','')}</td></tr>"
-            + (f"<tr><td style='border:1px solid #B9C6D6;background:#FFF3F5'>"
-               f"<b>Released</b></td><td style='border:1px solid #B9C6D6;"
+            f"<tr><td style='{_bd}'>Plant</td>"
+            f"<td style='{_bd}'>{d.get('PLANT','')}</td></tr>"
+            f"<tr><td style='{_bd}'>Document qty</td>"
+            f"<td style='{_bd}'>{_n(d.get('TOTAL_QTY'))} pcs over "
+            f"{_plural(d.get('LINES'), 'line')}</td></tr>"
+            f"<tr><td style='{_bd}'><b>Picking now</b></td>"
+            f"<td style='{_bd}'><b>{_n(picked)} pcs</b></td></tr>"
+            + (f"<tr><td style='{_bd}'>Already sent</td>"
+               f"<td style='{_bd}'>{_n(prev)} pcs (earlier pick)</td></tr>"
+               if prev else "")
+            + (f"<tr><td style='{_bd};background:#FFF6E6'><b>Still owed</b></td>"
+               f"<td style='{_bd};background:#FFF6E6'><b>{_n(short)} pcs</b></td></tr>"
+               if short else "")
+            + f"<tr><td style='{_bd}'>Pallets</td>"
+            f"<td style='{_bd}'>{d.get('PALLETS','')}</td></tr>"
+            f"<tr><td style='{_bd}'>Qty check</td>"
+            f"<td style='{_bd}'>{d.get('VERIFY','')}</td></tr>"
+            + (f"<tr><td style='{_bd};background:#FFF3F5'>"
+               f"<b>Released</b></td><td style='{_bd};"
                f"background:#FFF3F5'>from pick task {d.get('RELEASED','')}</td></tr>"
                if str(d.get("RELEASED", "")).strip() else "")
             + "</table>"
         )
+
+    # ---- line by line: what the document asked for, what is being picked ----
+    if verify is not None and len(verify):
+        v = verify[verify["LINE"].astype(str) != "TOTAL"]
+        if len(v):
+            lines += ["Line summary — document qty vs picked:"]
+            _vmulti = v["DOC_NUMBER"].astype(str).nunique() > 1
+            _vrows: list[list[str]] = []
+            html.append(
+                "<p style='margin:14px 0 4px'><b>Line summary — document qty vs "
+                "picked</b></p>"
+                "<table cellpadding='5' cellspacing='0' style='border-collapse:collapse;"
+                "border:1px solid #B9C6D6;font-size:12px'><tr style='background:#0F1F33;"
+                "color:#fff'><th>Doc</th><th>Ln</th><th>Item Code</th><th>Item Number</th>"
+                "<th>Doc Qty</th><th>Picked</th><th>Short</th></tr>")
+            for _, r in v.iterrows():
+                dq = float(r.get("DOC_QTY", 0) or 0)
+                pq = float(r.get("PICKED_QTY", 0) or 0)
+                sq = max(0.0, dq - pq)
+                _row = [str(r.get("LINE", "")), str(r.get("ITEM_CODE", "")),
+                        str(r.get("ITEM_NUMBER", "")), _n(dq), _n(pq), _n(sq)]
+                _vrows.append(([str(r.get("DOC_NUMBER", ""))] + _row) if _vmulti else _row)
+                _bg = ";background:#FFF6E6" if sq > 0 else ""
+                html.append(
+                    f"<tr><td style='border:1px solid #B9C6D6{_bg}'>{r.get('DOC_NUMBER','')}</td>"
+                    f"<td style='border:1px solid #B9C6D6{_bg}' align='center'>{r.get('LINE','')}</td>"
+                    f"<td style='border:1px solid #B9C6D6{_bg}'>{r.get('ITEM_CODE','')}</td>"
+                    f"<td style='border:1px solid #B9C6D6{_bg}'>{r.get('ITEM_NUMBER','')}</td>"
+                    f"<td style='border:1px solid #B9C6D6{_bg}' align='right'>{_n(dq)}</td>"
+                    f"<td style='border:1px solid #B9C6D6{_bg}' align='right'><b>{_n(pq)}</b></td>"
+                    f"<td style='border:1px solid #B9C6D6{_bg}' align='right'>"
+                    + (f"<b>{_n(sq)}</b>" if sq else "-") + "</td></tr>")
+            _vhead = ["Ln", "Item Code", "Item Number", "Doc Qty", "Picked", "Short"]
+            lines += (_ascii_table(["Document"] + _vhead, _vrows, right={4, 5, 6})
+                      if _vmulti else _ascii_table(_vhead, _vrows, right={3, 4, 5}))
+            lines.append("")
+            html.append("</table>")
 
     if alloc is not None and len(alloc):
         lines.append("Pick details:")
@@ -908,13 +1013,28 @@ def pick_email_text(docs_info: list[dict[str, Any]], alloc: pd.DataFrame,
                   else _ascii_table(_head, _rows, right={0, 4, 5}))
         html.append("</table>")
 
-    lines += ["", f"Total picked qty: {_n(total)}", "",
-              signature or "Thanks & regards,", ""]
+    # The old footer summed the *document* quantity and called it "picked" —
+    # true only when nothing is short, and badly wrong on a partial pick.
+    _foot = [f"Total document qty: {_n(doc_total)}",
+             f"Total picked qty  : {_n(total)}"]
+    if prev_total:
+        _foot.append(f"Already sent      : {_n(prev_total)} (earlier pick)")
+        _foot.append(f"Delivered in all  : {_n(prev_total + total)}")
+    if owed:
+        _foot.append(f"Still owed        : {_n(owed)}")
+    lines += [""] + _foot + ["", signature or "Thanks & regards,", ""]
     html.append("<p style='margin:14px 0 4px'><b>Item details</b></p>"
                 f"<img src='cid:{CID_CHART}' alt='Pick details by line' "
                 "style='max-width:660px;width:100%;border:1px solid #B9C6D6;"
                 "border-radius:6px'/>")
-    html.append(f"<p><b>Total picked qty: {_n(total)}</b></p>"
+    html.append(f"<p>Total document qty: {_n(doc_total)}<br>"
+                f"<b>Total picked qty: {_n(total)}</b>"
+                + (f"<br>Already sent: {_n(prev_total)} (earlier pick)"
+                   f"<br>Delivered in all: <b>{_n(prev_total + total)}</b>"
+                   if prev_total else "")
+                + (f"<br><b style='color:#A8620A'>Still owed: {_n(owed)}</b>"
+                   if owed else "")
+                + "</p>"
                 f"<p>{(signature or 'Thanks &amp; regards,')}</p></div>")
     return subject, "\n".join(lines), "".join(html)
 
