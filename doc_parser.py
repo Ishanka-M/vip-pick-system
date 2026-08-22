@@ -21,7 +21,7 @@ import pdfplumber
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 7
+API = 8
 
 # --------------------------------------------------------------------------- #
 # Item-code helpers
@@ -688,13 +688,20 @@ def frame_to_docs(df: pd.DataFrame, originals: list[ParsedDoc] | None = None) ->
                 doc_date=str(r.get("Doc Date", "") or ""),
                 ref_number=src.ref_number if src else "",
                 delivery_number=src.delivery_number if src else "",
+                # the customer and its contact only ever came off the PDF —
+                # losing them here emptied the register and the MRP flag
+                customer=src.customer if src else "",
+                customer_code=src.customer_code if src else "",
+                contact_person=src.contact_person if src else "",
+                contact_email=src.contact_email if src else "",
                 source_file=str(r.get("Source File", "") or ""),
                 declared_qty=src.declared_qty if src else None,
                 declared_amount=None,       # manual edit -> amount check skip
+                total_incl_tax=src.total_incl_tax if src else None,
             )
-        item = clean_item(r.get("Item Code"))
+        item = tidy_item(r.get("Item Code"))
         qty = _num(r.get("Qty")) or 0.0
-        if not item:
+        if not clean_item(item):
             continue
         out[num].lines.append(
             DocLine(
@@ -715,3 +722,64 @@ def frame_to_docs(df: pd.DataFrame, originals: list[ParsedDoc] | None = None) ->
         for i, ln in enumerate(d.lines, start=1):
             ln.line_no = i
     return docs
+
+
+# --------------------------------------------------------------------------- #
+# Manual entry — a pick with no PDF in hand
+# --------------------------------------------------------------------------- #
+MANUAL_SOURCE = "manual entry"
+MANUAL_COLS = ["Item Code", "Description", "Qty", "Doc UOM"]
+
+
+def manual_frame(rows: int = 6) -> pd.DataFrame:
+    """An empty line grid to type into — same columns the review table uses."""
+    return pd.DataFrame([{"Item Code": "", "Description": "", "Qty": None,
+                          "Doc UOM": "EA"} for _ in range(max(1, rows))],
+                        columns=MANUAL_COLS)
+
+
+def manual_doc(doc_number: Any, lines: pd.DataFrame, doc_type: str = "INVOICE",
+               doc_date: str = "", customer: str = "", ref_number: str = "",
+               customer_code: str = "", contact_person: str = "",
+               contact_email: str = "", source_file: str = "") -> ParsedDoc:
+    """
+    Typed-in invoice number + item codes + quantities -> a document the rest of
+    the pipeline cannot tell apart from a parsed PDF.
+
+    The PDF is not always in hand when the pick has to go out. Everything the
+    engine needs is here — number, date, lines, quantities — so the manual
+    document goes through exactly the same stock check, WMS output, pick sheet,
+    ledger and register as any other. The totals a PDF declares (`Total
+    Quantity`, `Total Amount`) are deliberately left unset: there is no
+    document to cross-check against, so the verify step compares the pick to
+    what was typed rather than to a number nobody can confirm.
+    """
+    doc = ParsedDoc(
+        doc_type=str(doc_type or "INVOICE").strip().upper() or "INVOICE",
+        doc_number=str(doc_number or "").strip(),
+        doc_date=str(doc_date or "").strip(),
+        ref_number=str(ref_number or "").strip(),
+        customer=str(customer or "").strip(),
+        customer_code=str(customer_code or "").strip(),
+        contact_person=str(contact_person or "").strip(),
+        contact_email=str(contact_email or "").strip(),
+        source_file=str(source_file or "").strip() or MANUAL_SOURCE,
+        notes=["Entered by hand — no PDF"],
+    )
+    if lines is None or not len(lines):
+        return doc
+    for _, r in lines.iterrows():
+        if "Use" in r.index and not bool(r.get("Use", True)):
+            continue
+        item = tidy_item(r.get("Item Code"))
+        qty = _num(r.get("Qty")) or 0.0
+        if not clean_item(item) or qty <= 0:
+            continue                      # a blank grid row is not a line
+        doc.lines.append(DocLine(
+            line_no=len(doc.lines) + 1,
+            item_code=item,
+            description=str(r.get("Description", "") or "").strip(),
+            qty=float(qty),
+            uom=str(r.get("Doc UOM", "") or "EA").strip() or "EA",
+        ))
+    return doc

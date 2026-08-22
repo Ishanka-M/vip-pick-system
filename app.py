@@ -40,7 +40,7 @@ st.set_page_config(
 # catch the opposite — an old app.py deployed beside new modules — which looks
 # like nothing happened at all: the new screen simply is not there. So publish
 # the build plainly enough to check in one glance after a deploy.
-BUILD = "2026-08-21 · partial pick"
+BUILD = "2026-08-22 · manual pick + period filter"
 
 # gsheet is imported lazily everywhere else, but it has to be checked with the
 # rest or a deploy that forgot it fails silently and reads like a logic bug.
@@ -53,9 +53,9 @@ _GS_API = getattr(_gs_mod, "API", 0)
 # Every file in the release, in one list. Checking them together matters:
 # reporting them one at a time sends the user round the loop again for the
 # next file, and the answer is always the same — replace the whole set.
-_NEEDS = {"pick_engine.py": (E, 6), "doc_parser.py": (P, 7), "pick_pdf.py": (PP, 5),
+_NEEDS = {"pick_engine.py": (E, 6), "doc_parser.py": (P, 8), "pick_pdf.py": (PP, 5),
           "sku_master.py": (SKU, 3), "ui.py": (ui, 3),
-          "invoice_register.py": (R, 16),
+          "invoice_register.py": (R, 17),
           "gsheet.py": (_gs_mod, 12)}
 _ALL = [(f, getattr(m, "API", 0), n) for f, (m, n) in _NEEDS.items() if m is not None]
 _STALE = [(f, have, need) for f, have, need in _ALL if have < need]
@@ -247,6 +247,53 @@ def _register_frames():
     return clean["summary"], clean["details"]
 
 
+def _date_filter_ui(prefix: str, frame: pd.DataFrame,
+                    with_types: bool = True) -> dict[str, object]:
+    """
+    One date filter, used by the Dashboard and the Register alike.
+
+    Today is one click, because that is the question asked most often; the rest
+    of the presets cover the usual ones; `Custom range` opens two date boxes;
+    `All time` is the whole register. Which date it reads is a choice too — the
+    invoice date and the day the warehouse actually picked are different
+    questions and both get asked.
+    """
+    st.segmented_control(
+        "Period", R.DATE_PRESETS, key=f"{prefix}_preset", default="All time",
+        label_visibility="collapsed")
+    preset = st.session_state.get(f"{prefix}_preset") or "All time"
+
+    c1, c2, c3 = st.columns([1.1, 1.4, 1.5])
+    basis = c1.selectbox("Date to use", list(R.DATE_BASES), key=f"{prefix}_basis")
+    col = R.DATE_BASES[basis]
+
+    if preset == "Custom range":
+        dates = R.parse_dates(frame[col] if col in frame.columns
+                              else frame["TAX_INVOICE_DATE"]).dropna()
+        lo = dates.min().date() if len(dates) else datetime.now().date()
+        hi = dates.max().date() if len(dates) else datetime.now().date()
+        r1, r2 = c2.columns(2)
+        d_from = r1.date_input("From", value=lo, key=f"{prefix}_from")
+        d_to = r2.date_input("To", value=hi, key=f"{prefix}_to")
+    else:
+        d_from, d_to = R.date_preset(preset)
+        c2.write("")
+        c2.caption(f"**{preset}** · " + ("the whole register" if d_from is None else
+                   (f"{d_from:%d %b %Y}" if d_from == d_to
+                    else f"{d_from:%d %b %Y} → {d_to:%d %b %Y}")))
+
+    types = (c3.multiselect("Document type",
+                            sorted(frame["DOC_TYPE"].astype(str).unique()),
+                            key=f"{prefix}_types")
+             if with_types and "DOC_TYPE" in frame.columns else [])
+
+    if col not in R.KEEP_UNDATED and d_from is not None:
+        st.caption(f"Reading **{basis}** — an invoice with no {basis.lower()} is "
+                   "outside this window, so it is not counted here.")
+    return {"from": d_from, "to": d_to, "col": col, "basis": basis,
+            "types": types or None, "preset": preset}
+
+
 def _dashboard_tab_body() -> None:
     ui.section("Pending vs picked", hint="how much is still to go")
     d_sum, d_det = _register_frames()
@@ -255,18 +302,15 @@ def _dashboard_tab_body() -> None:
         ui.empty("Nothing to show yet",
                  "Generate a pick and this fills up from the invoice register.", "📊")
     else:
-        with st.expander("Filter", expanded=False):
-            fa, fb, fc = st.columns(3)
-            dates = R.parse_dates(d_sum["TAX_INVOICE_DATE"]).dropna()
-            lo = dates.min().date() if len(dates) else datetime.now().date()
-            hi = dates.max().date() if len(dates) else datetime.now().date()
-            d_from = fa.date_input("Invoice date from", value=lo, key="dash_from")
-            d_to = fb.date_input("to", value=hi, key="dash_to")
-            d_types = fc.multiselect("Document type",
-                                     sorted(d_sum["DOC_TYPE"].astype(str).unique()),
-                                     key="dash_types")
-        dash = R.dashboard(d_sum, d_from, d_to, d_types or None)
+        flt = _date_filter_ui("dash", d_sum)
+        dash = R.dashboard(d_sum, flt["from"], flt["to"], flt["types"],
+                           date_col=flt["col"])
         k = dash["kpi"]
+        if not k["total"]:
+            ui.empty("Nothing in this period",
+                     f"No invoice matches **{flt['preset']}** on {flt['basis'].lower()}. "
+                     "Pick another period, or All time.", "🗓️")
+            return
         _nd = st.session_state.get("reg_dupes", 0) or dash.get("duplicates", 0)
         if _nd:
             st.caption(f"{_nd} duplicate row(s) left out — a duplicate is an invoice "
@@ -691,23 +735,44 @@ def _register_tab_body() -> None:
         ui.section("Backfill", hint="picked earlier, never registered")
         _backfill_ui()
     else:
-        _pk = reg_s["KORBER_PICK"].astype(str).str.strip().str.title()
+        # The register answers "what happened today" as often as "show me
+        # everything", so the same period filter the Dashboard uses sits here
+        # too — and reads the same way, so the two tabs never disagree.
+        #
+        # It filters the *view* only. `reg_s` / `reg_d` stay whole underneath,
+        # because Update status has to find an invoice by its number whatever
+        # period is on screen — a QR scanned at the packing bench must not miss
+        # because the register happens to be filtered to today.
+        rflt = _date_filter_ui("reg", reg_s)
+        view_s = R.filter_by_date(reg_s, rflt["from"], rflt["to"], rflt["col"])
+        if rflt["types"]:
+            view_s = view_s[view_s["DOC_TYPE"].astype(str).isin(rflt["types"])]
+        view_d = reg_d[reg_d["TAX_INVOICE_NO"].map(R._id_str)
+                       .isin({R._id_str(x) for x in view_s["TAX_INVOICE_NO"]})]
+        if not len(view_s):
+            st.info(f"No invoice matches **{rflt['preset']}** on "
+                    f"{rflt['basis'].lower()} — {len(reg_s)} invoices are on file "
+                    "altogether. Choose **All time** to see them.")
+
+        _pk = view_s["KORBER_PICK"].astype(str).str.strip().str.title()
         yes = int((_pk == R.PICK_YES).sum())
         part = int((_pk == R.PICK_PART).sum())
+        _n = len(view_s)
         ui.kpi_row([
-            {"label": "Invoices", "value": len(reg_s)},
+            {"label": "Invoices", "value": _n,
+             "hint": (None if _n == len(reg_s) else f"{len(reg_s)} on file altogether")},
             {"label": "Körber picked", "value": yes, "tone": "ok"},
             {"label": "Partial", "value": part, "tone": "warn"},
-            {"label": "Not picked", "value": int(len(reg_s) - yes - part), "tone": "warn"},
-            {"label": "MRP", "value": int((reg_s["MRP"].astype(str) == "Yes").sum())},
+            {"label": "Not picked", "value": int(_n - yes - part), "tone": "warn"},
+            {"label": "MRP", "value": int((view_s["MRP"].astype(str) == "Yes").sum())},
             {"label": "Picking done",
-             "value": int((reg_s["PICKING"].astype(str) == R.STATUS_DONE).sum()),
+             "value": int((view_s["PICKING"].astype(str) == R.STATUS_DONE).sum()),
              "tone": "info"},
             {"label": "Packing done",
-             "value": int((reg_s["PACKING"].astype(str) == R.STATUS_DONE).sum()),
+             "value": int((view_s["PACKING"].astype(str) == R.STATUS_DONE).sum()),
              "tone": "info"},
             {"label": "Dispatch done",
-             "value": int((reg_s["DISPATCH"].astype(str) == R.STATUS_DONE).sum()),
+             "value": int((view_s["DISPATCH"].astype(str) == R.STATUS_DONE).sum()),
              "tone": "ok"},
         ])
 
@@ -718,7 +783,7 @@ def _register_tab_body() -> None:
                             key="reg_k")
         fm = f3.multiselect("MRP", ["Yes", "No"], key="reg_m")
 
-        vs, vd = reg_s.copy(), reg_d.copy()
+        vs, vd = view_s.copy(), view_d.copy()
         if fk:
             vs = vs[vs["KORBER_PICK"].astype(str).isin(fk)]
         if fm:
@@ -1424,6 +1489,77 @@ with tab_gen:
             st.session_state.pop("result", None)
         docs = st.session_state.get("docs", [])
 
+    # ---------------- manual entry — no PDF in hand ---------------- #
+    with st.expander("No PDF? Enter the invoice by hand", expanded=not docs):
+        st.caption("The pick cannot wait for the PDF. Type the invoice number, "
+                   "the item codes and the quantities and it goes through exactly "
+                   "the same stock check, OutBound files, pick sheet, ledger and "
+                   "register as a parsed document.")
+        with st.form("manual_doc", clear_on_submit=False):
+            mc1, mc2, mc3 = st.columns([1.3, 1, 1])
+            m_num = mc1.text_input("Invoice / DC number *",
+                                   placeholder="e.g. 30426013174")
+            m_type = mc2.selectbox("Document type", ["INVOICE", "DELIVERY CHALLAN"])
+            m_date = mc3.date_input("Document date", value=datetime.now().date())
+            mc4, mc5 = st.columns([1.6, 1])
+            m_cust = mc4.text_input("Customer", placeholder="Ship-to name (optional)")
+            m_ref = mc5.text_input("AR / Order no", placeholder="optional")
+
+            st.caption("One row per line. **Item Code** takes the base ID or the "
+                       "full code — `P601560 710` and `P601560` both find the same "
+                       "stock. Blank rows are ignored.")
+            m_lines = st.data_editor(
+                P.manual_frame(6), num_rows="dynamic", width="stretch", height=260,
+                key="manual_lines",
+                column_config={
+                    "Item Code": st.column_config.TextColumn(
+                        "Item Code", help="Base ID or full Donaldson item code"),
+                    "Qty": st.column_config.NumberColumn("Qty", min_value=0, step=1),
+                    "Doc UOM": st.column_config.TextColumn("UOM", default="EA"),
+                })
+            add_manual = st.form_submit_button("Add this document", type="primary")
+
+        if add_manual:
+            _doc = P.manual_doc(m_num, m_lines, doc_type=m_type,
+                                doc_date=m_date.strftime("%d-%b-%Y").upper(),
+                                customer=m_cust, ref_number=m_ref)
+            _ok, _probs = _doc.completeness()
+            _have = {str(d.doc_number).strip() for d in st.session_state.get("docs", [])}
+            if not _doc.doc_number:
+                st.error("An invoice / DC number is needed — that is the LOAD ID the "
+                         "whole pick hangs off.")
+            elif _doc.doc_number in _have:
+                st.error(f"`{_doc.doc_number}` is already in this run. Remove it first, "
+                         "or use a different number.")
+            elif not _ok:
+                st.error("Not enough to pick with — " + " · ".join(_probs))
+            else:
+                _all = list(st.session_state.get("docs", [])) + [_doc]
+                st.session_state["docs"] = _all
+                st.session_state["doc_frame"] = P.docs_to_frame(_all)
+                st.session_state.pop("result", None)
+                st.success(f"Added `{_doc.doc_number}` — {len(_doc.lines)} lines · "
+                           f"qty {sum(l.qty for l in _doc.lines):g}. It is in the run "
+                           "below; generate the pick as usual.")
+                st.rerun()
+
+        # what the typed codes will actually match, before anything is picked
+        _peek = P.manual_doc("PREVIEW", st.session_state.get("manual_lines")
+                             if isinstance(st.session_state.get("manual_lines"),
+                                           pd.DataFrame) else pd.DataFrame())
+        if len(_peek.lines) and st.session_state.get("inv_raw") is not None:
+            _stock, _ = _inv_norm(st.session_state["inv_raw"])
+            _free = _stock[_stock["pick_free"]].groupby("base_id")["free_qty"].sum()
+            st.caption("What the typed codes match in the inventory report — free "
+                       "stock only, before any pick. This is a look, not a "
+                       "reservation.")
+            st.dataframe(pd.DataFrame([{
+                "Item Code": ln.item_code, "Base ID": ln.base, "Qty": ln.qty,
+                "In stock (free)": float(_free.get(ln.base, 0.0)),
+                "": "✅" if float(_free.get(ln.base, 0.0)) >= ln.qty else "⚠️ short",
+            } for ln in _peek.lines]), hide_index=True, width="stretch")
+
+    docs = st.session_state.get("docs", [])
     if docs:
         n_ok = sum(1 for d in docs if d.completeness()[0])
         ui.section("Documents read", "02",

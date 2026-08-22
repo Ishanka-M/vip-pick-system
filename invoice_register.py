@@ -15,7 +15,7 @@ from __future__ import annotations
 import io
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import pandas as pd
@@ -24,7 +24,7 @@ from doc_parser import ParsedDoc, base_item, clean_item
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 16
+API = 17
 
 # Warehouse execution status — independent of KORBER_PICK (this app's own pallet
 # allocation). These three track the physical pick / pack / dispatch, driven by
@@ -1269,6 +1269,70 @@ def parse_date(v: Any) -> Any:
     return parse_dates(pd.Series([v])).iloc[0]
 
 
+# --------------------------------------------------------------------------- #
+# Date filtering — "today", "this week", a range, or everything
+# --------------------------------------------------------------------------- #
+# Which date the question is about. They answer different questions and the
+# right one depends on what is being asked:
+#   Invoice date  — "what has the customer been invoiced for in this period"
+#   Picked date   — "what did the warehouse actually pick today"
+#   Last updated  — "what moved at all today" (a scan, a status report, a pick)
+DATE_BASES = {"Invoice date": "TAX_INVOICE_DATE",
+              "Picked date": "PICKED_AT",
+              "Last updated": "UPDATED_AT"}
+
+# A blank invoice date must not hide a row — the date simply could not be read
+# off the document, and the invoice is still outstanding work. A blank picked /
+# updated date is different: it means the thing being asked about never
+# happened, so the row genuinely falls outside the window.
+KEEP_UNDATED = {"TAX_INVOICE_DATE"}
+
+DATE_PRESETS = ["Today", "Yesterday", "Last 7 days", "Last 30 days",
+                "This month", "All time", "Custom range"]
+
+
+def date_preset(name: str, today: Any = None) -> tuple[Any, Any]:
+    """A preset name -> (from, to) as dates. `All time` is (None, None)."""
+    t = pd.Timestamp(today).date() if today is not None else datetime.now().date()
+    if name == "Today":
+        return t, t
+    if name == "Yesterday":
+        y = t - timedelta(days=1)
+        return y, y
+    if name == "Last 7 days":
+        return t - timedelta(days=6), t
+    if name == "Last 30 days":
+        return t - timedelta(days=29), t
+    if name == "This month":
+        return t.replace(day=1), t
+    return None, None                       # All time / Custom range
+
+
+def filter_by_date(df: pd.DataFrame, date_from: Any = None, date_to: Any = None,
+                   column: str = "TAX_INVOICE_DATE") -> pd.DataFrame:
+    """
+    Rows inside a date window, read off `column`.
+
+    The same rule drives the Dashboard and the Register, so a range that says
+    "42 invoices" on one tab says 42 on the other.
+    """
+    if df is None or not len(df) or (date_from is None and date_to is None):
+        return df
+    col = column if column in df.columns else "TAX_INVOICE_DATE"
+    if col not in df.columns:
+        return df
+    d = parse_dates(df[col])
+    keep = pd.Series(True, index=df.index)
+    if date_from is not None:
+        keep &= d >= pd.Timestamp(date_from)
+    if date_to is not None:
+        # to the end of that day, or a same-day range would match nothing
+        keep &= d <= pd.Timestamp(date_to) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+    if col in KEEP_UNDATED:
+        keep |= d.isna()
+    return df[keep]
+
+
 def classify(remark: Any) -> str:
     t = str(remark or "").lower()
     if not t.strip():
@@ -1280,7 +1344,8 @@ def classify(remark: Any) -> str:
 
 
 def dashboard(summary: pd.DataFrame, date_from: Any = None, date_to: Any = None,
-              doc_types: list[str] | None = None) -> dict[str, Any]:
+              doc_types: list[str] | None = None,
+              date_col: str = "TAX_INVOICE_DATE") -> dict[str, Any]:
     """
     Everything the Pending vs picked view needs, in one pass.
 
@@ -1309,10 +1374,7 @@ def dashboard(summary: pd.DataFrame, date_from: Any = None, date_to: Any = None,
 
     if doc_types:
         d = d[d["DOC_TYPE"].astype(str).isin(doc_types)]
-    if date_from is not None:
-        d = d[d["_DATE"].isna() | (d["_DATE"] >= pd.Timestamp(date_from))]
-    if date_to is not None:
-        d = d[d["_DATE"].isna() | (d["_DATE"] <= pd.Timestamp(date_to))]
+    d = filter_by_date(d, date_from, date_to, date_col)
     # Legacy rows written before duplicates were excluded — out of every number.
     dup = is_duplicate_row(d)
     n_dup = int(dup.sum())

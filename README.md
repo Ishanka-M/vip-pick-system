@@ -1372,3 +1372,153 @@ engine 6 · parser 7 · register 16 · sheet 12 · pdf 5 · sku 3 · ui 3
 
 දැන් ඔක්කොම **එකම ලයිස්තුවේ**, එක screen එකකින් සම්පූර්ණ පිළිතුර
 එනවා — up-to-date ඒවත් ✅ දාලා පෙන්නනවා.
+
+---
+
+## 37. PDF නැතුව pick එකක් — manual entry
+
+PDF එක අතේ නැති වෙලාවට Invoice No + Item Code + Qty type කරලා pick එකක්
+හදාගන්න පුළුවන්.
+
+### කරන විදිහ
+
+**Pick tab → "No PDF? Enter the invoice by hand"** expander එක.
+
+| Field | |
+|---|---|
+| Invoice / DC number ★ | LOAD ID එක මේකයි — QR එකට යන්නෙත් මේකමයි |
+| Document type | INVOICE / DELIVERY CHALLAN |
+| Document date | Default අද |
+| Customer | Optional (register එකට යනවා) |
+| AR / Order no | Optional |
+
+ඊට යටින් line grid එක:
+
+| Item Code | Description | Qty | UOM |
+|---|---|---|---|
+| P601560 710 | — | 10 | EA |
+| 1C072323 | — | 4 | EA |
+
+* **Item Code** එකට **base ID එක හරි සම්පූර්ණ code එක හරි** දෙන්න
+  පුළුවන් — `P601560 710` සහ `P601560` දෙකම එකම stock එක හොයනවා.
+* හිස් row ගණන් ගන්නේ නෑ (grid එකට row ඕන තරම් add කරන්න පුළුවන්).
+* Inventory report එක upload කරලා තියෙනවා නම් **type කරන ගමන්ම** මොකක්ද
+  match වෙන්නේ කියලා පේනවා:
+
+  | Item Code | Base ID | Qty | In stock (free) | |
+  |---|---|---|---|---|
+  | P601560 710 | P601560 | 10 | 48 | ✅ |
+  | 1C072323 | 1C072323 | 4 | 2 | ⚠️ short |
+
+  මේක **බැලීමක් විතරයි** — reservation එකක් නෙවෙයි.
+
+**Add this document** ඔබන්න → document එක run එකට එකතු වෙනවා. ඊට පස්සේ
+**සාමාන්‍ය විදිහටම** Generate pick කරන්න.
+
+### මොකද වෙන්නේ
+
+Manual document එකයි PDF එකෙන් ආපු එකයි **පසුව එකම විදිහට හැසිරෙනවා** —
+වෙනම code path එකක් නෑ:
+
+* එකම stock check (base ID match, pallet ledger, Pick Id gate)
+* එකම OutBound MASTER / Detail file
+* එකම Pick Sheet PDF (QR එක්ක)
+* `PALLET_LEDGER` · `DOC_REGISTRY` · `INVOICE_SUMMARY` · `INVOICE_DETAIL`
+* Stock short නම් **partial pick** එකත් offer වෙනවා (§35)
+* Packing / Dispatch QR scan එකත් වැඩ කරනවා
+
+`SOURCE_FILE` එකට `manual entry` කියලා යනවා, ඒ නිසා register එකේ මොනවද
+type කරලා ආපු ඒවා කියලා පැහැදිලියි.
+
+### Qty verify එක
+
+PDF එකක `Total Quantity` / `Total Amount` කියලා **cross-check කරන්න
+number** තියෙනවා. Manual entry එකකට එහෙම දෙයක් නෑ — ඒ නිසා ඒ check දෙක
+**deliberately skip** කරනවා. Verify කරන්නේ **type කරපු ප්‍රමාණයට** pick
+එක ගැලපෙනවද කියලා (line · document total · WMS file total).
+
+### පරිස්සම් වෙන්න
+
+Manual entry කියන්නේ **document එකක් නෙවෙයි, document එකක් ගැන කියන
+කතාවක්**. Type කරන අංකය වැරදුනොත් system එකට ඒක දැනගන්න ක්‍රමයක් නෑ.
+Invoice number එක `DOC_REGISTRY` එකේ දැනටමත් තියෙනවා නම් duplicate gate
+එකෙන් නවත්තනවා, ඒත් **qty එකක් වැරදියට type කරොත් ඒක pick වෙනවා**.
+
+---
+
+## 38. Period filter — අද / date range / full data
+
+**Dashboard (Pending vs picked)** එකේ සහ **Invoice register** එකේ දෙකේම
+එකම filter එක තියෙනවා, එකම විදිහට වැඩ කරනවා — ඒ නිසා tab දෙකේ අංක
+කවදාවත් වෙනස් වෙන්නේ නෑ.
+
+```
+[ Today ] [ Yesterday ] [ Last 7 days ] [ Last 30 days ] [ This month ] [ All time ] [ Custom range ]
+
+Date to use: [ Invoice date ▾ ]      Today · 22 Aug 2026      Document type: [ ▾ ]
+```
+
+* **Today** — එක click එකක්. වැඩිපුරම අහන ප්‍රශ්නය ඒක නිසා.
+* **Custom range** — From / To date box දෙකක් එනවා.
+* **All time** — මුළු register එකම (default එක).
+
+### "මොන date එකද" කියන එකත් තෝරන්න පුළුවන්
+
+මේ තුන **වෙනස් ප්‍රශ්න තුනක්**:
+
+| Date to use | අහන්නේ |
+|---|---|
+| **Invoice date** | "මේ කාලේට customer එකාට invoice කරලා තියෙන්නේ මොනවද" |
+| **Picked date** | "අද warehouse එකෙන් ඇත්තටම pick කරේ මොනවද" |
+| **Last updated** | "අද මොකක් හරි වුණේ මොනවටද" (scan, status report, pick) |
+
+### හිස් date එකකට මොකද වෙන්නේ
+
+| Column | හිස් නම් |
+|---|---|
+| Invoice date | **තියාගන්නවා** — date එක PDF එකෙන් කියවගන්න බැරි වුණා කියලා ඒ invoice එකේ වැඩේ ඉවර වෙන්නේ නෑ |
+| Picked date / Last updated | **අයින් කරනවා** — ඒ දේ **වුණේම නෑ**, ඒ නිසා ඒක මේ කාලෙන් පිටත |
+
+මේක screen එකේ caption එකකින් කියනවා, ඒ නිසා අංකයක් අඩුවෙන් පේනවනම්
+ඇයි කියලා පැහැදිලියි.
+
+### Download ඔක්කොම filter එකට යටත්
+
+Dashboard එකේ **Summary / Details / Pending (Excel) · Pending (CSV)**
+හතරම **screen එකේ තියෙන filter එකටම** අදාළව එනවා — යටින් තියෙන caption
+එකේ `42 invoices · 118 lines · 9 pending` කියලා තහවුරු කරලා තියෙනවා.
+
+### Register එකේ — filter වෙන්නේ **view එක විතරයි**
+
+Register tab එකේ filter එක Summary / Details table වලට සහ KPI වලට
+විතරයි බලපාන්නේ. **Update status** තාමත් **මුළු register එකම** බලනවා.
+
+ඇයි: Packing bench එකේ QR එකක් scan කරද්දී screen එක "Today" කියලා
+filter වෙලා තිබ්බොත්, ඊයේ invoice එකක් scan කරාම "not found" කියලා
+එන්න බෑ. ඒ නිසා scan එක filter එකට යටත් නෑ.
+
+KPI row එකේ "Invoices" එකට යටින් `138 on file altogether` කියලා පේනවා
+— filter එකෙන් කීයක් අයින් වුණාද කියලා දැනගන්න.
+
+### Test
+
+```bash
+python test_dataflow.py     # 43 tests
+```
+
+Manual entry එකට 4ක්, period filter එකට 4ක් — preset වල date ගණන්,
+"Today" tab දෙකේම එකම දේ කියනවද, හිස් date rule එක, summary/details
+එකට යනවද කියලා. App එකේ **preset 7 × date basis 3 = 21ම** tab දෙකේම
+render කරලා verify කරලා තියෙනවා.
+
+| Module | දැන් API |
+|---|---|
+| `doc_parser.py` | 8 |
+| `pick_engine.py` | 6 |
+| `invoice_register.py` | 17 |
+| `gsheet.py` | 12 |
+| `pick_pdf.py` | 5 |
+| `sku_master.py` | 3 |
+| `ui.py` | 3 |
+
+BUILD: `2026-08-22 · manual pick + period filter`

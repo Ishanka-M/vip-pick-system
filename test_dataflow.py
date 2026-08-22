@@ -12,6 +12,8 @@ Run:  python test_dataflow.py     (or)  python -m pytest test_dataflow.py
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 import pandas as pd
 
 import gsheet as G
@@ -521,6 +523,163 @@ def test_the_pick_sheet_says_it_is_partial():
     pdf = PP.build_pick_sheet(b["info"], b["allocations"], b["verify"])
     assert pdf[:4] == b"%PDF"
     assert len(pdf) > 1000
+
+
+
+# --------------------------------------------------------------------------- #
+# manual entry — a pick with no PDF in hand
+# --------------------------------------------------------------------------- #
+def _typed(rows):
+    return pd.DataFrame(rows, columns=["Item Code", "Description", "Qty", "Doc UOM"])
+
+
+def test_a_typed_document_is_a_document():
+    from doc_parser import manual_doc, manual_frame
+    d = manual_doc("30426013174",
+                   _typed([{"Item Code": "P601560 710", "Description": "filter",
+                            "Qty": 10, "Doc UOM": "EA"},
+                           {"Item Code": "", "Description": "", "Qty": None,
+                            "Doc UOM": "EA"},          # blank grid row
+                           {"Item Code": "1c072323-inl", "Description": "",
+                            "Qty": 4, "Doc UOM": ""}]),
+                   doc_date="21-AUG-2026", customer="ACME", ref_number="AR9")
+    ok, problems = d.completeness()
+    assert ok, problems
+    assert len(d.lines) == 2                       # the blank row is not a line
+    assert [ln.line_no for ln in d.lines] == [1, 2]
+    assert d.lines[0].item_code == "P601560 710"   # separators kept
+    assert d.lines[0].base == "P601560"
+    assert d.lines[1].base == "1C072323"
+    assert d.lines[1].uom == "EA"                  # blank UOM defaults
+    assert d.source_file == "manual entry"
+    assert d.declared_qty is None                  # nothing to cross-check against
+    # an empty grid is not a document
+    assert not manual_doc("X", manual_frame()).completeness()[0]
+
+
+def test_a_typed_document_picks_exactly_like_a_parsed_one():
+    from doc_parser import manual_doc
+    typed = manual_doc("30426013174",
+                       _typed([{"Item Code": "P601560", "Qty": 10, "Doc UOM": "EA",
+                                "Description": ""}]),
+                       doc_date="21-AUG-2026", customer="ACME")
+    parsed = _doc("30426013174", [("P601560 710", 10)])
+    a = PE.run_pick([typed], _inv(["P601560 710"], qty=50), PE.EngineConfig())
+    b = PE.run_pick([parsed], _inv(["P601560 710"], qty=50), PE.EngineConfig())
+    assert len(a["accepted"]) == len(b["accepted"]) == 1
+    assert a["accepted"].iloc[0]["PICKED_QTY"] == b["accepted"].iloc[0]["PICKED_QTY"]
+    assert list(a["detail"]["QTY"]) == list(b["detail"]["QTY"])
+    assert list(a["detail"]["DISPLAY_ITEM_NUMBER"]) == list(b["detail"]["DISPLAY_ITEM_NUMBER"])
+    # and it reaches the register the same way
+    s, d = R.build([typed], a, R.DEFAULT_MRP, user="t", plant="PL1")
+    assert s.iloc[0]["KORBER_PICK"] == R.PICK_YES
+    assert s.iloc[0]["TAX_INVOICE_NO"] == "30426013174"
+    assert float(s.iloc[0]["QTY"]) == 10.0
+    assert d.iloc[0]["BASE_ID"] == "P601560"
+
+
+def test_a_typed_document_is_short_checked_like_any_other():
+    from doc_parser import manual_doc
+    typed = manual_doc("I9", _typed([{"Item Code": "P601560", "Qty": 999,
+                                      "Doc UOM": "EA", "Description": ""}]))
+    res = PE.run_pick([typed], _inv(["P601560 710"], qty=50), PE.EngineConfig())
+    assert len(res["accepted"]) == 0
+    assert "STOCK SHORT" in res["rejected"].iloc[0]["REASON"]
+    assert len(PE.partialable(res)) == 1          # partial pick is offered
+
+
+def test_the_review_table_round_trips_a_typed_document():
+    from doc_parser import manual_doc, docs_to_frame, frame_to_docs
+    d = manual_doc("I1", _typed([{"Item Code": "X770132 003710", "Qty": 3,
+                                  "Doc UOM": "EA", "Description": "d"}]),
+                   customer="ACME", ref_number="AR1")
+    back = frame_to_docs(docs_to_frame([d]), [d])[0]
+    assert back.doc_number == "I1"
+    assert back.customer == "ACME" and back.ref_number == "AR1"   # not dropped
+    assert back.lines[0].item_code == "X770132 003710"            # separators kept
+    assert back.lines[0].base == "X770132"
+
+
+# --------------------------------------------------------------------------- #
+# period filter — today / a range / everything
+# --------------------------------------------------------------------------- #
+def _period_register():
+    """Invoices dated today, yesterday, 10 days ago, and one with no date."""
+    today = datetime.now().date()
+    rows = []
+    for tag, days, picked in (("TODAY", 0, True), ("YDAY", 1, True),
+                              ("OLD", 10, False)):
+        d = today - timedelta(days=days)
+        r = {c: "" for c in R.SUMMARY_COLS}
+        r.update({"TAX_INVOICE_NO": tag, "CUSTOMER_NAME": "ACME",
+                  "DOC_TYPE": "INVOICE", "QTY": 10, "LINES": 1, "MRP": "No",
+                  "TAX_INVOICE_DATE": d.strftime("%d-%b-%Y").upper(),
+                  "PICKED_AT": d.strftime("%Y-%m-%d 09:00:00") if picked else "",
+                  "UPDATED_AT": d.strftime("%Y-%m-%d 09:00:00"),
+                  "KORBER_PICK": R.PICK_YES if picked else R.PICK_NO,
+                  "PICKED_QTY": 10 if picked else 0})
+        for c in R.STATUS_COLS:
+            r[c] = R.STATUS_PENDING
+        rows.append(r)
+    blank = {c: "" for c in R.SUMMARY_COLS}
+    blank.update({"TAX_INVOICE_NO": "NODATE", "CUSTOMER_NAME": "ACME",
+                  "DOC_TYPE": "INVOICE", "QTY": 5, "LINES": 1, "MRP": "No",
+                  "KORBER_PICK": R.PICK_NO, "PICKED_QTY": 0})
+    for c in R.STATUS_COLS:
+        blank[c] = R.STATUS_PENDING
+    rows.append(blank)
+    return pd.DataFrame(rows, columns=R.SUMMARY_COLS)
+
+
+def test_the_presets_pick_the_right_days():
+    t = datetime(2026, 8, 21)
+    assert R.date_preset("Today", t) == (t.date(), t.date())
+    assert R.date_preset("Yesterday", t) == (datetime(2026, 8, 20).date(),) * 2
+    assert R.date_preset("Last 7 days", t) == (datetime(2026, 8, 15).date(), t.date())
+    assert R.date_preset("Last 30 days", t) == (datetime(2026, 7, 23).date(), t.date())
+    assert R.date_preset("This month", t) == (datetime(2026, 8, 1).date(), t.date())
+    assert R.date_preset("All time", t) == (None, None)
+    assert R.date_preset("Custom range", t) == (None, None)
+
+
+def test_today_means_today_on_both_tabs():
+    s = _period_register()
+    f, t = R.date_preset("Today")
+    # invoice date: today's invoice, plus the one whose date could not be read —
+    # a missing invoice date must not hide outstanding work
+    by_inv = R.filter_by_date(s, f, t, "TAX_INVOICE_DATE")
+    assert set(by_inv["TAX_INVOICE_NO"]) == {"TODAY", "NODATE"}
+    # picked date: only what was actually picked today
+    by_pick = R.filter_by_date(s, f, t, "PICKED_AT")
+    assert set(by_pick["TAX_INVOICE_NO"]) == {"TODAY"}
+    # the dashboard reads the same rule, so the two tabs agree
+    assert R.dashboard(s, f, t, None, date_col="TAX_INVOICE_DATE")["kpi"]["total"] == 2
+    assert R.dashboard(s, f, t, None, date_col="PICKED_AT")["kpi"]["total"] == 1
+
+
+def test_a_range_and_the_full_register():
+    s = _period_register()
+    f, t = R.date_preset("Last 7 days")
+    assert set(R.filter_by_date(s, f, t, "TAX_INVOICE_DATE")["TAX_INVOICE_NO"]) == {
+        "TODAY", "YDAY", "NODATE"}
+    # All time is every row, undated included
+    assert len(R.filter_by_date(s, None, None, "TAX_INVOICE_DATE")) == len(s)
+    assert R.dashboard(s)["kpi"]["total"] == len(s)
+    # a custom single day is inclusive of that whole day
+    y = (datetime.now().date() - timedelta(days=1))
+    assert set(R.filter_by_date(s, y, y, "PICKED_AT")["TAX_INVOICE_NO"]) == {"YDAY"}
+
+
+def test_the_period_filter_keeps_the_summary_and_the_details_in_step():
+    s = _period_register()
+    f, t = R.date_preset("Today")
+    dash = R.dashboard(s, f, t, None, date_col="TAX_INVOICE_DATE")
+    det = pd.DataFrame([{**{c: "" for c in R.DETAIL_COLS},
+                         "TAX_INVOICE_NO": n, "LINE": 1, "DOC_QTY": 10}
+                        for n in ("TODAY", "YDAY", "OLD", "NODATE")],
+                       columns=R.DETAIL_COLS)
+    kept = R.details_for(det, dash["invoices"])
+    assert set(kept["TAX_INVOICE_NO"]) == {"TODAY", "NODATE"}
 
 
 if __name__ == "__main__":
