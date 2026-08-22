@@ -40,7 +40,7 @@ st.set_page_config(
 # catch the opposite — an old app.py deployed beside new modules — which looks
 # like nothing happened at all: the new screen simply is not there. So publish
 # the build plainly enough to check in one glance after a deploy.
-BUILD = "2026-08-22 · manual pick + period filter"
+BUILD = "2026-08-22b · partial offer fix"
 
 # gsheet is imported lazily everywhere else, but it has to be checked with the
 # rest or a deploy that forgot it fails silently and reads like a logic bug.
@@ -53,7 +53,7 @@ _GS_API = getattr(_gs_mod, "API", 0)
 # Every file in the release, in one list. Checking them together matters:
 # reporting them one at a time sends the user round the loop again for the
 # next file, and the answer is always the same — replace the whole set.
-_NEEDS = {"pick_engine.py": (E, 6), "doc_parser.py": (P, 8), "pick_pdf.py": (PP, 5),
+_NEEDS = {"pick_engine.py": (E, 7), "doc_parser.py": (P, 8), "pick_pdf.py": (PP, 5),
           "sku_master.py": (SKU, 3), "ui.py": (ui, 3),
           "invoice_register.py": (R, 17),
           "gsheet.py": (_gs_mod, 12)}
@@ -1841,6 +1841,23 @@ with tab_gen:
         # Partial pick — send what is on the floor now
         # ------------------------------------------------------------------ #
         part = E.partialable(res)
+        dead = E.no_partial(res)
+        if len(dead) and not len(part):
+            st.divider()
+            ui.section("Send what we have",
+                       hint="nothing on the floor for these")
+            st.markdown(
+                ui.stamp("nothing to send", "stop") + " &nbsp;" +
+                ui.muted("A partial pick would put zero units on the truck for "
+                         "these documents, so there is nothing to confirm."),
+                unsafe_allow_html=True)
+            st.dataframe(dead, hide_index=True, width="stretch")
+            st.caption("`CAN_PICK_NOW` is 0 — every short line has no free stock in "
+                       "the confirmed plant. Worth checking before you write it off: "
+                       "the **plant** confirmed in step 03, the **status** filter in "
+                       "the sidebar (only `Available` counts by default), and whether "
+                       "the stock is sitting on another pick task — see **On a pick "
+                       "task** below.")
         if len(part):
             st.divider()
             ui.section("Send what we have",
@@ -1876,6 +1893,10 @@ with tab_gen:
             if not sure_p:
                 pc1.caption("The tick box is the confirmation — nothing goes out "
                             "short until it is on.")
+            if len(dead):
+                st.caption(f"{len(dead)} more short document(s) are not on this list "
+                           "because a partial pick would send nothing at all for "
+                           "them: " + ", ".join(dead["DOC_NUMBER"].astype(str)))
 
         if st.session_state.get("partial_docs"):
             done_p = ", ".join(st.session_state["partial_docs"])

@@ -1522,3 +1522,57 @@ render කරලා verify කරලා තියෙනවා.
 | `ui.py` | 3 |
 
 BUILD: `2026-08-22 · manual pick + period filter`
+
+---
+
+## 39. "Send what we have" එක නොපෙනෙන්නේ ඇයි
+
+Stock short වුණාට partial pick section එක නොපෙනුනොත් හේතු දෙකයි.
+
+### 1. ඒ document එකෙන් **යවන්න මොකුත්ම නෑ**
+
+Line එකේ `AVAILABLE` එක **0** නම් (screen එකේ `Item not in inventory /
+plant`), partial pick එකකින් trolley එකට යන්නේ **0**. ඒක partial pick
+එකක් නෙවෙයි — pick එකක්ම නෙවෙයි. ඒ නිසා confirm කරන්න දෙයක් නෑ.
+
+දැන් ඒක **හංගන්නේ නෑ**, පැහැදිලිව කියනවා:
+
+```
+⛔ nothing to send
+A partial pick would put zero units on the truck for these documents.
+
+DOC_NUMBER      LINES  SHORT_LINES  DOC_QTY  CAN_PICK_NOW  STILL_SHORT
+333262712447        1            1        3             0            3
+```
+
+**බලන්න ඕන තැන් තුනක්** (`CAN_PICK_NOW` 0 වුණාට කලින්):
+
+| | |
+|---|---|
+| **Plant** | Step 03 එකේ confirm කරපු plant එකේ නැත්නම් හම්බෙන්නේ නෑ. Item එක වෙන plant එකක තියෙන්න පුළුවන් |
+| **Status** | Sidebar එකේ status filter — default එකට `Available` විතරයි ගණන් ගන්නේ |
+| **Pick task** | `On a pick task — excluded` කියන expander එක බලන්න. Pick Id ≠ 0 නම් ඒ pallet locked. **Release stock** section එකෙන් release කරන්න පුළුවන් |
+
+### 2. **Bug එකක් තිබ්බා — 2026-08-22b එකේ හදලා**
+
+Line 4ක් තියෙන invoice එකක line 1ක stock නෑ, අනිත් 3ට ඕන තරම් තියෙනවා
+කියමු. Partial pick එකකින් **ඒ 3ම යවන්න පුළුවන්**.
+
+ඒත් offer එක හදාගත්තේ **shortage table එකෙන් විතරයි** — ඒකේ තියෙන්නේ
+**short lines විතරයි**. ඒ නිසා `AVAILABLE_NOW = 0` කියලා පෙන්නලා
+document එක **list එකෙන්ම අයින් වුණා**. Engine එකට ඒක හරියටම pick කරන්න
+පුළුවන් වුණා — user එකාට **අහන්නවත් ලැබුනේ නෑ**.
+
+දැන් offer එක හදන්නේ `run_pick` ඇතුලේ, ඇත්ත අංක තියෙන තැනම:
+
+```
+CAN_PICK_NOW = (සම්පූර්ණයෙන් allocate වුණු lines)  +  (short lines වල තියෙන ටික)
+```
+
+| DOC_NUMBER | LINES | SHORT_LINES | DOC_QTY | ALREADY_SENT | CAN_PICK_NOW | STILL_SHORT |
+|---|---|---|---|---|---|---|
+| I1 | 4 | 1 | 18 | 0 | **15** | 3 |
+
+`ALREADY_SENT` — කලින් partial pick එකකින් ගිය ප්‍රමාණය (§35).
+
+BUILD: `2026-08-22b · partial offer fix` · `pick_engine.py` API **7**

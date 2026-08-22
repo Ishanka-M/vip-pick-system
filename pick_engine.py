@@ -25,7 +25,7 @@ from doc_parser import ParsedDoc, base_item, clean_item
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 6
+API = 7
 
 # --------------------------------------------------------------------------- #
 # WMS templates
@@ -429,6 +429,7 @@ def run_pick(
     shortages: list[dict] = []
     accepted: list[dict] = []
     partials: list[str] = []
+    offers: list[dict] = []
     detail_rows: list[dict] = []
     master_rows: list[dict] = []
 
@@ -576,6 +577,26 @@ def run_pick(
                 rejected.append({"DOC_NUMBER": num, "DOC_TYPE": doc.doc_type,
                                  "REASON": "STOCK SHORT - not picked",
                                  "DETAIL": miss, "SOURCE_FILE": doc.source_file})
+                # What a partial pick would actually put on the truck, worked
+                # out here because this is the only place that knows it: the
+                # lines that were fine allocated in full (doc_alloc), and each
+                # short line could still give whatever is on the floor.
+                # Deriving it from the shortage table alone was wrong — that
+                # table holds only the short lines, so a document with one dead
+                # line and five good ones looked like it had nothing to send.
+                can_now = (sum(float(a["QTY_PICKED"]) for a in doc_alloc)
+                           + sum(float(x["AVAILABLE"]) for x in doc_short))
+                doc_total = float(sum(l.qty for l in doc.lines))
+                offers.append({
+                    "DOC_NUMBER": num, "DOC_TYPE": doc.doc_type,
+                    "LINES": len(doc.lines), "SHORT_LINES": len(doc_short),
+                    "DOC_QTY": doc_total,
+                    "ALREADY_SENT": float(sum(prev.values())),
+                    "CAN_PICK_NOW": can_now,
+                    "STILL_SHORT": max(0.0, doc_total - float(sum(prev.values())) - can_now),
+                    "ITEMS": ", ".join(dict.fromkeys(
+                        str(x["DOC_ITEM_CODE"]) for x in doc_short))[:200],
+                })
                 continue
         is_partial = bool(doc_short)
 
@@ -707,6 +728,7 @@ def run_pick(
         "accepted": pd.DataFrame(accepted),
         "balance": pallet_balance(basis, alloc_df, cap),
         "partial": partials,
+        "partial_offer": pd.DataFrame(offers, columns=PARTIAL_COLS),
         "picked_before": prev_map,
         "cfg": cfg,
     }
@@ -806,8 +828,8 @@ def _verify_doc(doc, doc_alloc: list[dict], doc_detail: list[dict],
     return rows, bad
 
 
-PARTIAL_COLS = ["DOC_NUMBER", "DOC_TYPE", "SHORT_LINES", "REQUIRED",
-                "AVAILABLE_NOW", "STILL_SHORT", "ITEMS"]
+PARTIAL_COLS = ["DOC_NUMBER", "DOC_TYPE", "LINES", "SHORT_LINES", "DOC_QTY",
+                "ALREADY_SENT", "CAN_PICK_NOW", "STILL_SHORT", "ITEMS"]
 
 
 def partialable(res: dict[str, Any]) -> pd.DataFrame:
@@ -815,31 +837,22 @@ def partialable(res: dict[str, Any]) -> pd.DataFrame:
     Documents refused for stock that could still put something on a truck —
     the answer to "we cannot wait, send what we have".
 
-    The numbers cover the **short lines only**; the lines that were fine are
-    picked in full either way. A document with nothing at all on its short
-    lines is not a partial pick, it is no pick, so it is left out.
+    A document with nothing at all in the warehouse is not a partial pick, it
+    is no pick, so it is left out; `no_partial()` names those separately rather
+    than leaving the user hunting for a section that never appears.
     """
-    sh = res.get("shortage")
-    rej = res.get("rejected", pd.DataFrame())
-    if sh is None or not len(sh) or rej is None or not len(rej):
+    out = res.get("partial_offer")
+    if out is None or not len(out):
         return pd.DataFrame(columns=PARTIAL_COLS)
-    stuck = {str(r["DOC_NUMBER"]) for _, r in rej.iterrows()
-             if "STOCK SHORT" in str(r.get("REASON", ""))}
-    if not stuck:
-        return pd.DataFrame(columns=PARTIAL_COLS)
+    return out[out["CAN_PICK_NOW"] > 0].reset_index(drop=True)
 
-    rows: list[dict] = []
-    for num, g in sh[sh["DOC_NUMBER"].astype(str).isin(stuck)].groupby("DOC_NUMBER"):
-        need = float(pd.to_numeric(g["REQUIRED"], errors="coerce").fillna(0).sum())
-        have = float(pd.to_numeric(g["AVAILABLE"], errors="coerce").fillna(0).sum())
-        rows.append({
-            "DOC_NUMBER": str(num), "DOC_TYPE": str(g.iloc[0].get("DOC_TYPE", "")),
-            "SHORT_LINES": int(len(g)), "REQUIRED": need, "AVAILABLE_NOW": have,
-            "STILL_SHORT": max(0.0, need - have),
-            "ITEMS": ", ".join(dict.fromkeys(str(x) for x in g["DOC_ITEM_CODE"]))[:200],
-        })
-    out = pd.DataFrame(rows, columns=PARTIAL_COLS)
-    return out[out["AVAILABLE_NOW"] > 0].reset_index(drop=True)
+
+def no_partial(res: dict[str, Any]) -> pd.DataFrame:
+    """Stock-short documents where a partial pick would send nothing at all."""
+    out = res.get("partial_offer")
+    if out is None or not len(out):
+        return pd.DataFrame(columns=PARTIAL_COLS)
+    return out[out["CAN_PICK_NOW"] <= 0].reset_index(drop=True)
 
 
 RELEASE_COLS = ["DOC_NUMBER", "DOC_TYPE", "SHORT_LINES", "SHORT_QTY", "ON_PICK_TASK",

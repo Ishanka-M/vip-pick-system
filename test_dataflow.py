@@ -390,15 +390,21 @@ def test_all_or_nothing_is_still_the_default():
 
 
 def test_partialable_offers_only_what_can_actually_ship():
-    inv, doc = _short_case()
+    inv, doc = _short_case()                    # AAA 10 ok, BBB 12 asked / 4 there
     res = PE.run_pick([doc], inv, PE.EngineConfig())
     offer = PE.partialable(res)
     assert list(offer["DOC_NUMBER"]) == ["I1"]
     row = offer.iloc[0]
-    assert row["REQUIRED"] == 12 and row["AVAILABLE_NOW"] == 4 and row["STILL_SHORT"] == 8
-    # a document with nothing at all on its short line is not on offer
+    # the whole document, and what a partial pick would really load: the full
+    # line in full (10) plus whatever the short line has (4)
+    assert row["DOC_QTY"] == 22
+    assert row["CAN_PICK_NOW"] == 14
+    assert row["STILL_SHORT"] == 8
+    assert row["LINES"] == 2 and row["SHORT_LINES"] == 1
+    # a document with nothing at all is not on offer — it is named separately
     nothing = PE.run_pick([_doc("I2", [("ZZZ", 5)])], inv, PE.EngineConfig())
     assert len(PE.partialable(nothing)) == 0
+    assert list(PE.no_partial(nothing)["DOC_NUMBER"]) == ["I2"]
 
 
 def test_a_confirmed_partial_picks_what_is_there():
@@ -680,6 +686,65 @@ def test_the_period_filter_keeps_the_summary_and_the_details_in_step():
                        columns=R.DETAIL_COLS)
     kept = R.details_for(det, dash["invoices"])
     assert set(kept["TAX_INVOICE_NO"]) == {"TODAY", "NODATE"}
+
+
+
+def test_a_dead_line_does_not_hide_what_the_rest_of_the_document_can_send():
+    """
+    One line with no stock at all, three lines with plenty.
+
+    The offer used to be worked out from the shortage table, which holds only
+    the *short* lines — so this document showed 0 available and was dropped off
+    the partial list, even though three quarters of it was sitting on the floor
+    ready to go.
+    """
+    inv = pd.concat([_inv(["AAA"], qty=100), _inv(["BBB"], qty=100),
+                     _inv(["CCC"], qty=100)], ignore_index=True)
+    doc = _doc("I1", [("AAA", 5), ("BBB", 5), ("CCC", 5), ("R010077", 3)])
+    res = PE.run_pick([doc], inv, PE.EngineConfig())
+    assert len(res["accepted"]) == 0                       # all-or-nothing default
+    offer = PE.partialable(res)
+    assert list(offer["DOC_NUMBER"]) == ["I1"], offer.to_dict("records")
+    row = offer.iloc[0]
+    assert row["DOC_QTY"] == 18 and row["CAN_PICK_NOW"] == 15 and row["STILL_SHORT"] == 3
+    assert row["LINES"] == 4 and row["SHORT_LINES"] == 1
+    assert len(PE.no_partial(res)) == 0
+    # and confirming it really does send those 15
+    go = PE.run_pick([doc], inv, PE.EngineConfig(partial_docs=["I1"]))
+    assert go["partial"] == ["I1"]
+    assert go["detail"]["QTY"].astype(float).sum() == 15
+    assert go["accepted"].iloc[0]["SHORT_QTY"] == 3
+
+
+def test_a_document_with_nothing_at_all_is_named_not_hidden():
+    """The whole document has no stock — there is nothing to offer, and the
+    screen has to say so rather than leave the user hunting for a section."""
+    doc = _doc("333262712447", [("R010077", 3)])
+    res = PE.run_pick([doc], _inv(["AAA"], qty=100), PE.EngineConfig())
+    assert len(PE.partialable(res)) == 0                   # nothing to send
+    dead = PE.no_partial(res)
+    assert list(dead["DOC_NUMBER"]) == ["333262712447"]
+    assert dead.iloc[0]["CAN_PICK_NOW"] == 0
+    assert dead.iloc[0]["STILL_SHORT"] == 3
+    # and forcing a partial anyway still refuses it
+    forced = PE.run_pick([doc], _inv(["AAA"], qty=100), PE.EngineConfig(partial_docs=["*"]))
+    assert len(forced["accepted"]) == 0
+
+
+def test_the_offer_counts_what_an_earlier_partial_already_sent():
+    inv, doc = _short_case()
+    first = PE.run_pick([doc], inv, PE.EngineConfig(partial_docs=["I1"]))
+    prev = G.picked_lines_from(first["allocations"])
+    # still short on the balance run, and still nothing new on the floor
+    second = PE.run_pick([doc], inv.assign(**{"Actual Qty": [100, 0]}),
+                         PE.EngineConfig(), picked_before=prev)
+    offer = PE.partialable(second)
+    if len(offer):
+        row = offer.iloc[0]
+        assert row["ALREADY_SENT"] == 14
+        assert row["DOC_QTY"] == 22
+    else:
+        assert PE.no_partial(second).iloc[0]["ALREADY_SENT"] == 14
 
 
 if __name__ == "__main__":
