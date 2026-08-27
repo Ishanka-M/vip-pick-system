@@ -702,6 +702,45 @@ pick වුණාම register එක `Yes` කරනවා, dashboard එකෙ�
 
 ---
 
+---
+
+## Partial pick — how much of a short line goes out
+
+A short document can be sent two ways. The offer shows both numbers so the
+choice is made on the figures, not on a guess:
+
+| Column | What that load would carry |
+|---|---|
+| `CAN_PICK_NOW` | the complete lines **plus whatever is on the floor** for the short line — that line goes out split |
+| `WHOLE_LINES_ONLY` | the complete lines **only** — the short item is left off the load entirely |
+
+**Send whatever is on the floor** (the default) is the old behaviour: 12 asked
+for, 4 on the floor, 4 go out and 8 stay owed.
+
+**Send only the lines that are complete** leaves that item off. Nothing of it
+ships, all 12 stay owed, and the customer gets whole line items rather than
+fragments. `SHORT` on the shortage sheet reflects that — the whole line, not
+the balance of a split.
+
+### Leaving an item off by hand
+
+Under *Leave an item off this load* any line can be held back, short or not.
+It is recorded as `Left out of this load by the user`, the quantity stays owed
+and the document comes back for it on the next pick, exactly like a shortage.
+
+Holding a line back **is** a partial pick — the document is marked `PARTIAL`
+and stays open in `DOC_REGISTRY` even without the short-delivery confirmation,
+because the load no longer carries the whole document.
+
+If every line is held back, nothing is written. There is no such thing as an
+empty order.
+
+### When nothing can be sent at all
+
+`no_partial()` still names the documents where both numbers are zero, and each
+one now carries its own `REASONS` — *on another pick task*, *item not in
+inventory / plant* — so the next step is on the row rather than in a hunt.
+
 ## 24. Duplicates · API quota · multi-user · speed
 
 ### Duplicate කිසිම තැනකට යන්නේ නෑ

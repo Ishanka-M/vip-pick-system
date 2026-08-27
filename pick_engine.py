@@ -25,7 +25,7 @@ from doc_parser import ParsedDoc, base_item, clean_item
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 7
+API = 8
 
 # --------------------------------------------------------------------------- #
 # WMS templates
@@ -337,6 +337,14 @@ class EngineConfig:
     # Partial pick — තියෙන ප්‍රමාණය විතරක් යවන්න user confirm කරපු documents.
     # ["*"] = ඔක්කොම. හිස් නම් කලින් වගේම all-or-nothing.
     partial_docs: list[str] = field(default_factory=list)
+    # How much of a short line a partial pick takes.
+    #   "floor" — whatever is on the floor, so a line can go out split
+    #   "whole" — only lines that can be filled completely; a short line is
+    #             left out of the load entirely and stays owed in full
+    partial_mode: str = "floor"
+    # Lines the user has deliberately left out of this load: {doc: [line no, …]}.
+    # The quantity stays owed, so the document comes back for it.
+    skip_lines: dict[str, list[int]] = field(default_factory=dict)
     strategy: str = "FIFO"              # FIFO | LEAST_PALLETS | SINGLE_PALLET_FIRST
     exact_item_first: bool = True
     use_ledger: bool = True             # pallet balance එකට ledger එක බලනවද
@@ -486,12 +494,27 @@ def run_pick(
                 ok = ok | df["pick_id"].isin(allow)
             return ok
 
+        skip_set = {int(x) for x in (cfg.skip_lines or {}).get(num, []) if str(x).strip()}
+        left_out: list[dict] = []
+
         for ln in doc.lines:
             # only the balance is still owed when an earlier run took some
             done_before = float(prev.get(ln.line_no, 0.0))
             need = float(ln.qty) - done_before
             if need <= QTY_TOL:
                 continue                       # this line was completed earlier
+            if ln.line_no in skip_set:
+                # deliberately held back — not a shortage, a decision. The
+                # quantity stays owed so the document comes back for it.
+                left_out.append({
+                    "DOC_NUMBER": num, "DOC_TYPE": doc.doc_type, "DOC_LINE": ln.line_no,
+                    "DOC_ITEM_CODE": ln.item_code, "BASE_ID": ln.base,
+                    "DESCRIPTION": _desc("", ln.item_code, ln.description),
+                    "REQUIRED": need, "AVAILABLE": 0.0, "ON_PICK_TASK": 0.0,
+                    "PICK_IDS": "", "SHORT": need, "PICKED_NOW": 0.0,
+                    "REASON": "Left out of this load by the user",
+                })
+                continue
             # Base id first, but the *exact* code always matches itself too:
             # "P601560710" on the document and "P601560 710" in the inventory
             # clean to the same key even though only one of them can be split
@@ -520,19 +543,26 @@ def run_pick(
                            f"(Pick Id {lock_id})")
                 else:
                     why = "Stock short"
+                # Whole-line mode sends nothing for a short line, so the owed
+                # quantity is the whole line — not the balance of a split.
+                takes_floor = (go_partial and have > QTY_TOL
+                               and str(cfg.partial_mode).lower() != "whole")
+                sending = have if takes_floor else 0.0
                 doc_short.append({
                     "DOC_NUMBER": num, "DOC_TYPE": doc.doc_type, "DOC_LINE": ln.line_no,
                     "DOC_ITEM_CODE": ln.item_code, "BASE_ID": ln.base,
                     "DESCRIPTION": _desc("", ln.item_code, ln.description),
                     "REQUIRED": need, "AVAILABLE": have,
                     "ON_PICK_TASK": lock_q, "PICK_IDS": lock_id,
-                    "SHORT": max(0.0, need - have), "REASON": why,
-                    "PICKED_NOW": have if go_partial else 0.0,
+                    "SHORT": max(0.0, need - sending), "REASON": why,
+                    "PICKED_NOW": sending,
                 })
                 # A partial pick takes whatever is on the floor and leaves the
                 # rest owed; without the user's confirmation the line is simply
                 # not picked and the whole document falls over below.
-                if not go_partial or have <= QTY_TOL:
+                # In "whole" mode a short line never goes out split — the load
+                # carries only the lines that can be filled completely.
+                if not takes_floor:
                     continue
                 need = have
 
@@ -564,6 +594,12 @@ def run_pick(
                     "_attrs": tuple(str(r.get(v, "") or "") for v in GEN_MAP.values()),
                 })
 
+        # A line the user held back is owed just like a short one, and asking
+        # for it is itself a request for a partial pick.
+        if left_out:
+            doc_short.extend(left_out)
+            go_partial = True
+
         # ---------- whole document must be complete ----------
         # …unless the user has confirmed a partial pick for this document, and
         # there is actually something to send.
@@ -584,8 +620,8 @@ def run_pick(
                 # Deriving it from the shortage table alone was wrong — that
                 # table holds only the short lines, so a document with one dead
                 # line and five good ones looked like it had nothing to send.
-                can_now = (sum(float(a["QTY_PICKED"]) for a in doc_alloc)
-                           + sum(float(x["AVAILABLE"]) for x in doc_short))
+                whole_only = sum(float(a["QTY_PICKED"]) for a in doc_alloc)
+                can_now = whole_only + sum(float(x["AVAILABLE"]) for x in doc_short)
                 doc_total = float(sum(l.qty for l in doc.lines))
                 offers.append({
                     "DOC_NUMBER": num, "DOC_TYPE": doc.doc_type,
@@ -593,9 +629,17 @@ def run_pick(
                     "DOC_QTY": doc_total,
                     "ALREADY_SENT": float(sum(prev.values())),
                     "CAN_PICK_NOW": can_now,
+                    # what would go out if short lines were left whole instead
+                    # of split — the lines that are complete, and nothing else
+                    "WHOLE_LINES_ONLY": whole_only,
+                    "COMPLETE_LINES": len(doc.lines) - len(doc_short),
                     "STILL_SHORT": max(0.0, doc_total - float(sum(prev.values())) - can_now),
                     "ITEMS": ", ".join(dict.fromkeys(
                         str(x["DOC_ITEM_CODE"]) for x in doc_short))[:200],
+                    # why it is short, so a document that can send nothing says
+                    # so on its own row instead of sending the user hunting
+                    "REASONS": ", ".join(dict.fromkeys(
+                        str(x["REASON"]) for x in doc_short))[:160],
                 })
                 continue
         is_partial = bool(doc_short)
@@ -828,8 +872,9 @@ def _verify_doc(doc, doc_alloc: list[dict], doc_detail: list[dict],
     return rows, bad
 
 
-PARTIAL_COLS = ["DOC_NUMBER", "DOC_TYPE", "LINES", "SHORT_LINES", "DOC_QTY",
-                "ALREADY_SENT", "CAN_PICK_NOW", "STILL_SHORT", "ITEMS"]
+PARTIAL_COLS = ["DOC_NUMBER", "DOC_TYPE", "LINES", "COMPLETE_LINES", "SHORT_LINES",
+                "DOC_QTY", "ALREADY_SENT", "CAN_PICK_NOW", "WHOLE_LINES_ONLY",
+                "STILL_SHORT", "ITEMS", "REASONS"]
 
 
 def partialable(res: dict[str, Any]) -> pd.DataFrame:
@@ -844,7 +889,10 @@ def partialable(res: dict[str, Any]) -> pd.DataFrame:
     out = res.get("partial_offer")
     if out is None or not len(out):
         return pd.DataFrame(columns=PARTIAL_COLS)
-    return out[out["CAN_PICK_NOW"] > 0].reset_index(drop=True)
+    room = out["CAN_PICK_NOW"].astype(float)
+    if "WHOLE_LINES_ONLY" in out.columns:
+        room = room.combine(out["WHOLE_LINES_ONLY"].astype(float), max)
+    return out[room > 0].reset_index(drop=True)
 
 
 def no_partial(res: dict[str, Any]) -> pd.DataFrame:
@@ -852,7 +900,10 @@ def no_partial(res: dict[str, Any]) -> pd.DataFrame:
     out = res.get("partial_offer")
     if out is None or not len(out):
         return pd.DataFrame(columns=PARTIAL_COLS)
-    return out[out["CAN_PICK_NOW"] <= 0].reset_index(drop=True)
+    room = out["CAN_PICK_NOW"].astype(float)
+    if "WHOLE_LINES_ONLY" in out.columns:
+        room = room.combine(out["WHOLE_LINES_ONLY"].astype(float), max)
+    return out[room <= 0].reset_index(drop=True)
 
 
 RELEASE_COLS = ["DOC_NUMBER", "DOC_TYPE", "SHORT_LINES", "SHORT_QTY", "ON_PICK_TASK",

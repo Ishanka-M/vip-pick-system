@@ -435,6 +435,71 @@ def test_nothing_on_the_floor_is_not_a_partial_pick():
     assert "STOCK SHORT" in res["rejected"].iloc[0]["REASON"]
 
 
+def _three_line_case():
+    """AAA and CCC are fine, BBB is 8 short of the 12 asked for."""
+    inv = pd.DataFrame([
+        {"Item Number": c, "Lot Number": "L", "Pallet ID": f"P{i}", "Location Id": "A",
+         "Actual Qty": q, "Plant": "PL1", "Status": "Available", "Pick Id": "0",
+         "UOM": "EA", "Description": "d"}
+        for i, (c, q) in enumerate([("AAA", 100), ("BBB", 4), ("CCC", 50)])])
+    return inv, _doc("I1", [("AAA", 10), ("BBB", 12), ("CCC", 6)])
+
+
+def test_the_offer_shows_both_ways_of_sending_it():
+    inv, doc = _three_line_case()
+    row = PE.partialable(PE.run_pick([doc], inv, PE.EngineConfig())).iloc[0]
+    assert row["DOC_QTY"] == 28
+    assert row["CAN_PICK_NOW"] == 20        # 10 + 4 on the floor + 6
+    assert row["WHOLE_LINES_ONLY"] == 16    # the two complete lines only
+    assert row["COMPLETE_LINES"] == 2 and row["SHORT_LINES"] == 1
+
+
+def test_whole_mode_leaves_the_short_item_off_the_load():
+    inv, doc = _three_line_case()
+    res = PE.run_pick([doc], inv,
+                      PE.EngineConfig(partial_docs=["I1"], partial_mode="whole"))
+    per_line = res["allocations"].groupby("DOC_LINE")["QTY_PICKED"].sum()
+    assert 2 not in per_line                 # nothing of the short item goes out
+    assert per_line[1] == 10 and per_line[3] == 6
+    a = res["accepted"].iloc[0]
+    assert a["PICK_STATUS"] == "PARTIAL" and a["PICKED_QTY"] == 16
+    assert res["detail"]["QTY"].astype(float).sum() == 16
+    # the whole of the short line is still owed, not the balance of a split
+    owed = res["shortage"].set_index("DOC_LINE")["SHORT"]
+    assert owed[2] == 12
+
+
+def test_a_line_held_back_by_hand_stays_owed():
+    inv, doc = _three_line_case()
+    res = PE.run_pick([doc], inv, PE.EngineConfig(partial_docs=["I1"],
+                                                  skip_lines={"I1": [3]}))
+    per_line = res["allocations"].groupby("DOC_LINE")["QTY_PICKED"].sum()
+    assert 3 not in per_line
+    held = res["shortage"][res["shortage"]["DOC_LINE"] == 3].iloc[0]
+    assert held["SHORT"] == 6
+    assert "Left out" in held["REASON"]
+    assert res["accepted"].iloc[0]["PICK_STATUS"] == "PARTIAL"
+
+
+def test_holding_a_line_back_is_itself_a_partial_pick():
+    """No partial_docs confirmation, but a held line still must not fail the run."""
+    inv, doc = _three_line_case()
+    doc.lines[1].qty = 4                     # BBB now fits, so nothing is short
+    res = PE.run_pick([doc], inv, PE.EngineConfig(skip_lines={"I1": [1]}))
+    a = res["accepted"].iloc[0]
+    assert a["PICK_STATUS"] == "PARTIAL"
+    assert a["PICKED_QTY"] == 10             # BBB 4 + CCC 6, AAA held back
+    assert len(res["rejected"]) == 0
+
+
+def test_holding_every_line_back_sends_nothing():
+    inv, doc = _three_line_case()
+    res = PE.run_pick([doc], inv, PE.EngineConfig(partial_docs=["I1"],
+                                                  skip_lines={"I1": [1, 2, 3]}))
+    assert len(res["accepted"]) == 0
+    assert len(res["allocations"]) == 0
+
+
 def test_the_balance_is_picked_later_and_only_the_balance():
     inv, doc = _short_case()
     first = PE.run_pick([doc], inv, PE.EngineConfig(partial_docs=["I1"]))

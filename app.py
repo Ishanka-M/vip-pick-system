@@ -53,7 +53,7 @@ _GS_API = getattr(_gs_mod, "API", 0)
 # Every file in the release, in one list. Checking them together matters:
 # reporting them one at a time sends the user round the loop again for the
 # next file, and the answer is always the same — replace the whole set.
-_NEEDS = {"pick_engine.py": (E, 7), "doc_parser.py": (P, 8), "pick_pdf.py": (PP, 6),
+_NEEDS = {"pick_engine.py": (E, 8), "doc_parser.py": (P, 8), "pick_pdf.py": (PP, 6),
           "sku_master.py": (SKU, 3), "ui.py": (ui, 3),
           "invoice_register.py": (R, 17),
           "gsheet.py": (_gs_mod, 12)}
@@ -1607,7 +1607,8 @@ with tab_gen:
         with st.spinner("Reading the inventory..."):
             st.session_state["inv_raw"] = pd.read_excel(f_inv, dtype=str)
         st.session_state["inv_sig"] = (f_inv.name, f_inv.size)
-        for _k in ("plants_ok", "result", "release_locked", "partial_docs"):
+        for _k in ("plants_ok", "result", "release_locked", "partial_docs",
+                   "partial_mode", "skip_lines"):
             st.session_state.pop(_k, None)
     inv_raw = st.session_state.get("inv_raw")
 
@@ -1664,6 +1665,8 @@ with tab_gen:
             pick_id_zero_only=pick_id_gate,
             release_locked=st.session_state.get("release_locked", {}),
             partial_docs=st.session_state.get("partial_docs", []),
+            partial_mode=st.session_state.get("partial_mode", "floor"),
+            skip_lines=st.session_state.get("skip_lines", {}),
             blank_fill=blank_fill,
             fill_item_number_col=fill_item_col, merge_same_item_lines=merge_lines,
             override_doc_check=override,
@@ -1852,6 +1855,9 @@ with tab_gen:
                          "these documents, so there is nothing to confirm."),
                 unsafe_allow_html=True)
             st.dataframe(dead, hide_index=True, width="stretch")
+            if "REASONS" in dead.columns:
+                for _, _r in dead.iterrows():
+                    st.markdown(f"- **{_r['DOC_NUMBER']}** — {_r['REASONS']}")
             st.caption("`CAN_PICK_NOW` is 0 — every short line has no free stock in "
                        "the confirmed plant. Worth checking before you write it off: "
                        "the **plant** confirmed in step 03, the **status** filter in "
@@ -1870,14 +1876,48 @@ with tab_gen:
                          "the stock arrives."),
                 unsafe_allow_html=True)
             st.dataframe(part, hide_index=True, width="stretch")
-            st.caption("The numbers above are for the **short lines only** — every "
-                       "line that has full stock goes out in full either way.")
+            st.caption("`CAN_PICK_NOW` splits the short line and sends whatever is "
+                       "on the floor. `WHOLE_LINES_ONLY` leaves that item off the "
+                       "load altogether and sends the complete lines.")
+
+            mode_label = st.radio(
+                "How to send it",
+                ["Send whatever is on the floor — a short line goes out split",
+                 "Send only the lines that are complete — leave that item off"],
+                index=0 if st.session_state.get("partial_mode", "floor") == "floor" else 1,
+                key="partial_mode_choice")
+            _whole = mode_label.startswith("Send only")
 
             pc1, pc2 = st.columns([2, 1])
             take_p = pc1.multiselect("Documents to pick partially",
                                      part["DOC_NUMBER"].tolist(),
                                      default=part["DOC_NUMBER"].tolist(),
                                      key="partial_pick")
+
+            # leaving a specific item off, whichever mode is chosen
+            _sh = res.get("shortage", pd.DataFrame())
+            _lines = st.session_state.get("skip_lines", {})
+            with st.expander("Leave an item off this load"):
+                st.caption("The quantity stays owed — the document comes back for it "
+                           "on the next pick, exactly like a short line.")
+                doc_lines = st.session_state.get("doc_frame", pd.DataFrame())
+                for _num in take_p:
+                    rows = doc_lines[doc_lines["Doc Number"].astype(str) == str(_num)] \
+                        if len(doc_lines) and "Doc Number" in doc_lines.columns \
+                        else pd.DataFrame()
+                    if not len(rows):
+                        continue
+                    opts = {f"L{int(r['Line'])} · {r['Item Code']} · qty {r['Qty']:g}":
+                            int(r["Line"]) for _, r in rows.iterrows()}
+                    chosen = st.multiselect(
+                        f"{_num} — lines to hold back", list(opts),
+                        default=[k for k, v in opts.items()
+                                 if v in _lines.get(str(_num), [])],
+                        key=f"skip_{_num}")
+                    if chosen:
+                        _lines[str(_num)] = [opts[k] for k in chosen]
+                    else:
+                        _lines.pop(str(_num), None)
             sure_p = pc1.checkbox(
                 "The customer has agreed to a short delivery for these documents",
                 key="partial_confirm")
@@ -1886,6 +1926,8 @@ with tab_gen:
                           disabled=not (take_p and sure_p)):
                 st.session_state["partial_docs"] = sorted(
                     set(st.session_state.get("partial_docs", [])) | set(take_p))
+                st.session_state["partial_mode"] = "whole" if _whole else "floor"
+                st.session_state["skip_lines"] = _lines
                 st.session_state["rerun_pick"] = True
                 st.toast(f"Partial pick for {len(take_p)} document(s) — picking again",
                          icon="📦")
@@ -1900,11 +1942,19 @@ with tab_gen:
 
         if st.session_state.get("partial_docs"):
             done_p = ", ".join(st.session_state["partial_docs"])
+            _held = st.session_state.get("skip_lines") or {}
+            if st.session_state.get("partial_mode") == "whole":
+                st.caption("Whole lines only — a short line is left off the load "
+                           "rather than sent split.")
+            if _held:
+                st.caption("Held back by hand: " + " · ".join(
+                    f"{k} lines {', '.join(str(x) for x in v)}" for k, v in _held.items()))
             st.caption(f"Partial pick confirmed in this run: {done_p} — the balance "
                        "stays owed, and DOC_REGISTRY keeps the document open so it "
                        "can be picked again.")
             if st.button("Undo the partial pick"):
-                st.session_state.pop("partial_docs", None)
+                for _k in ("partial_docs", "partial_mode", "skip_lines"):
+                    st.session_state.pop(_k, None)
                 st.session_state["rerun_pick"] = True
                 st.rerun()
 
