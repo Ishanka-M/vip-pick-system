@@ -1888,36 +1888,54 @@ with tab_gen:
                 key="partial_mode_choice")
             _whole = mode_label.startswith("Send only")
 
+            # Held-back lines are chosen before the button, not under it. The
+            # list covers every offered document, so it does not depend on the
+            # selection below and the two can be read in any order.
+            _lines = dict(st.session_state.get("skip_lines", {}))
+            _doc_lines = st.session_state.get("doc_frame", pd.DataFrame())
+            _have_lines = len(_doc_lines) and "Doc Number" in _doc_lines.columns
+            with st.expander("Leave an item off this load"):
+                if not _have_lines:
+                    st.caption("Upload the documents again to choose lines by hand.")
+                else:
+                    st.caption("Any line can be held back, short or not. The quantity "
+                               "stays owed and the document comes back for it on the "
+                               "next pick, exactly like a short line.")
+                for _num in (part["DOC_NUMBER"].astype(str).tolist() if _have_lines
+                             else []):
+                    rows = _doc_lines[_doc_lines["Doc Number"].astype(str) == _num]
+                    if not len(rows):
+                        continue
+                    short_lines = set()
+                    _sh = res.get("shortage", pd.DataFrame())
+                    if len(_sh):
+                        short_lines = {int(x) for x in
+                                       _sh.loc[_sh["DOC_NUMBER"].astype(str) == _num,
+                                               "DOC_LINE"]}
+                    opts = {}
+                    for _, r in rows.iterrows():
+                        tag = "  · short" if int(r["Line"]) in short_lines else ""
+                        opts[f"L{int(r['Line'])} · {r['Item Code']} · "
+                             f"qty {float(r['Qty']):g}{tag}"] = int(r["Line"])
+                    chosen = st.multiselect(
+                        f"{_num} — lines to hold back", list(opts),
+                        default=[k for k, v in opts.items()
+                                 if v in _lines.get(_num, [])],
+                        key=f"skip_{_num}")
+                    if chosen:
+                        _lines[_num] = [opts[k] for k in chosen]
+                    else:
+                        _lines.pop(_num, None)
+            if _lines:
+                st.caption("Holding back: " + " · ".join(
+                    f"{k} line {', '.join(str(x) for x in v)}" for k, v in _lines.items())
+                    + " — these stay owed.")
+
             pc1, pc2 = st.columns([2, 1])
             take_p = pc1.multiselect("Documents to pick partially",
                                      part["DOC_NUMBER"].tolist(),
                                      default=part["DOC_NUMBER"].tolist(),
                                      key="partial_pick")
-
-            # leaving a specific item off, whichever mode is chosen
-            _sh = res.get("shortage", pd.DataFrame())
-            _lines = st.session_state.get("skip_lines", {})
-            with st.expander("Leave an item off this load"):
-                st.caption("The quantity stays owed — the document comes back for it "
-                           "on the next pick, exactly like a short line.")
-                doc_lines = st.session_state.get("doc_frame", pd.DataFrame())
-                for _num in take_p:
-                    rows = doc_lines[doc_lines["Doc Number"].astype(str) == str(_num)] \
-                        if len(doc_lines) and "Doc Number" in doc_lines.columns \
-                        else pd.DataFrame()
-                    if not len(rows):
-                        continue
-                    opts = {f"L{int(r['Line'])} · {r['Item Code']} · qty {r['Qty']:g}":
-                            int(r["Line"]) for _, r in rows.iterrows()}
-                    chosen = st.multiselect(
-                        f"{_num} — lines to hold back", list(opts),
-                        default=[k for k, v in opts.items()
-                                 if v in _lines.get(str(_num), [])],
-                        key=f"skip_{_num}")
-                    if chosen:
-                        _lines[str(_num)] = [opts[k] for k in chosen]
-                    else:
-                        _lines.pop(str(_num), None)
             sure_p = pc1.checkbox(
                 "The customer has agreed to a short delivery for these documents",
                 key="partial_confirm")
@@ -1927,7 +1945,8 @@ with tab_gen:
                 st.session_state["partial_docs"] = sorted(
                     set(st.session_state.get("partial_docs", [])) | set(take_p))
                 st.session_state["partial_mode"] = "whole" if _whole else "floor"
-                st.session_state["skip_lines"] = _lines
+                st.session_state["skip_lines"] = {k: v for k, v in _lines.items()
+                                                  if k in set(take_p)}
                 st.session_state["rerun_pick"] = True
                 st.toast(f"Partial pick for {len(take_p)} document(s) — picking again",
                          icon="📦")
