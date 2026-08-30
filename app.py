@@ -56,7 +56,7 @@ _GS_API = getattr(_gs_mod, "API", 0)
 # next file, and the answer is always the same — replace the whole set.
 _NEEDS = {"pick_engine.py": (E, 8), "doc_parser.py": (P, 8), "pick_pdf.py": (PP, 6),
           "sku_master.py": (SKU, 3), "ui.py": (ui, 3),
-          "invoice_register.py": (R, 17), "transactions.py": (TX, 8),
+          "invoice_register.py": (R, 17), "transactions.py": (TX, 9),
           "gsheet.py": (_gs_mod, 14)}
 _ALL = [(f, getattr(m, "API", 0), n) for f, (m, n) in _NEEDS.items() if m is not None]
 _STALE = [(f, have, need) for f, have, need in _ALL if have < need]

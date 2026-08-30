@@ -1249,3 +1249,75 @@ def test_a_frame_left_by_an_earlier_version_is_recognised_as_stale():
     assert not set(TX.ACTUAL_COLS).issubset(set(old.columns))   # the app's own check
     fresh = TX.normalize(pd.DataFrame([_tx_row()]), "CL01")
     assert set(TX.ACTUAL_COLS).issubset(set(fresh.columns))
+
+
+def _sheet_shaped(rows):
+    """A ledger as it comes back from Google Sheets — every cell a string."""
+    return pd.DataFrame(rows).astype(str)
+
+
+def test_reconcile_survives_a_ledger_of_strings():
+    """Sheets hands back text. The merge makes float columns out of the missing
+    side, and pandas 3 will not put one dtype into the other — it raises."""
+    led = _sheet_shaped([{"DOC_NUMBER": "L1", "PALLET": "P1", "ITEM_NUMBER": "AAA",
+                          "LOT_NUMBER": "LOT1", "QTY_BEFORE": "10",
+                          "QTY_PICKED": "6", "QTY_BALANCE": "4",
+                          "ROW_KEY": "P1|A|AAA|LOT1|", "BASE_ID": "AAA",
+                          "LOCATION_ID": "A", "PLANT": "PL1", "UOM": "EA",
+                          "RUN_ID": "R1"}])
+    act = pd.DataFrame([{"LOAD_ID": "L1", "CONTROL_NUMBER": "C", "PALLET": "P9",
+                         "TO_PALLET": "P9", "HU_SOURCE": "Starting Hu",
+                         "ITEM_NUMBER": "AAA", "BASE_ID": "AAA", "LOT_NUMBER": "",
+                         "QTY": 6.0, "FROM_LOC": "R", "TO_LOC": "S", "WHEN": "",
+                         "EMPLOYEE": ""}])
+    keys = pd.DataFrame([{"PALLET": "P9", "ROW_KEY": "P9|B|AAA|LOT7|",
+                          "LOT_NUMBER": "LOT7", "LOCATION_ID": "B", "PLANT": "PL1",
+                          "UOM": "EA", "QTY_BEFORE": 20}])
+    rec = TX.reconcile(act, led, keys=keys)
+    assert rec["totals"]["unbound"] == 0
+    corr = TX.ledger_corrections(rec)
+    p9 = corr[corr["PALLET"] == "P9"].iloc[0]
+    assert p9["ROW_KEY"] == "P9|B|AAA|LOT7|"
+    assert float(p9["QTY_BEFORE"]) == 20        # numbers survive as numbers
+    p1 = corr[corr["PALLET"] == "P1"].iloc[0]
+    assert float(p1["QTY_PICKED"]) == -6
+
+
+def test_a_blank_key_never_wins_over_a_real_one():
+    """The same pallet appears twice — once with its keys, once without."""
+    led = _sheet_shaped([
+        {"DOC_NUMBER": "OTHER", "PALLET": "P9", "ITEM_NUMBER": "AAA",
+         "LOT_NUMBER": "", "QTY_BEFORE": "0", "QTY_PICKED": "0", "QTY_BALANCE": "0",
+         "ROW_KEY": "", "BASE_ID": "AAA", "LOCATION_ID": "", "PLANT": "", "UOM": ""},
+        {"DOC_NUMBER": "OTHER", "PALLET": "P9", "ITEM_NUMBER": "AAA",
+         "LOT_NUMBER": "LOT7", "QTY_BEFORE": "20", "QTY_PICKED": "2",
+         "QTY_BALANCE": "18", "ROW_KEY": "P9|B|AAA|LOT7|", "BASE_ID": "AAA",
+         "LOCATION_ID": "B", "PLANT": "PL1", "UOM": "EA"},
+        {"DOC_NUMBER": "L1", "PALLET": "P1", "ITEM_NUMBER": "AAA",
+         "LOT_NUMBER": "LOT1", "QTY_BEFORE": "10", "QTY_PICKED": "6",
+         "QTY_BALANCE": "4", "ROW_KEY": "P1|A|AAA|LOT1|", "BASE_ID": "AAA",
+         "LOCATION_ID": "A", "PLANT": "PL1", "UOM": "EA"}])
+    act = pd.DataFrame([{"LOAD_ID": "L1", "CONTROL_NUMBER": "C", "PALLET": "P9",
+                         "TO_PALLET": "P9", "HU_SOURCE": "Starting Hu",
+                         "ITEM_NUMBER": "AAA", "BASE_ID": "AAA", "LOT_NUMBER": "",
+                         "QTY": 6.0, "FROM_LOC": "R", "TO_LOC": "S", "WHEN": "",
+                         "EMPLOYEE": ""}])
+    rec = TX.reconcile(act, led)
+    p9 = rec["rows"][rec["rows"]["PALLET"] == "P9"].iloc[0]
+    assert p9["ROW_KEY"] == "P9|B|AAA|LOT7|" and p9["BINDS"] == "yes"
+
+
+def test_the_real_report_against_a_sheet_shaped_ledger():
+    raw = pd.read_excel("/mnt/user-data/uploads/Transactions_History_Report.xlsx",
+                        dtype=str)
+    act = TX.normalize(raw, "INM0DONA")
+    real = act[act["LOAD_ID"] == "333262712295"]
+    led = _sheet_shaped(
+        [{"DOC_NUMBER": "333262712295", "PALLET": p, "ITEM_NUMBER": i,
+          "LOT_NUMBER": "", "QTY_BEFORE": str(int(q) + 5), "QTY_PICKED": str(q),
+          "QTY_BALANCE": "5", "ROW_KEY": f"{p}|LOC|{i}|", "BASE_ID": i,
+          "LOCATION_ID": "LOC", "PLANT": "333-MUMBAI", "UOM": "EA", "RUN_ID": "R1"}
+         for p, i, q in zip(real["PALLET"], real["ITEM_NUMBER"], real["QTY"])])
+    rec = TX.reconcile(act, led)
+    assert rec["totals"]["agree"] == len(real)
+    assert rec["totals"]["release_qty"] == 0 and rec["totals"]["consume_qty"] == 0

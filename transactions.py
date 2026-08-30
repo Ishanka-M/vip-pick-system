@@ -24,7 +24,7 @@ from doc_parser import base_item, clean_item
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 8
+API = 9
 
 QTY_TOL = 1e-6
 
@@ -62,6 +62,23 @@ _ALIASES = {
     "client": ["client code", "client"],
     "wh": ["wh id", "warehouse"],
 }
+
+
+def _txt(col: Any) -> pd.Series:
+    """A plain string column — no NA, no mixed dtype, nothing three-valued."""
+    if col is None:
+        return pd.Series(dtype="object")
+    s = col if isinstance(col, pd.Series) else pd.Series(col)
+    out = s.astype("string").fillna("").astype(str).str.strip()
+    return out.mask(out.str.lower().isin(["nan", "none", "nat", "<na>"]), "")
+
+
+def _num(col: Any) -> pd.Series:
+    """A plain float column, whatever the sheet handed back."""
+    if col is None:
+        return pd.Series(dtype="float64")
+    s = col if isinstance(col, pd.Series) else pd.Series(col)
+    return pd.to_numeric(s, errors="coerce").fillna(0.0).astype(float)
 
 
 def _col(df: pd.DataFrame, key: str) -> str | None:
@@ -247,9 +264,9 @@ def reconcile(actual: pd.DataFrame, ledger: pd.DataFrame,
         return empty
 
     led = ledger.copy()
-    led["DOC_NUMBER"] = led["DOC_NUMBER"].astype(str).str.strip()
-    led["PALLET"] = led["PALLET"].astype(str).str.strip()
-    led["QTY_PICKED"] = pd.to_numeric(led["QTY_PICKED"], errors="coerce").fillna(0.0)
+    led["DOC_NUMBER"] = _txt(led["DOC_NUMBER"])
+    led["PALLET"] = _txt(led["PALLET"])
+    led["QTY_PICKED"] = _num(led["QTY_PICKED"])
     known = sorted(set(led["DOC_NUMBER"]))
 
     pairs = match_loads(actual, known)
@@ -267,9 +284,7 @@ def reconcile(actual: pd.DataFrame, ledger: pd.DataFrame,
               BASE_ID=("BASE_ID", "first")).reset_index())
 
     for c in KEY_COLS:
-        if c not in led.columns:
-            led[c] = ""
-    led["QTY_BEFORE"] = pd.to_numeric(led["QTY_BEFORE"], errors="coerce").fillna(0.0)
+        led[c] = _num(led.get(c)) if c == "QTY_BEFORE" else _txt(led.get(c))
 
     def _first_set(col: pd.Series) -> str:
         for v in col:
@@ -290,12 +305,17 @@ def reconcile(actual: pd.DataFrame, ledger: pd.DataFrame,
                  suffixes=("_S", "_A"))
     m["SYSTEM_QTY"] = m["SYSTEM_QTY"].fillna(0.0)
     m["ACTUAL_QTY"] = m["ACTUAL_QTY"].fillna(0.0)
-    m["ITEM_NUMBER"] = m["ITEM_NUMBER_S"].fillna(m["ITEM_NUMBER_A"]).fillna("")
-    m["BASE_ID"] = m["BASE_ID_S"].fillna(m["BASE_ID_A"]).fillna("")
+    m["ITEM_NUMBER"] = _txt(m["ITEM_NUMBER_S"]).where(
+        _txt(m["ITEM_NUMBER_S"]) != "", _txt(m["ITEM_NUMBER_A"]))
+    m["BASE_ID"] = _txt(m["BASE_ID_S"]).where(
+        _txt(m["BASE_ID_S"]) != "", _txt(m["BASE_ID_A"]))
     m["DIFF"] = m["ACTUAL_QTY"] - m["SYSTEM_QTY"]
+    # Settle every key column into one dtype before anything is written into
+    # it. A ledger read back from the sheet is all strings while the merge makes
+    # float columns out of the missing side, and pandas will not quietly put one
+    # into the other — it raises.
     for c in KEY_COLS:
-        m[c] = m[c].fillna("") if c in m.columns else ""
-    m["QTY_BEFORE"] = pd.to_numeric(m["QTY_BEFORE"], errors="coerce").fillna(0.0)
+        m[c] = _num(m[c]) if c == "QTY_BEFORE" else _txt(m.get(c))
 
     # A pallet the system never chose for *this* load has no ledger row here to
     # borrow keys from — and a correction without keys binds to nothing and moves
@@ -309,26 +329,32 @@ def reconcile(actual: pd.DataFrame, ledger: pd.DataFrame,
     look = pd.concat([p.reindex(columns=["PALLET"] + KEY_COLS) for p in pool
                       if p is not None and len(p)], ignore_index=True)
     if len(look):
-        look["PALLET"] = look["PALLET"].astype(str).str.strip()
+        look["PALLET"] = _txt(look["PALLET"])
+        for c in KEY_COLS:
+            look[c] = _num(look[c]) if c == "QTY_BEFORE" else _txt(look.get(c))
         look = look[look["PALLET"] != ""]
-        look["_rk"] = look["ROW_KEY"].astype(str).str.strip()
-        look = (look.sort_values("_rk", ascending=False)      # a real key beats a blank
+        # a row that actually carries a key beats a blank one for the same pallet
+        look = (look.assign(_has=(look["ROW_KEY"] != "").astype(int))
+                    .sort_values("_has", ascending=False, kind="stable")
                     .drop_duplicates(subset=["PALLET"], keep="first")
                     .set_index("PALLET"))
         for c in KEY_COLS:
             if c not in look.columns:
                 continue
-            miss = m[c].astype(str).str.strip().isin(["", "0", "0.0"]) \
-                if c == "QTY_BEFORE" else m[c].astype(str).str.strip() == ""
-            m.loc[miss, c] = m.loc[miss, "PALLET"].map(look[c]).fillna(
-                0.0 if c == "QTY_BEFORE" else "")
-        m["QTY_BEFORE"] = pd.to_numeric(m["QTY_BEFORE"], errors="coerce").fillna(0.0)
+            # replace the whole column rather than writing into part of it —
+            # a partial .loc assignment has to coerce, and pandas 3 refuses
+            got = m["PALLET"].map(look[c])
+            if c == "QTY_BEFORE":
+                cur, fill = _num(m[c]), _num(got)
+                m[c] = cur.where(cur > 0, fill)
+            else:
+                cur, fill = _txt(m[c]), _txt(got)
+                m[c] = cur.where(cur != "", fill)
 
     # A row with no key at all is a record, not a movement — say so rather than
     # writing something that quietly does nothing.
-    m["BINDS"] = ((m["ROW_KEY"].astype(str).str.strip() != "")
-                  | (m["LOT_NUMBER"].astype(str).str.strip() != "")).map(
-                      {True: "yes", False: "no"})
+    m["BINDS"] = ((_txt(m["ROW_KEY"]) != "") | (_txt(m["LOT_NUMBER"]) != "")) \
+        .map({True: "yes", False: "no"})
 
     def _outcome(r) -> tuple[str, str]:
         sysq, actq = float(r["SYSTEM_QTY"]), float(r["ACTUAL_QTY"])

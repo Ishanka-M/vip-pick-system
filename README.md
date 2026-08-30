@@ -742,6 +742,30 @@ Re-comparing after applying was already safe on its own — the system quantity
 reads the corrected figure, the outcome comes back `AGREES` and nothing is
 written.
 
+## Two dtypes, one column
+
+`TypeError: Invalid value '[20]' for dtype 'float64'` — from the key-borrowing
+step, on a real deploy and never in a test, because every test built its ledger
+in Python and every deploy reads it back from Google Sheets **as strings**.
+
+Two things met in the middle:
+
+* the merge creates the missing side of an outer join as a **float** column of
+  `NaN`, while the sheet supplies **text**
+* pandas 3 refuses to write one into the other. `.loc[mask, col] = values` has to
+  coerce the column, and coercion now raises instead of silently upcasting.
+
+Partial assignment was the trap. Every key column is now settled into one dtype
+first — `_txt()` for the string keys, `_num()` for `QTY_BEFORE` — and the borrow
+replaces the **whole column** with `where()` rather than writing into part of it,
+so there is nothing to coerce.
+
+The same pass fixed a quieter one: the lookup preferred whichever row sorted
+first by `ROW_KEY` descending, and an empty key read back as the string `"nan"`,
+which sorts **after** any real key and therefore won. A pallet with its keys
+sitting right there in the ledger could lose to a blank row for the same pallet.
+The lookup now sorts on whether a key is present at all.
+
 ## A cached frame outlives the release that built it
 
 `KeyError: 'HU_SOURCE'`, from a session that had the report loaded before the
