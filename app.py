@@ -1462,6 +1462,21 @@ with tab_actual:
                "have taken others. Until the two are put side by side, a pallet "
                "nobody touched stays locked out of every later pick.")
 
+    # A frame parsed by an earlier release is still sitting in this session, and
+    # the upload signature has not changed, so nothing would re-read it — but it
+    # was built without the columns this version expects. Throw it away rather
+    # than reaching for a column that is not there.
+    _stale = st.session_state.get("tx_api") != TX.API
+    if not _stale:
+        _held = st.session_state.get("tx_actual")
+        _stale = (_held is not None
+                  and not set(TX.ACTUAL_COLS).issubset(set(_held.columns)))
+    if _stale and st.session_state.get("tx_actual") is not None:
+        for _k in ("tx_actual", "tx_sig", "recon", "recon_corrections"):
+            st.session_state.pop(_k, None)
+        st.info("The report was read by an earlier version of this app. "
+                "Upload it again to pick up the current columns.")
+
     tx_file = st.file_uploader("Transactions History Report (Excel)",
                                type=["xlsx", "xls"], key="tx_file")
     if tx_file is not None:
@@ -1472,7 +1487,9 @@ with tab_actual:
                     raw = pd.read_excel(tx_file, dtype=str)
                     st.session_state["tx_actual"] = TX.normalize(raw, client_code)
                 st.session_state["tx_sig"] = sig
+                st.session_state["tx_api"] = TX.API
                 st.session_state.pop("recon", None)
+                st.session_state.pop("recon_corrections", None)
             except Exception as ex:
                 st.error(f"Could not read it: {ex}")
 
@@ -1492,7 +1509,8 @@ with tab_actual:
                    "The pallet is `Starting Hu` — the one the stock came off and "
                    "the one the stock file knows — falling back to `Ending Hu` "
                    "where the pick was written without a starting HU.")
-        _src = act["HU_SOURCE"].value_counts().to_dict()
+        _src = (act["HU_SOURCE"].value_counts().to_dict()
+                if "HU_SOURCE" in act.columns else {})
         if _src.get("Ending Hu"):
             st.caption(f"{_src['Ending Hu']} movement(s) had no `Starting Hu`; the "
                        "`Ending Hu` was used. `HU_SOURCE` on each row says which.")
@@ -1523,6 +1541,10 @@ with tab_actual:
                 st.rerun()
 
             rec = st.session_state.get("recon")
+            if rec is not None and (rec.get("rows") is None
+                                    or "BINDS" not in rec["rows"].columns):
+                rec = None                      # built before BINDS existed
+                st.session_state.pop("recon", None)
             if rec:
                 t = rec["totals"]
                 k1, k2, k3, k4 = st.columns(4)

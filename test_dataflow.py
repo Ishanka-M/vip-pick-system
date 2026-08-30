@@ -1237,3 +1237,15 @@ def test_the_real_report_keeps_the_picks_written_on_the_ending_hu():
     assert not act["PALLET"].isna().any() and (act["PALLET"] != "").all()
     assert (act["HU_SOURCE"] == "Ending Hu").sum() > 0
     assert float(act[act["LOAD_ID"] == "333262712295"]["QTY"].sum()) == 130
+
+
+def test_a_frame_left_by_an_earlier_version_is_recognised_as_stale():
+    """The upload signature does not change when the code does, so a cached
+    frame outlives the release that built it."""
+    old = pd.DataFrame([{"LOAD_ID": "L1", "CONTROL_NUMBER": "C-L1", "PALLET": "P1",
+                         "ITEM_NUMBER": "AAA", "BASE_ID": "AAA", "LOT_NUMBER": "",
+                         "QTY": 10.0, "FROM_LOC": "R", "TO_LOC": "S", "WHEN": "",
+                         "EMPLOYEE": ""}])
+    assert not set(TX.ACTUAL_COLS).issubset(set(old.columns))   # the app's own check
+    fresh = TX.normalize(pd.DataFrame([_tx_row()]), "CL01")
+    assert set(TX.ACTUAL_COLS).issubset(set(fresh.columns))

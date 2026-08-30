@@ -742,6 +742,27 @@ Re-comparing after applying was already safe on its own — the system quantity
 reads the corrected figure, the outcome comes back `AGREES` and nothing is
 written.
 
+## A cached frame outlives the release that built it
+
+`KeyError: 'HU_SOURCE'`, from a session that had the report loaded before the
+column existed. The upload signature is the file name and size — it does not
+change when the code does, so nothing re-read the file and the old frame was
+still being handed round with the old columns.
+
+The parsed report now carries the module's API number beside it. On every run
+the tab checks both that number and that the frame still has every column
+`ACTUAL_COLS` declares; if either fails the frame is dropped and the screen says
+so, rather than reaching for a column that is not there:
+
+> *The report was read by an earlier version of this app. Upload it again to
+> pick up the current columns.*
+
+The reconciliation is checked the same way — one built before `BINDS` existed is
+thrown away instead of being displayed.
+
+The module version gate at the top of `app.py` catches a half-updated deploy on
+disk. This is the same problem one level in: state that survived the update.
+
 ## Which HU is the pallet
 
 `Starting Hu` is the pallet the stock came off, and it is the one the stock file
