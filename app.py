@@ -19,6 +19,7 @@ import pick_engine as E
 import pick_pdf as PP
 import invoice_register as R
 import sku_master as SKU
+import transactions as TX
 import ui
 
 st.set_page_config(
@@ -55,8 +56,8 @@ _GS_API = getattr(_gs_mod, "API", 0)
 # next file, and the answer is always the same — replace the whole set.
 _NEEDS = {"pick_engine.py": (E, 8), "doc_parser.py": (P, 8), "pick_pdf.py": (PP, 6),
           "sku_master.py": (SKU, 3), "ui.py": (ui, 3),
-          "invoice_register.py": (R, 17),
-          "gsheet.py": (_gs_mod, 12)}
+          "invoice_register.py": (R, 17), "transactions.py": (TX, 1),
+          "gsheet.py": (_gs_mod, 13)}
 _ALL = [(f, getattr(m, "API", 0), n) for f, (m, n) in _NEEDS.items() if m is not None]
 _STALE = [(f, have, need) for f, have, need in _ALL if have < need]
 if _STALE:
@@ -1446,9 +1447,135 @@ def _draw_rail():
          "value": (f"{len(res_now['accepted'])} picked" if res_now else "not run")},
     ])
 
-(tab_gen, tab_dash, tab_reg, tab_loads, tab_sku, tab_search, tab_bal, tab_hist,
- tab_help) = st.tabs(["Pick", "Dashboard", "Register", "Loads", "SKU master",
-                      "Search", "Stock", "History", "Guide"])
+(tab_gen, tab_dash, tab_reg, tab_loads, tab_actual, tab_sku, tab_search, tab_bal,
+ tab_hist, tab_help) = st.tabs(["Pick", "Dashboard", "Register", "Loads",
+                                "Actual picks", "SKU master", "Search", "Stock",
+                                "History", "Guide"])
+
+# =========================================================================== #
+# TAB — Actual picks (Transactions History Report)
+# =========================================================================== #
+with tab_actual:
+    ui.section("What the floor actually picked",
+               hint="Transactions History Report → the ledger put right")
+    st.caption("The ledger holds the pallets the system **chose**. The picker may "
+               "have taken others. Until the two are put side by side, a pallet "
+               "nobody touched stays locked out of every later pick.")
+
+    tx_file = st.file_uploader("Transactions History Report (Excel)",
+                               type=["xlsx", "xls"], key="tx_file")
+    if tx_file is not None:
+        sig = (tx_file.name, tx_file.size)
+        if st.session_state.get("tx_sig") != sig:
+            try:
+                with st.spinner("Reading the report..."):
+                    raw = pd.read_excel(tx_file, dtype=str)
+                    st.session_state["tx_actual"] = TX.normalize(raw, client_code)
+                st.session_state["tx_sig"] = sig
+                st.session_state.pop("recon", None)
+            except Exception as ex:
+                st.error(f"Could not read it: {ex}")
+
+    act = st.session_state.get("tx_actual")
+    if act is None or not len(act):
+        ui.empty("No report loaded",
+                 "Upload the WMS Transactions History Report. `Control Number` "
+                 "carries the load, `Starting Hu` the pallet.", "🧾")
+    else:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Pick movements", len(act))
+        m2.metric("Loads in the report", len(TX.load_ids(act)))
+        m3.metric("Units", f"{float(act['QTY'].sum()):g}")
+        st.caption("A pallet moves rack → picker → staging → dock, and every leg "
+                   "is a row. Those chains are collapsed back to the one movement "
+                   "that took stock out of storage, so nothing is counted twice.")
+
+        led = pd.DataFrame()
+        if gs_ready:
+            try:
+                import gsheet
+                led = gsheet.read_ledger(sa_info, sheet_key)
+            except Exception as ex:
+                st.warning(f"Ledger read failed: {ex}")
+        elif st.session_state.get("result"):
+            led = st.session_state["result"]["allocations"]
+
+        if not len(led):
+            st.info("No ledger to compare against — connect the database, or "
+                    "generate a pick in this session first.")
+        else:
+            if st.button("Compare with the ledger", type="primary"):
+                with st.spinner("Matching loads..."):
+                    st.session_state["recon"] = TX.reconcile(act, led,
+                                                             client_code=client_code)
+                st.rerun()
+
+            rec = st.session_state.get("recon")
+            if rec:
+                t = rec["totals"]
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Loads matched", t.get("loads", 0))
+                k2.metric("Pallets agree", t.get("agree", 0))
+                k3.metric("To release", f"{t.get('release_qty', 0):g}",
+                          help="Reserved by the system, never touched on the floor.")
+                k4.metric("To consume", f"{t.get('consume_qty', 0):g}",
+                          help="Taken on the floor, the system does not know.")
+                if rec["unknown"]:
+                    st.caption(f"{len(rec['unknown'])} load(s) in the report are not "
+                               f"in this system — ignored: "
+                               f"{', '.join(rec['unknown'][:6])}")
+
+                v1, v2, v3 = st.tabs(["Every pallet", "Release", "Picked twice"])
+                with v1:
+                    st.dataframe(rec["rows"], hide_index=True, width="stretch",
+                                 height=380)
+                with v2:
+                    st.caption("These go back on the rack.")
+                    st.dataframe(rec["release"], hide_index=True, width="stretch",
+                                 height=300)
+                with v3:
+                    dup = TX.duplicate_pallets(act, list(rec["loads"].values()))
+                    if len(dup):
+                        st.caption("The same pallet appears on more than one of the "
+                                   "matched loads. Sometimes right — a pallet can "
+                                   "serve two orders — but this is also what a "
+                                   "double pick looks like.")
+                        st.dataframe(dup, hide_index=True, width="stretch")
+                    else:
+                        st.success("No pallet appears on two of these loads.")
+
+                corr = TX.ledger_corrections(rec, who=USER)
+                st.session_state["recon_corrections"] = {
+                    lid: corr[corr["DOC_NUMBER"] == lid]
+                    for lid in corr["DOC_NUMBER"].unique()} if len(corr) else {}
+
+                ui.eyebrow("Apply")
+                st.caption("Corrections go into the ledger as ordinary rows with a "
+                           "negative quantity where stock is handed back, so the "
+                           "balance stays a plain sum. Applying twice would move "
+                           "the stock twice — do it once, or complete the load "
+                           "instead and let that apply them.")
+                ap1, ap2 = st.columns([2, 1])
+                ap1.dataframe(corr[["DOC_NUMBER", "PALLET", "ITEM_NUMBER",
+                                    "QTY_PICKED", "DESCRIPTION"]]
+                              if len(corr) else pd.DataFrame(),
+                              hide_index=True, width="stretch", height=200)
+                sure_r = ap1.checkbox("I have checked these against the floor",
+                                      key="recon_sure")
+                ap2.write("")
+                if ap2.button("Apply to the ledger", type="primary", width="stretch",
+                              disabled=not (gs_ready and len(corr) and sure_r)):
+                    try:
+                        import gsheet
+                        n = gsheet.apply_corrections(sa_info, sheet_key, corr,
+                                                     owner=USER)
+                        gsheet.save_actuals(sa_info, sheet_key, act, owner=USER)
+                        st.toast(f"{n} correction(s) written", icon="🧾")
+                        st.session_state.pop("recon", None)
+                        st.rerun()
+                    except Exception as ex:
+                        st.error(f"Apply failed: {ex}")
+
 
 # =========================================================================== #
 # TAB 1 — Generate
@@ -2448,6 +2575,46 @@ with tab_loads:
                                    width="stretch", disabled=not len(led))
                 st.caption("This PDF holds the pick sheet only - the original Invoice / "
                            "DC PDF is not stored in the database.")
+
+                ui.eyebrow("Order complete")
+                st.caption("Completing keeps every row — the load left the building "
+                           "and the record has to stand. What comes back is the "
+                           "pallet quantity this load reserved but never used.")
+                _done = st.session_state.get("completed_loads", set())
+                if load_id in _done:
+                    st.success(f"{load_id} is already completed.")
+                else:
+                    oc1, oc2 = st.columns([2, 1])
+                    oc_note = oc1.text_input("Note (optional)", key="oc_note",
+                                             placeholder="vehicle, gate pass, who signed")
+                    _corr = st.session_state.get("recon_corrections", {}).get(load_id)
+                    if _corr is not None and len(_corr):
+                        oc1.caption(f"The uploaded transactions report has "
+                                    f"{len(_corr)} pallet correction(s) for this load "
+                                    "— they are applied on completion.")
+                    else:
+                        oc1.caption("No transactions report loaded for this load, so "
+                                    "nothing is released — only the record is closed.")
+                    oc2.write("")
+                    if oc2.button("Mark order complete", type="primary",
+                                  width="stretch", disabled=not gs_ready):
+                        try:
+                            import gsheet
+                            out = gsheet.complete_load(
+                                sa_info, sheet_key, load_id, owner=USER,
+                                corrections=_corr, note=oc_note)
+                            if out.get("ok"):
+                                st.session_state.setdefault(
+                                    "completed_loads", set()).add(load_id)
+                                st.session_state.pop("load_cache", None)
+                                st.toast(f"{load_id} completed — "
+                                         f"{out['released']} pallet(s) released",
+                                         icon="✅")
+                                st.rerun()
+                            else:
+                                st.warning(f"Not completed — {out.get('reason')}.")
+                        except Exception as ex:
+                            st.error(f"Complete failed: {ex}")
 
                 ui.eyebrow("Delete")
                 st.caption("Deleting removes it from the ledger and the registry, so the "

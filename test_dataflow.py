@@ -907,3 +907,105 @@ if __name__ == "__main__":
             print(f"  FAIL {name}: {type(ex).__name__}: {ex}")
     print(f"\n{fails} failed")
     sys.exit(1 if fails else 0)
+
+
+# =========================================================================== #
+# Transactions History Report — what the floor actually picked
+# =========================================================================== #
+import transactions as TX
+
+
+def _legs():
+    """One pallet leaving the rack, then moving on twice — three rows, one pick."""
+    return pd.DataFrame([
+        {"Control Number": "CL01-INV1", "Starting Hu": "PAL-A", "Ending Hu": "PAL-A",
+         "Item Number": "CL01-AAA", "Tran Qty": "10", "Starting Loc": "RACK-1",
+         "Ending Loc": "PICKER", "End Tran Date": "12-08-2026 10:00:00",
+         "Employee Id": "PICKER", "Client Code": "CL01", "Lot Number": "L"},
+        {"Control Number": "CL01-INV1", "Starting Hu": "PAL-A", "Ending Hu": "PAL-A",
+         "Item Number": "CL01-AAA", "Tran Qty": "10", "Starting Loc": "PICKER",
+         "Ending Loc": "STAGE", "End Tran Date": "12-08-2026 11:00:00",
+         "Employee Id": "PICKER", "Client Code": "CL01", "Lot Number": "L"},
+        {"Control Number": "CL01-INV1", "Starting Hu": "PAL-A", "Ending Hu": "PAL-A",
+         "Item Number": "CL01-AAA", "Tran Qty": "10", "Starting Loc": "STAGE",
+         "Ending Loc": "DOCK", "End Tran Date": "12-08-2026 12:00:00",
+         "Employee Id": "DOCK", "Client Code": "CL01", "Lot Number": "L"},
+    ])
+
+
+def test_the_load_id_comes_out_of_the_control_number():
+    assert TX.strip_client("INM0DONA-333262712295", "INM0DONA") == "333262712295"
+    assert TX.strip_client("INM0DONA-333/26-27/17", "INM0DONA") == "333/26-27/17"
+    assert TX.strip_client("333262712295", "INM0DONA") == "333262712295"
+
+
+def test_a_movement_chain_is_one_pick_not_three():
+    act = TX.normalize(_legs(), "CL01")
+    assert len(act) == 1
+    assert float(act.iloc[0]["QTY"]) == 10
+    assert act.iloc[0]["LOAD_ID"] == "INV1"
+    assert act.iloc[0]["ITEM_NUMBER"] == "AAA"     # the client code is stripped
+
+
+def test_a_second_pick_off_the_same_pallet_survives_the_collapse():
+    legs = pd.concat([_legs(), pd.DataFrame([{
+        "Control Number": "CL01-INV1", "Starting Hu": "PAL-A", "Ending Hu": "PAL-A",
+        "Item Number": "CL01-AAA", "Tran Qty": "4", "Starting Loc": "RACK-2",
+        "Ending Loc": "PICKER", "End Tran Date": "13-08-2026 09:00:00",
+        "Employee Id": "PICKER", "Client Code": "CL01", "Lot Number": "L"}])],
+        ignore_index=True)
+    act = TX.normalize(legs, "CL01")
+    assert float(act["QTY"].sum()) == 14
+
+
+def test_reconcile_releases_a_pallet_the_floor_never_touched():
+    act = TX.normalize(_legs(), "CL01")
+    led = pd.DataFrame([
+        {"DOC_NUMBER": "INV1", "PALLET": "PAL-A", "QTY_PICKED": 10,
+         "ITEM_NUMBER": "AAA", "BASE_ID": "AAA"},
+        {"DOC_NUMBER": "INV1", "PALLET": "PAL-GHOST", "QTY_PICKED": 6,
+         "ITEM_NUMBER": "AAA", "BASE_ID": "AAA"}])
+    rec = TX.reconcile(act, led)
+    assert rec["totals"]["agree"] == 1
+    assert rec["totals"]["release_qty"] == 6
+    corr = TX.ledger_corrections(rec)
+    ghost = corr[corr["PALLET"] == "PAL-GHOST"].iloc[0]
+    assert float(ghost["QTY_PICKED"]) == -6      # negative = handed back
+
+
+def test_reconcile_consumes_a_pallet_the_system_never_chose():
+    act = TX.normalize(_legs(), "CL01")
+    led = pd.DataFrame([{"DOC_NUMBER": "INV1", "PALLET": "PAL-OTHER",
+                         "QTY_PICKED": 10, "ITEM_NUMBER": "AAA", "BASE_ID": "AAA"}])
+    rec = TX.reconcile(act, led)
+    assert rec["totals"]["consume_qty"] == 10
+    assert rec["totals"]["release_qty"] == 10
+    corr = TX.ledger_corrections(rec)
+    assert float(corr.loc[corr["PALLET"] == "PAL-A", "QTY_PICKED"].iat[0]) == 10
+    assert float(corr.loc[corr["PALLET"] == "PAL-OTHER", "QTY_PICKED"].iat[0]) == -10
+
+
+def test_a_load_not_in_this_system_is_left_alone():
+    act = TX.normalize(_legs(), "CL01")
+    led = pd.DataFrame([{"DOC_NUMBER": "SOMETHING-ELSE", "PALLET": "P", "QTY_PICKED": 1,
+                         "ITEM_NUMBER": "AAA", "BASE_ID": "AAA"}])
+    rec = TX.reconcile(act, led)
+    assert rec["unknown"] == ["INV1"]
+    assert not len(rec["rows"])
+
+
+def test_a_revision_suffix_still_matches_its_load():
+    legs = _legs().assign(**{"Control Number": "CL01-INV1-A"})
+    act = TX.normalize(legs, "CL01")
+    led = pd.DataFrame([{"DOC_NUMBER": "INV1", "PALLET": "PAL-A", "QTY_PICKED": 10,
+                         "ITEM_NUMBER": "AAA", "BASE_ID": "AAA"}])
+    assert TX.reconcile(act, led)["loads"] == {"INV1-A": "INV1"}
+
+
+def test_the_real_report_reads_and_reconciles():
+    raw = pd.read_excel("/mnt/user-data/uploads/Transactions_History_Report.xlsx",
+                        dtype=str)
+    act = TX.normalize(raw, "INM0DONA")
+    assert len(act) and (act["PALLET"] != "").all()
+    one = act[act["LOAD_ID"] == "333262712295"]
+    assert float(one["QTY"].sum()) == 130        # 467 before the chains collapse

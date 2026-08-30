@@ -26,10 +26,11 @@ import pandas as pd
 
 import invoice_register as R
 import pick_engine as E
+import transactions as T
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 12
+API = 13
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -47,8 +48,13 @@ WS_SKU = "SKU_MASTER"
 WS_INV_SUM = "INVOICE_SUMMARY"
 WS_INV_DET = "INVOICE_DETAIL"
 WS_LOCK = "_LOCKS"
+WS_COMPLETE = "COMPLETED_LOADS"
+WS_ACTUAL = "ACTUAL_PICKS"
 
 LEDGER_COLS = E.ALLOC_COLS
+COMPLETE_COLS = ["LOAD_ID", "DOC_TYPE", "COMPLETED_AT", "COMPLETED_BY", "DOC_QTY",
+                 "PICKED_QTY", "ACTUAL_QTY", "PALLETS_RELEASED", "QTY_RELEASED",
+                 "SOURCE", "NOTE"]
 REGISTRY_COLS = ["DOC_NUMBER", "DOC_TYPE", "DOC_DATE", "REF_NUMBER", "DOC_CHECK",
                  "LINES", "WMS_LINES", "DOC_QTY", "PICKED_QTY", "WMS_QTY", "VERIFY",
                  "PALLETS", "PLANTS", "RUN_ID", "PROCESSED_AT", "SOURCE_FILE",
@@ -73,6 +79,8 @@ _SHEETS = {
     WS_SKU: SKU_COLS,
     WS_INV_SUM: R.SUMMARY_COLS,
     WS_INV_DET: R.DETAIL_COLS,
+    WS_COMPLETE: COMPLETE_COLS,
+    WS_ACTUAL: T.ACTUAL_COLS,
     WS_SETTINGS: ["KEY", "VALUE", "UPDATED_AT"],
     WS_LOCK: LOCK_COLS,
 }
@@ -1016,6 +1024,103 @@ def apply_sales_report(sa_info: dict, sheet_key: str, sales_df,
 
 
 # --------------------------------------------------------------------------- #
+# Completing a load  ·  what the floor actually picked
+# --------------------------------------------------------------------------- #
+def read_completed(sa_info: dict, sheet_key: str, fresh: bool = False) -> pd.DataFrame:
+    return read_ws(sa_info, sheet_key, WS_COMPLETE, use_cache=not fresh)
+
+
+def read_actuals(sa_info: dict, sheet_key: str, fresh: bool = False) -> pd.DataFrame:
+    return read_ws(sa_info, sheet_key, WS_ACTUAL, use_cache=not fresh)
+
+
+def complete_load(sa_info: dict, sheet_key: str, load_id: str, owner: str = "",
+                  corrections: pd.DataFrame | None = None,
+                  note: str = "", actual_qty: float | None = None) -> dict[str, Any]:
+    """
+    Close a load without losing it.
+
+    Delete throws the order away and hands the whole reservation back. Complete
+    keeps every row — master, detail, ledger, registry — because the load left
+    the building and the record has to stand. What it does hand back is the
+    pallet quantity the load reserved but never used, which is the only part
+    that is still really on the rack.
+
+    A load already completed is not completed twice; the corrections would be
+    applied a second time and the balance would drift.
+    """
+    lid = str(load_id).strip()
+    with sheet_lock(sa_info, sheet_key, "COMPLETE", owner=owner):
+        book = open_book(sa_info, sheet_key)
+        done = read_ws(sa_info, sheet_key, WS_COMPLETE, use_cache=False)
+        if len(done) and lid in set(done["LOAD_ID"].astype(str).str.strip()):
+            return {"ok": False, "reason": "already completed", "released": 0}
+
+        reg = read_ws(sa_info, sheet_key, WS_REGISTRY, use_cache=False)
+        row = reg[reg["DOC_NUMBER"].astype(str).str.strip() == lid] if len(reg) \
+            else pd.DataFrame()
+        n_pal = qty_rel = 0.0
+        if corrections is not None and len(corrections):
+            back = corrections[pd.to_numeric(corrections["QTY_PICKED"],
+                                             errors="coerce").fillna(0) < 0]
+            n_pal = int(len(back))
+            qty_rel = float(-pd.to_numeric(back["QTY_PICKED"],
+                                           errors="coerce").fillna(0).sum())
+            ws = _ensure(book, WS_LEDGER, LEDGER_COLS)
+            _append(ws, corrections, LEDGER_COLS)
+
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rec = pd.DataFrame([{
+            "LOAD_ID": lid,
+            "DOC_TYPE": str(row.iloc[0]["DOC_TYPE"]) if len(row) else "",
+            "COMPLETED_AT": stamp, "COMPLETED_BY": owner,
+            "DOC_QTY": str(row.iloc[0]["DOC_QTY"]) if len(row) else "",
+            "PICKED_QTY": str(row.iloc[0].get("TOTAL_PICKED",
+                                              row.iloc[0]["PICKED_QTY"]))
+            if len(row) else "",
+            "ACTUAL_QTY": "" if actual_qty is None else f"{float(actual_qty):g}",
+            "PALLETS_RELEASED": n_pal, "QTY_RELEASED": f"{qty_rel:g}",
+            "SOURCE": "Transactions report" if corrections is not None
+                      and len(corrections) else "Manual",
+            "NOTE": str(note or "")[:300],
+        }], columns=COMPLETE_COLS)
+        _append(_ensure(book, WS_COMPLETE, COMPLETE_COLS), rec, COMPLETE_COLS)
+    cache_clear(sheet_key)
+    return {"ok": True, "released": n_pal, "qty_released": qty_rel}
+
+
+def save_actuals(sa_info: dict, sheet_key: str, actual: pd.DataFrame,
+                 owner: str = "") -> int:
+    """Keep what the floor really picked, replacing any earlier read of the
+    same loads so a re-upload does not double the history."""
+    if actual is None or not len(actual):
+        return 0
+    with sheet_lock(sa_info, sheet_key, "ACTUALS", owner=owner):
+        book = open_book(sa_info, sheet_key)
+        old = read_ws(sa_info, sheet_key, WS_ACTUAL, use_cache=False)
+        loads = {str(x) for x in actual["LOAD_ID"]}
+        if len(old) and "LOAD_ID" in old.columns:
+            old = old[~old["LOAD_ID"].astype(str).isin(loads)]
+        merged = pd.concat([old.reindex(columns=T.ACTUAL_COLS),
+                            actual.reindex(columns=T.ACTUAL_COLS)], ignore_index=True)
+        n = write_table(book, WS_ACTUAL, T.ACTUAL_COLS, merged, prev_rows=len(old))
+    cache_clear(sheet_key)
+    return n
+
+
+def apply_corrections(sa_info: dict, sheet_key: str, corrections: pd.DataFrame,
+                      owner: str = "") -> int:
+    """Write the pallet balance corrections into the ledger as ordinary rows."""
+    if corrections is None or not len(corrections):
+        return 0
+    with sheet_lock(sa_info, sheet_key, "RECON", owner=owner):
+        book = open_book(sa_info, sheet_key)
+        _append(_ensure(book, WS_LEDGER, LEDGER_COLS), corrections, LEDGER_COLS)
+    cache_clear(sheet_key)
+    return len(corrections)
+
+
+# --------------------------------------------------------------------------- #
 # reset
 # --------------------------------------------------------------------------- #
 RESET_SCOPES = {
@@ -1026,6 +1131,8 @@ RESET_SCOPES = {
     "runlog": [WS_RUNLOG],
     "sku": [WS_SKU],
     "register": [WS_INV_SUM, WS_INV_DET],
+    "completed": [WS_COMPLETE],
+    "actuals": [WS_ACTUAL],
     "settings": [WS_SETTINGS],
 }
 

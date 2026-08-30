@@ -704,6 +704,56 @@ pick වුණාම register එක `Yes` කරනවා, dashboard එකෙ�
 
 ---
 
+## Order complete, and what the floor actually picked
+
+### Complete is not delete
+
+| | Record | Pallet balance |
+|---|---|---|
+| **Delete** | every row removed — master, detail, ledger, registry | the **whole** reservation comes back, the document can be picked again |
+| **Order complete** | every row **kept** — the load left the building and the record has to stand | only the quantity this load reserved but **never used** comes back |
+
+Loads tab → **Order complete**. A load is never completed twice; the corrections
+would be applied a second time and the balance would drift.
+
+### The Transactions History Report
+
+The ledger holds the pallets the system *chose*. The picker may well have taken
+others. Until the two are put side by side, a pallet nobody touched stays locked
+out of every later pick, and a pallet that really was emptied still looks full.
+
+Tab: **Actual picks**. Upload the WMS report and press **Compare with the ledger**.
+
+* `Control Number` carries the load — `INM0DONA-333262712295` is load
+  `333262712295`, `INM0DONA-333/26-27/17` is `333/26-27/17`. A revision suffix
+  (`…298-A`, `…321A`) matches back to its load; nothing else is guessed.
+* `Starting Hu` is the pallet the stock actually came off.
+* **A pallet moves rack → picker → staging → dock, and every leg is a row.**
+  Summing them multiplies the pick by three or four — one load in the sample
+  report reads 467 units flat and **130** once the chains are collapsed back to
+  the single movement that took stock out of storage. A genuine second pick off
+  the same pallet starts somewhere new, so it survives.
+
+Each pallet lands in one of four outcomes:
+
+| Outcome | Meaning |
+|---|---|
+| `AGREES` | reserved and taken match |
+| `RELEASE` | the system reserved it, the floor never touched it — goes back on the rack |
+| `CONSUME` | the floor took it, the system does not know — comes off the rack |
+| `ADJUST` | the same pallet, a different quantity |
+
+**Picked twice** lists any pallet appearing on more than one of the matched
+loads. Sometimes that is right — a pallet can serve two orders — but it is also
+what a double pick looks like.
+
+Corrections are written into the ledger as ordinary rows with a **negative
+quantity** where stock is handed back, so the running balance stays a plain sum
+and nothing downstream needs to know those rows are different. Apply them once —
+either from this tab, or by completing the load and letting that apply them.
+
+Worksheets: `COMPLETED_LOADS` · `ACTUAL_PICKS`. Press **Set up worksheets** once.
+
 ## Partial pick — how much of a short line goes out
 
 A short document can be sent two ways. The offer shows both numbers so the
