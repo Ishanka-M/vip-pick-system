@@ -24,12 +24,13 @@ from doc_parser import base_item, clean_item
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 3
+API = 8
 
 QTY_TOL = 1e-6
 
-ACTUAL_COLS = ["LOAD_ID", "CONTROL_NUMBER", "PALLET", "ITEM_NUMBER", "BASE_ID",
-               "LOT_NUMBER", "QTY", "FROM_LOC", "TO_LOC", "WHEN", "EMPLOYEE"]
+ACTUAL_COLS = ["LOAD_ID", "CONTROL_NUMBER", "PALLET", "TO_PALLET", "HU_SOURCE",
+               "ITEM_NUMBER", "BASE_ID", "LOT_NUMBER", "QTY", "FROM_LOC", "TO_LOC",
+               "WHEN", "EMPLOYEE"]
 
 RECON_COLS = ["LOAD_ID", "PALLET", "ITEM_NUMBER", "BASE_ID", "SYSTEM_QTY",
               "ACTUAL_QTY", "DIFF", "OUTCOME", "NOTE"]
@@ -120,8 +121,15 @@ def _collapse_chains(df: pd.DataFrame) -> pd.DataFrame:
     return d[pd.Series(keep, index=d.index)].drop(columns=["_t"])
 
 
+# A receipt, not a pick. The marker can sit anywhere a separator puts it —
+# `PO-342258027`, `3332627/STN-002`, `GRN-...` — so match on the separator
+# rather than only at the front.
+INBOUND = re.compile(r"(?:^|[-/])(?:PO|STN|GRN|ASN)(?=[-/\s\d]|$)", re.I)
+
+
 def normalize(raw: pd.DataFrame, client_code: str = "",
-              picks_only: bool = True, collapse: bool = True) -> pd.DataFrame:
+              picks_only: bool = True, collapse: bool = True,
+              drop_inbound: bool = True) -> pd.DataFrame:
     """
     The report as this app needs it.
 
@@ -142,6 +150,8 @@ def normalize(raw: pd.DataFrame, client_code: str = "",
     out = pd.DataFrame()
     out["CONTROL_NUMBER"] = df[cn].astype(str).str.strip()
     out["PALLET"] = df[hu].astype(str).str.strip()
+    eh = _col(df, "to_hu")
+    out["TO_PALLET"] = df[eh].astype(str).str.strip() if eh else ""
     for key, col in (("ITEM_NUMBER", "item_number"), ("LOT_NUMBER", "lot_number"),
                      ("FROM_LOC", "from_loc"), ("TO_LOC", "to_loc"),
                      ("WHEN", "when"), ("EMPLOYEE", "employee")):
@@ -161,13 +171,32 @@ def normalize(raw: pd.DataFrame, client_code: str = "",
     out["BASE_ID"] = out["ITEM_NUMBER"].map(base_item)
 
     blank = {"nan", "none", "nat", "<na>", ""}
-    for c in ("PALLET", "ITEM_NUMBER", "LOT_NUMBER", "FROM_LOC", "TO_LOC",
-              "WHEN", "EMPLOYEE", "LOAD_ID", "CONTROL_NUMBER", "BASE_ID"):
-        out[c] = out[c].astype(str).str.strip()
+    for c in ("PALLET", "TO_PALLET", "ITEM_NUMBER", "LOT_NUMBER", "FROM_LOC",
+              "TO_LOC", "WHEN", "EMPLOYEE", "LOAD_ID", "CONTROL_NUMBER", "BASE_ID"):
+        # pandas keeps a missing value as pd.NA under the string dtype, so
+        # astype(str) leaves it NA rather than "nan" and every comparison after
+        # it goes three-valued. fillna first, then everything is a real string.
+        out[c] = out[c].astype("string").fillna("").astype(str).str.strip()
         out.loc[out[c].str.lower().isin(blank), c] = ""
+    # `Starting Hu` is the pallet the stock came off, and it is the one the
+    # inventory knows — 97% of outbound rows where the two differ, against 34%
+    # for `Ending Hu`, and the leftover provably stays on it: pallet E-13 still
+    # holds 25 after the pick, while E-13A is nowhere in the stock file.
+    #
+    # But some picks are written with no `Starting Hu` at all — 130 rows across
+    # real invoice and challan loads in the sample report. Dropping those loses
+    # a genuine pick, so the `Ending Hu` stands in, and `HU_SOURCE` records
+    # which column the pallet came from.
+    out["HU_SOURCE"] = "Starting Hu"
+    fill = out["PALLET"] == ""
+    out.loc[fill, "PALLET"] = out.loc[fill, "TO_PALLET"]
+    out.loc[fill & (out["PALLET"] != ""), "HU_SOURCE"] = "Ending Hu"
     if picks_only:
         out = out[(out["PALLET"] != "") & (out["LOAD_ID"] != "")
                   & (out["QTY"] > QTY_TOL)]
+    if picks_only and drop_inbound:
+        # a purchase order or stock transfer is a receipt, not a pick
+        out = out[~out["LOAD_ID"].str.contains(INBOUND, na=False)]
     out = out[ACTUAL_COLS]
     if collapse:
         out = _collapse_chains(out)
@@ -210,9 +239,9 @@ def reconcile(actual: pd.DataFrame, ledger: pd.DataFrame,
     Returns the per-pallet table, plus the two frames that matter — the pallet
     quantity to give back, and the pallet quantity to take away.
     """
-    empty = {"rows": pd.DataFrame(columns=RECON_COLS + KEY_COLS),
-             "release": pd.DataFrame(columns=RECON_COLS + KEY_COLS),
-             "consume": pd.DataFrame(columns=RECON_COLS + KEY_COLS),
+    empty = {"rows": pd.DataFrame(columns=RECON_COLS + KEY_COLS + ["BINDS"]),
+             "release": pd.DataFrame(columns=RECON_COLS + KEY_COLS + ["BINDS"]),
+             "consume": pd.DataFrame(columns=RECON_COLS + KEY_COLS + ["BINDS"]),
              "loads": {}, "unknown": [], "totals": {}}
     if actual is None or not len(actual) or ledger is None or not len(ledger):
         return empty
@@ -268,17 +297,38 @@ def reconcile(actual: pd.DataFrame, ledger: pd.DataFrame,
         m[c] = m[c].fillna("") if c in m.columns else ""
     m["QTY_BEFORE"] = pd.to_numeric(m["QTY_BEFORE"], errors="coerce").fillna(0.0)
 
-    # A pallet the system never chose has no ledger row to borrow keys from.
-    # `keys` — the stock basis — supplies them so the correction still binds.
+    # A pallet the system never chose for *this* load has no ledger row here to
+    # borrow keys from — and a correction without keys binds to nothing and moves
+    # no stock. Two more places know that pallet: the current inventory (`keys`,
+    # the better source, because it is what the balance is measured against) and
+    # the rest of the ledger, where the pallet may sit under another load.
+    pool = []
     if keys is not None and len(keys):
-        k = keys.copy()
-        k["PALLET"] = k["PALLET"].astype(str).str.strip()
-        k = k.drop_duplicates(subset=["PALLET"], keep="first").set_index("PALLET")
+        pool.append(keys)
+    pool.append(ledger)                       # every load, not just these
+    look = pd.concat([p.reindex(columns=["PALLET"] + KEY_COLS) for p in pool
+                      if p is not None and len(p)], ignore_index=True)
+    if len(look):
+        look["PALLET"] = look["PALLET"].astype(str).str.strip()
+        look = look[look["PALLET"] != ""]
+        look["_rk"] = look["ROW_KEY"].astype(str).str.strip()
+        look = (look.sort_values("_rk", ascending=False)      # a real key beats a blank
+                    .drop_duplicates(subset=["PALLET"], keep="first")
+                    .set_index("PALLET"))
         for c in KEY_COLS:
-            if c not in k.columns:
+            if c not in look.columns:
                 continue
-            miss = m[c].astype(str).str.strip() == ""
-            m.loc[miss, c] = m.loc[miss, "PALLET"].map(k[c]).fillna("")
+            miss = m[c].astype(str).str.strip().isin(["", "0", "0.0"]) \
+                if c == "QTY_BEFORE" else m[c].astype(str).str.strip() == ""
+            m.loc[miss, c] = m.loc[miss, "PALLET"].map(look[c]).fillna(
+                0.0 if c == "QTY_BEFORE" else "")
+        m["QTY_BEFORE"] = pd.to_numeric(m["QTY_BEFORE"], errors="coerce").fillna(0.0)
+
+    # A row with no key at all is a record, not a movement — say so rather than
+    # writing something that quietly does nothing.
+    m["BINDS"] = ((m["ROW_KEY"].astype(str).str.strip() != "")
+                  | (m["LOT_NUMBER"].astype(str).str.strip() != "")).map(
+                      {True: "yes", False: "no"})
 
     def _outcome(r) -> tuple[str, str]:
         sysq, actq = float(r["SYSTEM_QTY"]), float(r["ACTUAL_QTY"])
@@ -294,8 +344,8 @@ def reconcile(actual: pd.DataFrame, ledger: pd.DataFrame,
 
     got = m.apply(_outcome, axis=1, result_type="expand")
     m["OUTCOME"], m["NOTE"] = got[0], got[1]
-    rows = m[RECON_COLS + KEY_COLS].sort_values(["LOAD_ID", "OUTCOME", "PALLET"]) \
-        .reset_index(drop=True)
+    rows = m[RECON_COLS + KEY_COLS + ["BINDS"]] \
+        .sort_values(["LOAD_ID", "OUTCOME", "PALLET"]).reset_index(drop=True)
 
     give_back = rows[rows["OUTCOME"].isin([RELEASE, SHORT_TAKE])].copy()
     take_away = rows[rows["OUTCOME"].isin([CONSUME, OVER_TAKE])].copy()
@@ -307,6 +357,8 @@ def reconcile(actual: pd.DataFrame, ledger: pd.DataFrame,
             "loads": len(set(pairs.values())),
             "pallets": int(len(rows)),
             "agree": int((rows["OUTCOME"] == AGREES).sum()),
+            "unbound": int(((rows["BINDS"] == "no")
+                            & (rows["OUTCOME"] != AGREES)).sum()),
             "release_qty": float((give_back["SYSTEM_QTY"]
                                   - give_back["ACTUAL_QTY"]).sum()),
             "consume_qty": float((take_away["ACTUAL_QTY"]

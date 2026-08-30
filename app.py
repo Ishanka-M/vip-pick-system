@@ -56,8 +56,8 @@ _GS_API = getattr(_gs_mod, "API", 0)
 # next file, and the answer is always the same — replace the whole set.
 _NEEDS = {"pick_engine.py": (E, 8), "doc_parser.py": (P, 8), "pick_pdf.py": (PP, 6),
           "sku_master.py": (SKU, 3), "ui.py": (ui, 3),
-          "invoice_register.py": (R, 17), "transactions.py": (TX, 1),
-          "gsheet.py": (_gs_mod, 13)}
+          "invoice_register.py": (R, 17), "transactions.py": (TX, 8),
+          "gsheet.py": (_gs_mod, 14)}
 _ALL = [(f, getattr(m, "API", 0), n) for f, (m, n) in _NEEDS.items() if m is not None]
 _STALE = [(f, have, need) for f, have, need in _ALL if have < need]
 if _STALE:
@@ -1488,7 +1488,14 @@ with tab_actual:
         m3.metric("Units", f"{float(act['QTY'].sum()):g}")
         st.caption("A pallet moves rack → picker → staging → dock, and every leg "
                    "is a row. Those chains are collapsed back to the one movement "
-                   "that took stock out of storage, so nothing is counted twice.")
+                   "that took stock out of storage, so nothing is counted twice. "
+                   "The pallet is `Starting Hu` — the one the stock came off and "
+                   "the one the stock file knows — falling back to `Ending Hu` "
+                   "where the pick was written without a starting HU.")
+        _src = act["HU_SOURCE"].value_counts().to_dict()
+        if _src.get("Ending Hu"):
+            st.caption(f"{_src['Ending Hu']} movement(s) had no `Starting Hu`; the "
+                       "`Ending Hu` was used. `HU_SOURCE` on each row says which.")
 
         led = pd.DataFrame()
         if gs_ready:
@@ -1506,8 +1513,13 @@ with tab_actual:
         else:
             if st.button("Compare with the ledger", type="primary"):
                 with st.spinner("Matching loads..."):
-                    st.session_state["recon"] = TX.reconcile(act, led,
-                                                             client_code=client_code)
+                    _keys = None
+                    if st.session_state.get("result"):
+                        _keys = st.session_state["result"].get("basis")
+                    elif st.session_state.get("inv_raw") is not None:
+                        _keys = E.stock_view(st.session_state["inv_raw"])
+                    st.session_state["recon"] = TX.reconcile(
+                        act, led, client_code=client_code, keys=_keys)
                 st.rerun()
 
             rec = st.session_state.get("recon")
@@ -1519,7 +1531,16 @@ with tab_actual:
                 k3.metric("To release", f"{t.get('release_qty', 0):g}",
                           help="Reserved by the system, never touched on the floor.")
                 k4.metric("To consume", f"{t.get('consume_qty', 0):g}",
-                          help="Taken on the floor, the system does not know.")
+                          help="Taken on the floor, the system does not know. "
+                               "A pallet this load never reserved is written "
+                               "against the load all the same.")
+                if t.get("unbound"):
+                    st.warning(
+                        f"{t['unbound']} pallet(s) could not be matched to a stock "
+                        "row — no lot, and nothing in the inventory or the ledger to "
+                        "match them by. They are recorded against the load, but they "
+                        "will **not** change a balance. Load the inventory report on "
+                        "the Pick tab and compare again to bind them.")
                 if rec["unknown"]:
                     st.caption(f"{len(rec['unknown'])} load(s) in the report are not "
                                f"in this system — ignored: "
@@ -1530,7 +1551,9 @@ with tab_actual:
                     st.dataframe(rec["rows"], hide_index=True, width="stretch",
                                  height=380)
                 with v2:
-                    st.caption("These go back on the rack.")
+                    st.caption("These go back on the rack. `BINDS` says whether the "
+                               "correction can reach a stock row — `no` means it is "
+                               "filed as a record only.")
                     st.dataframe(rec["release"], hide_index=True, width="stretch",
                                  height=300)
                 with v3:
@@ -1570,8 +1593,10 @@ with tab_actual:
                         n = gsheet.apply_corrections(sa_info, sheet_key, corr,
                                                      owner=USER)
                         gsheet.save_actuals(sa_info, sheet_key, act, owner=USER)
-                        st.toast(f"{n} correction(s) written", icon="🧾")
-                        st.session_state.pop("recon", None)
+                        st.toast(f"{n} correction(s) written" if n
+                                 else "Already applied — nothing written", icon="🧾")
+                        for _k in ("recon", "recon_corrections"):
+                            st.session_state.pop(_k, None)
                         st.rerun()
                     except Exception as ex:
                         st.error(f"Apply failed: {ex}")

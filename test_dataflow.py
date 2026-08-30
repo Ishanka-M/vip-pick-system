@@ -1123,3 +1123,117 @@ def test_every_written_frame_fits_its_worksheet_header():
                       (G.WS_INV_SUM, s_df), (G.WS_INV_DET, d_df)):
         extra = set(df.columns) - set(G._SHEETS[title])
         assert not extra, f"{title} would drop {sorted(extra)}"
+
+
+def test_a_pallet_the_system_never_chose_is_written_against_the_load():
+    """Consume: the floor took a pallet this load never reserved."""
+    act = pd.DataFrame([{"LOAD_ID": "L1", "CONTROL_NUMBER": "C", "PALLET": "P9",
+                         "ITEM_NUMBER": "AAA", "BASE_ID": "AAA", "LOT_NUMBER": "",
+                         "QTY": 6.0, "FROM_LOC": "R", "TO_LOC": "S", "WHEN": "",
+                         "EMPLOYEE": ""}])
+    led = pd.DataFrame([{"DOC_NUMBER": "L1", "PALLET": "P1", "ITEM_NUMBER": "AAA",
+                         "LOT_NUMBER": "LOT1", "QTY_BEFORE": 10, "QTY_PICKED": 6,
+                         "QTY_BALANCE": 4, "ROW_KEY": "P1|A|AAA|LOT1|",
+                         "BASE_ID": "AAA", "LOCATION_ID": "A", "PLANT": "PL1",
+                         "UOM": "EA", "RUN_ID": "R1"}])
+    keys = pd.DataFrame([{"PALLET": "P9", "ROW_KEY": "P9|B|AAA|LOT7|",
+                          "LOT_NUMBER": "LOT7", "LOCATION_ID": "B", "PLANT": "PL1",
+                          "UOM": "EA", "QTY_BEFORE": 20}])
+    rec = TX.reconcile(act, led, keys=keys)
+    corr = TX.ledger_corrections(rec)
+    p9 = corr[corr["PALLET"] == "P9"].iloc[0]
+    assert p9["DOC_NUMBER"] == "L1"            # filed against the load
+    assert float(p9["QTY_PICKED"]) == 6        # positive = comes off the rack
+    assert p9["ROW_KEY"] == "P9|B|AAA|LOT7|"   # and it binds to the stock row
+    assert rec["totals"]["unbound"] == 0
+
+
+def test_an_unknown_pallet_borrows_its_keys_from_the_wider_ledger():
+    act = pd.DataFrame([{"LOAD_ID": "L1", "CONTROL_NUMBER": "C", "PALLET": "P9",
+                         "ITEM_NUMBER": "AAA", "BASE_ID": "AAA", "LOT_NUMBER": "",
+                         "QTY": 6.0, "FROM_LOC": "R", "TO_LOC": "S", "WHEN": "",
+                         "EMPLOYEE": ""}])
+    led = pd.DataFrame([
+        {"DOC_NUMBER": "L1", "PALLET": "P1", "ITEM_NUMBER": "AAA", "LOT_NUMBER": "LOT1",
+         "QTY_BEFORE": 10, "QTY_PICKED": 6, "QTY_BALANCE": 4,
+         "ROW_KEY": "P1|A|AAA|LOT1|", "BASE_ID": "AAA", "LOCATION_ID": "A",
+         "PLANT": "PL1", "UOM": "EA", "RUN_ID": "R1"},
+        # P9 went out on another load once — the ledger still knows its keys
+        {"DOC_NUMBER": "OLD", "PALLET": "P9", "ITEM_NUMBER": "AAA",
+         "LOT_NUMBER": "LOT7", "QTY_BEFORE": 20, "QTY_PICKED": 2, "QTY_BALANCE": 18,
+         "ROW_KEY": "P9|B|AAA|LOT7|", "BASE_ID": "AAA", "LOCATION_ID": "B",
+         "PLANT": "PL1", "UOM": "EA", "RUN_ID": "R0"}])
+    corr = TX.ledger_corrections(TX.reconcile(act, led))
+    after = PE.ledger_state(pd.concat([led, corr], ignore_index=True))[0]
+    assert after["P9|B|AAA|LOT7|"]["balance"] == 12      # 18 - 6, really moved
+
+
+def test_a_pallet_nobody_can_identify_is_flagged_not_silently_ignored():
+    act = pd.DataFrame([{"LOAD_ID": "L1", "CONTROL_NUMBER": "C", "PALLET": "GHOST",
+                         "ITEM_NUMBER": "AAA", "BASE_ID": "AAA", "LOT_NUMBER": "",
+                         "QTY": 6.0, "FROM_LOC": "R", "TO_LOC": "S", "WHEN": "",
+                         "EMPLOYEE": ""}])
+    led = pd.DataFrame([{"DOC_NUMBER": "L1", "PALLET": "P1", "ITEM_NUMBER": "AAA",
+                         "LOT_NUMBER": "LOT1", "QTY_BEFORE": 10, "QTY_PICKED": 6,
+                         "QTY_BALANCE": 4, "ROW_KEY": "P1|A|AAA|LOT1|",
+                         "BASE_ID": "AAA", "LOCATION_ID": "A", "PLANT": "PL1",
+                         "UOM": "EA", "RUN_ID": "R1"}])
+    rec = TX.reconcile(act, led)
+    ghost = rec["rows"][rec["rows"]["PALLET"] == "GHOST"].iloc[0]
+    assert ghost["BINDS"] == "no"
+    assert rec["totals"]["unbound"] == 1        # the UI warns instead of pretending
+
+
+def _tx_row(**kw):
+    base = {"Control Number": "CL01-INV1", "Starting Hu": "PAL-A", "Ending Hu": "PAL-A",
+            "Item Number": "CL01-AAA", "Tran Qty": "10", "Starting Loc": "RACK-1",
+            "Ending Loc": "PICKER", "End Tran Date": "12-08-2026 10:00:00",
+            "Employee Id": "PICKER", "Client Code": "CL01", "Lot Number": "L"}
+    base.update(kw)
+    return base
+
+
+def test_the_pallet_is_the_one_the_stock_came_off():
+    """A split pick: stock leaves PAL-A and lands on a new HU. PAL-A is the one
+    whose balance moves — the stock file has never heard of PAL-A-NEW."""
+    act = TX.normalize(pd.DataFrame([_tx_row(**{"Ending Hu": "PAL-A-NEW"})]), "CL01")
+    assert act.iloc[0]["PALLET"] == "PAL-A"
+    assert act.iloc[0]["TO_PALLET"] == "PAL-A-NEW"
+    assert act.iloc[0]["HU_SOURCE"] == "Starting Hu"
+
+
+def test_a_pick_written_without_a_starting_hu_still_counts():
+    """130 rows on real loads in the sample report look like this. Dropping them
+    loses a genuine pick."""
+    act = TX.normalize(pd.DataFrame([_tx_row(**{"Starting Hu": None,
+                                                "Ending Hu": "PAL-B"})]), "CL01")
+    assert len(act) == 1
+    assert act.iloc[0]["PALLET"] == "PAL-B"
+    assert act.iloc[0]["HU_SOURCE"] == "Ending Hu"
+
+
+def test_a_missing_value_is_a_blank_not_the_word_nan():
+    """Under the string dtype a missing value stays pd.NA, so every comparison
+    after astype(str) goes three-valued and blank rows slip through."""
+    act = TX.normalize(pd.DataFrame([_tx_row(**{"Starting Hu": None,
+                                                "Ending Hu": None})]), "CL01")
+    assert not len(act)                     # no pallet at all — not a pick
+
+
+def test_a_receipt_is_not_a_pick():
+    rows = [_tx_row(**{"Control Number": "CL01-PO-9912", "Starting Hu": None,
+                       "Ending Hu": "PAL-C"}),
+            _tx_row(**{"Control Number": "CL01-3332627/STN-002", "Starting Hu": None,
+                       "Ending Hu": "PAL-D"}),
+            _tx_row()]
+    act = TX.normalize(pd.DataFrame(rows), "CL01")
+    assert set(act["LOAD_ID"]) == {"INV1"}
+
+
+def test_the_real_report_keeps_the_picks_written_on_the_ending_hu():
+    raw = pd.read_excel("/mnt/user-data/uploads/Transactions_History_Report.xlsx",
+                        dtype=str)
+    act = TX.normalize(raw, "INM0DONA")
+    assert not act["PALLET"].isna().any() and (act["PALLET"] != "").all()
+    assert (act["HU_SOURCE"] == "Ending Hu").sum() > 0
+    assert float(act[act["LOAD_ID"] == "333262712295"]["QTY"].sum()) == 130

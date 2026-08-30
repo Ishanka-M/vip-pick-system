@@ -742,6 +742,70 @@ Re-comparing after applying was already safe on its own — the system quantity
 reads the corrected figure, the outcome comes back `AGREES` and nothing is
 written.
 
+## Which HU is the pallet
+
+`Starting Hu` is the pallet the stock came off, and it is the one the stock file
+knows. Where the two columns differ on an outbound pick, `Starting Hu` is in the
+inventory **97%** of the time against 34% for `Ending Hu` — and the leftover
+provably stays on it: after picking 2 off `DONAL060826-E-13`, the stock file
+still shows 25 on `E-13`, while `E-13A` is nowhere in it. So the balance belongs
+to `Starting Hu`.
+
+`Ending Hu` is kept as `TO_PALLET` all the same. On a split pick
+(`DONAL060826-E-13 → DONAL060826-E-13A`, `DONAL070826-B-17 → DONA-000001`) that
+is the HU the picked stock left on, which is what the driver has in his hand.
+
+**Some picks are written with no `Starting Hu` at all** — 130 rows across real
+invoice and challan loads in the sample report, and 1,612 movements once the
+whole file is read. Those were being dropped, so a genuine pick simply vanished.
+The `Ending Hu` now stands in, and `HU_SOURCE` on every row records which column
+the pallet came from.
+
+Two things came out of chasing that:
+
+**A missing value is not the word "nan".** Under the string dtype pandas keeps it
+as `pd.NA`, so `astype(str)` leaves it `NA` rather than `"nan"`, every
+comparison after that goes three-valued, and the blank filter quietly passed
+those rows through with a `NaN` pallet. They then survived `PALLET != ""`,
+because `NaN != ""` is true.
+
+**A receipt is not a pick.** `PO-342258027` and `3332627/STN-002` are goods
+coming in. They have no `Starting Hu` either, so the fallback above would have
+turned every receipt into a pick against a load that does not exist. They are
+matched on the separator — start, `-` or `/` — and left out.
+
+## A pallet the system never chose
+
+The floor takes what is in front of it. When the report shows a pallet this load
+never reserved, it **is** written to the database against that load — a
+`PALLET_LEDGER` row with the load in `DOC_NUMBER`, the pallet, and a positive
+quantity, plus the movement itself in `ACTUAL_PICKS`.
+
+For that row to do anything it has to reach a stock row. `ledger_state()` groups
+on `ROW_KEY`, falling back to `PALLET|ITEM|LOT` — and the report carries no lot,
+so a correction built from the report alone has the key `P9|AAA|` while the
+inventory holds `P9|AAA|LOT7`. They do not match, and the balance never moves.
+
+So the keys are looked for in three places, best first:
+
+1. the ledger rows for **this load** — the pick it is correcting
+2. the **inventory** (`reconcile(keys=…)`, taken from the stock basis) — what the
+   balance is actually measured against
+3. the **rest of the ledger** — the same pallet under another load still carries
+   its `ROW_KEY` and lot
+
+That covers a pallet the system never chose but the warehouse plainly knows.
+
+If none of the three can identify it, the row is still filed against the load,
+but `BINDS` reads `no`, the reconciliation counts it, and the screen says so:
+
+> *2 pallet(s) could not be matched to a stock row — they are recorded against
+> the load, but they will not change a balance.*
+
+A record that quietly moves nothing is worse than one that says it did nothing.
+Loading the inventory report on the Pick tab and comparing again usually binds
+them.
+
 ## Order complete, and what the floor actually picked
 
 ### Complete is not delete
