@@ -704,6 +704,44 @@ pick වුණාම register එක `Yes` කරනවා, dashboard එකෙ�
 
 ---
 
+## Data mapping — what was checked, and what was wrong
+
+Every frame the app writes was put against the header its worksheet declares.
+No column is produced that the header does not know, so nothing is silently
+dropped on write. `RUN_ID` and `PROCESSED_AT` are the only header columns not in
+the source frames — `save_run` stamps those at write time.
+
+Headers themselves are safe two ways: `init_sheet` writes one for every
+registered worksheet, and `sheet_header()` widens an older, shorter header by
+appending the missing columns **at the end**, so a value never lands under the
+wrong name when a release adds a column.
+
+Two real bugs came out of this pass, both in the reconciliation shipped just
+before it:
+
+**1 · The corrections moved no stock at all.**
+`ledger_state()` groups the ledger on `ROW_KEY`, falling back to
+`PALLET|ITEM|LOT`. The correction rows carried none of those — empty `ROW_KEY`,
+empty lot — so they grouped on their own and the pallet's balance never changed.
+A silent no-op: the sheet filled up with corrections and the stock stayed
+locked. The reconciliation now carries `ROW_KEY`, `LOT_NUMBER`, `LOCATION_ID`,
+`PLANT`, `UOM` and `QTY_BEFORE` through from the ledger row it is correcting, and
+`reconcile(keys=…)` borrows them from the stock basis for a pallet the system
+never chose. `QTY_BEFORE` is carried rather than zeroed, because `ledger_state`
+takes the **max** of it as the pallet's baseline and a zero would drag it down.
+
+**2 · Applying the same correction twice moved the stock twice.**
+Press *Apply to the ledger*, then *Mark order complete* with the same cached
+frame, and a pallet went `picked 20 → 15 → 10` — quietly gaining five units that
+were never on the rack. Every correction now carries a deterministic id,
+`RECON-<load>-<pallet>-<delta>`, and both writers drop anything the ledger
+already holds. A later, genuinely different adjustment has a different delta and
+its own id, so it still goes through.
+
+Re-comparing after applying was already safe on its own — the system quantity
+reads the corrected figure, the outcome comes back `AGREES` and nothing is
+written.
+
 ## Order complete, and what the floor actually picked
 
 ### Complete is not delete

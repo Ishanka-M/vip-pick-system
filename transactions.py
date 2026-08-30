@@ -24,7 +24,7 @@ from doc_parser import base_item, clean_item
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 1
+API = 3
 
 QTY_TOL = 1e-6
 
@@ -33,6 +33,12 @@ ACTUAL_COLS = ["LOAD_ID", "CONTROL_NUMBER", "PALLET", "ITEM_NUMBER", "BASE_ID",
 
 RECON_COLS = ["LOAD_ID", "PALLET", "ITEM_NUMBER", "BASE_ID", "SYSTEM_QTY",
               "ACTUAL_QTY", "DIFF", "OUTCOME", "NOTE"]
+
+# Carried through from the ledger so a correction lands on the *same* pallet the
+# original pick did. `ledger_state()` groups on ROW_KEY, falling back to
+# PALLET|ITEM|LOT — a correction without those keys groups on its own and moves
+# no stock at all, which is a silent no-op and the worst kind.
+KEY_COLS = ["ROW_KEY", "LOT_NUMBER", "LOCATION_ID", "PLANT", "UOM", "QTY_BEFORE"]
 
 # what an outcome means for the pallet balance
 RELEASE = "RELEASE — system reserved it, the floor never touched it"
@@ -195,8 +201,8 @@ def match_loads(actual: pd.DataFrame, known: list[str]) -> dict[str, str]:
 
 
 def reconcile(actual: pd.DataFrame, ledger: pd.DataFrame,
-              loads: list[str] | None = None,
-              client_code: str = "") -> dict[str, Any]:
+              loads: list[str] | None = None, client_code: str = "",
+              keys: pd.DataFrame | None = None) -> dict[str, Any]:
     """
     Pallet by pallet, for every load in both: what the system reserved against
     what the floor actually took.
@@ -204,9 +210,9 @@ def reconcile(actual: pd.DataFrame, ledger: pd.DataFrame,
     Returns the per-pallet table, plus the two frames that matter — the pallet
     quantity to give back, and the pallet quantity to take away.
     """
-    empty = {"rows": pd.DataFrame(columns=RECON_COLS),
-             "release": pd.DataFrame(columns=RECON_COLS),
-             "consume": pd.DataFrame(columns=RECON_COLS),
+    empty = {"rows": pd.DataFrame(columns=RECON_COLS + KEY_COLS),
+             "release": pd.DataFrame(columns=RECON_COLS + KEY_COLS),
+             "consume": pd.DataFrame(columns=RECON_COLS + KEY_COLS),
              "loads": {}, "unknown": [], "totals": {}}
     if actual is None or not len(actual) or ledger is None or not len(ledger):
         return empty
@@ -231,11 +237,25 @@ def reconcile(actual: pd.DataFrame, ledger: pd.DataFrame,
          .agg(ACTUAL_QTY=("QTY", "sum"), ITEM_NUMBER=("ITEM_NUMBER", "first"),
               BASE_ID=("BASE_ID", "first")).reset_index())
 
+    for c in KEY_COLS:
+        if c not in led.columns:
+            led[c] = ""
+    led["QTY_BEFORE"] = pd.to_numeric(led["QTY_BEFORE"], errors="coerce").fillna(0.0)
+
+    def _first_set(col: pd.Series) -> str:
+        for v in col:
+            if str(v or "").strip():
+                return str(v).strip()
+        return ""
+
     s = (led[led["DOC_NUMBER"].isin(set(pairs.values()))]
          .groupby(["DOC_NUMBER", "PALLET"], dropna=False)
          .agg(SYSTEM_QTY=("QTY_PICKED", "sum"), ITEM_NUMBER=("ITEM_NUMBER", "first"),
-              BASE_ID=("BASE_ID", "first")).reset_index()
-         .rename(columns={"DOC_NUMBER": "LOAD_ID"}))
+              BASE_ID=("BASE_ID", "first"), ROW_KEY=("ROW_KEY", _first_set),
+              LOT_NUMBER=("LOT_NUMBER", _first_set),
+              LOCATION_ID=("LOCATION_ID", _first_set), PLANT=("PLANT", _first_set),
+              UOM=("UOM", _first_set), QTY_BEFORE=("QTY_BEFORE", "max"))
+         .reset_index().rename(columns={"DOC_NUMBER": "LOAD_ID"}))
 
     m = pd.merge(s, a, on=["LOAD_ID", "PALLET"], how="outer",
                  suffixes=("_S", "_A"))
@@ -244,6 +264,21 @@ def reconcile(actual: pd.DataFrame, ledger: pd.DataFrame,
     m["ITEM_NUMBER"] = m["ITEM_NUMBER_S"].fillna(m["ITEM_NUMBER_A"]).fillna("")
     m["BASE_ID"] = m["BASE_ID_S"].fillna(m["BASE_ID_A"]).fillna("")
     m["DIFF"] = m["ACTUAL_QTY"] - m["SYSTEM_QTY"]
+    for c in KEY_COLS:
+        m[c] = m[c].fillna("") if c in m.columns else ""
+    m["QTY_BEFORE"] = pd.to_numeric(m["QTY_BEFORE"], errors="coerce").fillna(0.0)
+
+    # A pallet the system never chose has no ledger row to borrow keys from.
+    # `keys` — the stock basis — supplies them so the correction still binds.
+    if keys is not None and len(keys):
+        k = keys.copy()
+        k["PALLET"] = k["PALLET"].astype(str).str.strip()
+        k = k.drop_duplicates(subset=["PALLET"], keep="first").set_index("PALLET")
+        for c in KEY_COLS:
+            if c not in k.columns:
+                continue
+            miss = m[c].astype(str).str.strip() == ""
+            m.loc[miss, c] = m.loc[miss, "PALLET"].map(k[c]).fillna("")
 
     def _outcome(r) -> tuple[str, str]:
         sysq, actq = float(r["SYSTEM_QTY"]), float(r["ACTUAL_QTY"])
@@ -259,7 +294,7 @@ def reconcile(actual: pd.DataFrame, ledger: pd.DataFrame,
 
     got = m.apply(_outcome, axis=1, result_type="expand")
     m["OUTCOME"], m["NOTE"] = got[0], got[1]
-    rows = m[RECON_COLS].sort_values(["LOAD_ID", "OUTCOME", "PALLET"]) \
+    rows = m[RECON_COLS + KEY_COLS].sort_values(["LOAD_ID", "OUTCOME", "PALLET"]) \
         .reset_index(drop=True)
 
     give_back = rows[rows["OUTCOME"].isin([RELEASE, SHORT_TAKE])].copy()
@@ -303,18 +338,44 @@ def ledger_corrections(recon: dict[str, Any], run_id: str = "",
     out = []
     for _, r in fix.iterrows():
         delta = float(r["ACTUAL_QTY"]) - float(r["SYSTEM_QTY"])
+        # A deterministic id, so the same adjustment cannot be written twice.
+        # Applying a stale correction a second time would move the stock again:
+        # picked 20 -> 15 -> 10, and the pallet quietly gains units that are not
+        # there. A later, genuinely different adjustment has a different delta
+        # and its own id, so it still gets through.
+        ident = f"RECON-{r['LOAD_ID']}-{r['PALLET']}-{delta:g}"
         out.append({
-            "RUN_ID": run_id or f"RECON-{stamp}", "PICK_DATE": stamp,
+            "RUN_ID": run_id or ident, "PICK_DATE": stamp,
             "DOC_TYPE": "RECONCILIATION", "DOC_NUMBER": r["LOAD_ID"], "DOC_LINE": 0,
             "DOC_ITEM_CODE": r["ITEM_NUMBER"], "BASE_ID": r["BASE_ID"],
             "ITEM_NUMBER": r["ITEM_NUMBER"],
             "DESCRIPTION": f"{r['OUTCOME'].split('—')[0].strip()} · {who}".strip(" ·"),
-            "PALLET": r["PALLET"], "LOCATION_ID": "", "LOT_NUMBER": "", "PLANT": "",
-            "UOM": "", "QTY_BEFORE": 0.0, "QTY_PICKED": delta, "QTY_BALANCE": 0.0,
+            "PALLET": r["PALLET"], "LOCATION_ID": r.get("LOCATION_ID", ""),
+            "LOT_NUMBER": r.get("LOT_NUMBER", ""), "PLANT": r.get("PLANT", ""),
+            "UOM": r.get("UOM", ""),
+            # QTY_BEFORE is carried, not zeroed: ledger_state takes the *max* of
+            # it as the pallet's baseline, and a zero here would drag it down.
+            "QTY_BEFORE": float(r.get("QTY_BEFORE", 0) or 0),
+            "QTY_PICKED": delta, "QTY_BALANCE": 0.0,
             "FIFO_DATE": "", "GRN_NUMBER": "", "STORED_ATTRIBUTE_ID": "",
-            "ROW_KEY": "", "SOURCE_FILE": "Transactions History Report",
+            "ROW_KEY": r.get("ROW_KEY", ""),
+            "SOURCE_FILE": "Transactions History Report",
         })
     return pd.DataFrame(out, columns=E.ALLOC_COLS)
+
+
+def already_applied(corrections: pd.DataFrame,
+                    ledger: pd.DataFrame | None) -> pd.DataFrame:
+    """Drop the corrections this ledger already carries, matched on their id."""
+    if corrections is None or not len(corrections):
+        return corrections
+    if ledger is None or not len(ledger) or "RUN_ID" not in ledger.columns:
+        return corrections
+    seen = {str(x).strip() for x in ledger["RUN_ID"] if str(x).strip().startswith("RECON-")}
+    if not seen:
+        return corrections
+    keep = ~corrections["RUN_ID"].astype(str).str.strip().isin(seen)
+    return corrections[keep].reset_index(drop=True)
 
 
 def duplicate_pallets(actual: pd.DataFrame,

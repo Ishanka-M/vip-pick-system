@@ -1009,3 +1009,117 @@ def test_the_real_report_reads_and_reconciles():
     assert len(act) and (act["PALLET"] != "").all()
     one = act[act["LOAD_ID"] == "333262712295"]
     assert float(one["QTY"].sum()) == 130        # 467 before the chains collapse
+
+
+def test_a_correction_actually_moves_the_pallet_balance():
+    """The whole point: a release has to reach `ledger_state`, not sit beside it."""
+    act = pd.DataFrame([{"LOAD_ID": "L1", "CONTROL_NUMBER": "C", "PALLET": "P1",
+                         "ITEM_NUMBER": "AAA", "BASE_ID": "AAA", "LOT_NUMBER": "",
+                         "QTY": 15.0, "FROM_LOC": "R", "TO_LOC": "S", "WHEN": "",
+                         "EMPLOYEE": ""}])
+    led = pd.DataFrame([{"DOC_NUMBER": "L1", "PALLET": "P1", "ITEM_NUMBER": "AAA",
+                         "LOT_NUMBER": "LOT9", "QTY_BEFORE": 20, "QTY_PICKED": 20,
+                         "QTY_BALANCE": 0, "ROW_KEY": "P1|LOCA|AAA|LOT9|",
+                         "BASE_ID": "AAA", "LOCATION_ID": "LOCA", "PLANT": "PL1",
+                         "UOM": "EA"}])
+    corr = TX.ledger_corrections(TX.reconcile(act, led))
+    assert corr.iloc[0]["ROW_KEY"] == "P1|LOCA|AAA|LOT9|"   # binds to the same pallet
+    assert float(corr.iloc[0]["QTY_BEFORE"]) == 20          # baseline is not dragged to 0
+    before = PE.ledger_state(led)[0]["P1|LOCA|AAA|LOT9|"]
+    after = PE.ledger_state(pd.concat([led, corr], ignore_index=True))[0][
+        "P1|LOCA|AAA|LOT9|"]
+    assert before["balance"] == 0 and after["balance"] == 5
+
+
+def test_released_stock_can_be_picked_again_on_the_next_run():
+    """End to end: reserve it, find out the floor never took it, pick it again."""
+    inv = pd.DataFrame([{"Item Number": "AAA", "Lot Number": "L", "Pallet ID": "P1",
+                         "Location Id": "A", "Actual Qty": 20, "Plant": "PL1",
+                         "Status": "Available", "Pick Id": "0", "UOM": "EA",
+                         "Description": "d"}])
+    r1 = PE.run_pick([_doc("L1", [("AAA", 20)])], inv, PE.EngineConfig())
+    led = r1["allocations"]
+    assert float(led["QTY_PICKED"].sum()) == 20
+
+    # the same inventory export is uploaded again, so the pallet still reads 20
+    blocked = PE.run_pick([_doc("L2", [("AAA", 5)])], inv, PE.EngineConfig(),
+                          ledger=led)
+    assert len(blocked["rejected"]) == 1          # ledger says the pallet is spent
+
+    # the report shows the floor never touched it
+    act = pd.DataFrame([{"LOAD_ID": "L1", "CONTROL_NUMBER": "C", "PALLET": "ELSEWHERE",
+                         "ITEM_NUMBER": "AAA", "BASE_ID": "AAA", "LOT_NUMBER": "",
+                         "QTY": 20.0, "FROM_LOC": "R", "TO_LOC": "S", "WHEN": "",
+                         "EMPLOYEE": ""}])
+    corr = TX.ledger_corrections(TX.reconcile(act, led))
+    fixed = pd.concat([led, corr], ignore_index=True)
+    ok = PE.run_pick([_doc("L3", [("AAA", 5)])], inv, PE.EngineConfig(), ledger=fixed)
+    assert len(ok["rejected"]) == 0
+    assert float(ok["allocations"]["QTY_PICKED"].sum()) == 5
+
+
+def test_keys_are_borrowed_for_a_pallet_the_system_never_chose():
+    act = pd.DataFrame([{"LOAD_ID": "L1", "CONTROL_NUMBER": "C", "PALLET": "P9",
+                         "ITEM_NUMBER": "AAA", "BASE_ID": "AAA", "LOT_NUMBER": "",
+                         "QTY": 4.0, "FROM_LOC": "R", "TO_LOC": "S", "WHEN": "",
+                         "EMPLOYEE": ""}])
+    led = pd.DataFrame([{"DOC_NUMBER": "L1", "PALLET": "P1", "ITEM_NUMBER": "AAA",
+                         "LOT_NUMBER": "LOT1", "QTY_BEFORE": 10, "QTY_PICKED": 4,
+                         "QTY_BALANCE": 6, "ROW_KEY": "P1|A|AAA|LOT1|",
+                         "BASE_ID": "AAA", "LOCATION_ID": "A", "PLANT": "PL1",
+                         "UOM": "EA"}])
+    keys = pd.DataFrame([{"PALLET": "P9", "ROW_KEY": "P9|B|AAA|LOT7|",
+                          "LOT_NUMBER": "LOT7", "LOCATION_ID": "B", "PLANT": "PL1",
+                          "UOM": "EA", "QTY_BEFORE": 9}])
+    corr = TX.ledger_corrections(TX.reconcile(act, led, keys=keys))
+    p9 = corr[corr["PALLET"] == "P9"].iloc[0]
+    assert p9["ROW_KEY"] == "P9|B|AAA|LOT7|" and p9["LOT_NUMBER"] == "LOT7"
+
+
+def test_a_correction_cannot_be_applied_twice():
+    """Apply, then complete the load with the same frame — the stock must not move again."""
+    led = pd.DataFrame([{"DOC_NUMBER": "L1", "PALLET": "P1", "ITEM_NUMBER": "AAA",
+                         "LOT_NUMBER": "LOT9", "QTY_BEFORE": 20, "QTY_PICKED": 20,
+                         "QTY_BALANCE": 0, "ROW_KEY": "P1|A|AAA|LOT9|",
+                         "BASE_ID": "AAA", "LOCATION_ID": "A", "PLANT": "PL1",
+                         "UOM": "EA", "RUN_ID": "R1"}])
+    act = pd.DataFrame([{"LOAD_ID": "L1", "CONTROL_NUMBER": "C", "PALLET": "P1",
+                         "ITEM_NUMBER": "AAA", "BASE_ID": "AAA", "LOT_NUMBER": "",
+                         "QTY": 15.0, "FROM_LOC": "R", "TO_LOC": "S", "WHEN": "",
+                         "EMPLOYEE": ""}])
+    corr = TX.ledger_corrections(TX.reconcile(act, led))
+    one = pd.concat([led, corr], ignore_index=True)
+    assert PE.ledger_state(one)[0]["P1|A|AAA|LOT9|"]["balance"] == 5
+    assert not len(TX.already_applied(corr, one))          # nothing left to write
+    two = pd.concat([one, TX.already_applied(corr, one)], ignore_index=True)
+    assert PE.ledger_state(two)[0]["P1|A|AAA|LOT9|"]["balance"] == 5
+
+
+def test_re_comparing_after_applying_finds_nothing_to_do():
+    led = pd.DataFrame([{"DOC_NUMBER": "L1", "PALLET": "P1", "ITEM_NUMBER": "AAA",
+                         "LOT_NUMBER": "LOT9", "QTY_BEFORE": 20, "QTY_PICKED": 20,
+                         "QTY_BALANCE": 0, "ROW_KEY": "P1|A|AAA|LOT9|",
+                         "BASE_ID": "AAA", "LOCATION_ID": "A", "PLANT": "PL1",
+                         "UOM": "EA"}])
+    act = pd.DataFrame([{"LOAD_ID": "L1", "CONTROL_NUMBER": "C", "PALLET": "P1",
+                         "ITEM_NUMBER": "AAA", "BASE_ID": "AAA", "LOT_NUMBER": "",
+                         "QTY": 15.0, "FROM_LOC": "R", "TO_LOC": "S", "WHEN": "",
+                         "EMPLOYEE": ""}])
+    fixed = pd.concat([led, TX.ledger_corrections(TX.reconcile(act, led))],
+                      ignore_index=True)
+    again = TX.reconcile(act, fixed)
+    assert again["rows"].iloc[0]["OUTCOME"] == TX.AGREES
+    assert not len(TX.ledger_corrections(again))
+
+
+def test_every_written_frame_fits_its_worksheet_header():
+    """A column the header does not know is silently dropped on write."""
+    import gsheet as G
+    inv, doc = _three_line_case()
+    res = PE.run_pick([doc], inv, PE.EngineConfig(partial_docs=["I1"]))
+    s_df, d_df = R.build([doc], res, R.load_contacts(None))
+    for title, df in ((G.WS_MASTER, res["master"]), (G.WS_DETAIL, res["detail"]),
+                      (G.WS_LEDGER, res["allocations"]),
+                      (G.WS_INV_SUM, s_df), (G.WS_INV_DET, d_df)):
+        extra = set(df.columns) - set(G._SHEETS[title])
+        assert not extra, f"{title} would drop {sorted(extra)}"

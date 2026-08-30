@@ -30,7 +30,7 @@ import transactions as T
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 13
+API = 14
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -1061,6 +1061,10 @@ def complete_load(sa_info: dict, sheet_key: str, load_id: str, owner: str = "",
             else pd.DataFrame()
         n_pal = qty_rel = 0.0
         if corrections is not None and len(corrections):
+            # never apply an adjustment this ledger already carries
+            corrections = T.already_applied(
+                corrections, read_ws(sa_info, sheet_key, WS_LEDGER, use_cache=False))
+        if corrections is not None and len(corrections):
             back = corrections[pd.to_numeric(corrections["QTY_PICKED"],
                                              errors="coerce").fillna(0) < 0]
             n_pal = int(len(back))
@@ -1115,9 +1119,13 @@ def apply_corrections(sa_info: dict, sheet_key: str, corrections: pd.DataFrame,
         return 0
     with sheet_lock(sa_info, sheet_key, "RECON", owner=owner):
         book = open_book(sa_info, sheet_key)
-        _append(_ensure(book, WS_LEDGER, LEDGER_COLS), corrections, LEDGER_COLS)
+        fresh = T.already_applied(
+            corrections, read_ws(sa_info, sheet_key, WS_LEDGER, use_cache=False))
+        if not len(fresh):
+            return 0
+        _append(_ensure(book, WS_LEDGER, LEDGER_COLS), fresh, LEDGER_COLS)
     cache_clear(sheet_key)
-    return len(corrections)
+    return len(fresh)
 
 
 # --------------------------------------------------------------------------- #
