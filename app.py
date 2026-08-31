@@ -54,7 +54,7 @@ _GS_API = getattr(_gs_mod, "API", 0)
 # Every file in the release, in one list. Checking them together matters:
 # reporting them one at a time sends the user round the loop again for the
 # next file, and the answer is always the same — replace the whole set.
-_NEEDS = {"pick_engine.py": (E, 8), "doc_parser.py": (P, 8), "pick_pdf.py": (PP, 6),
+_NEEDS = {"pick_engine.py": (E, 9), "doc_parser.py": (P, 8), "pick_pdf.py": (PP, 6),
           "sku_master.py": (SKU, 3), "ui.py": (ui, 3),
           "invoice_register.py": (R, 17), "transactions.py": (TX, 9),
           "gsheet.py": (_gs_mod, 14)}
@@ -1183,7 +1183,12 @@ with st.sidebar:
                                       "moved on and Actual Qty becomes the new baseline.")
         blank_fill = st.text_input("Blank attribute fill", value="TBC")
         fill_item_col = st.checkbox("Fill ITEM_NUMBER column", value=False)
-        merge_lines = st.checkbox("Merge same-item lines", value=False)
+        merge_lines = st.checkbox(
+            "One order line per item", value=True,
+            help="The same item on three invoice lines, or picked off three "
+                 "pallets, goes to the WMS as one line with the quantities "
+                 "added. Turn it off to keep a line per invoice line. The total "
+                 "is the same either way and is verified either way.")
         override = st.checkbox("Bypass document check", value=False,
                                help="Picks even when the Total Quantity / Grand Total / "
                                     "S.No check fails. The stock check is never bypassed. "
@@ -2340,6 +2345,20 @@ with tab_gen:
         # Downloads — one file set per LOAD_ID
         # ------------------------------------------------------------------ #
         st.divider()
+        _mg = res.get("detail_merge") or {}
+        if _mg:
+            _tot_a = sum(int(v["ALLOCATIONS"]) for v in _mg.values())
+            _tot_l = sum(int(v["ORDER_LINES"]) for v in _mg.values())
+            if _tot_a != _tot_l:
+                st.caption(f"Detail: {_tot_a} pallet allocations → **{_tot_l} order "
+                           f"lines** — the same item is one line, quantities added.")
+            _split = [f"{k}: {v['NOT_MERGED']}" for k, v in _mg.items()
+                      if v.get("NOT_MERGED")]
+            if _split:
+                st.warning("The same item is on more than one line because "
+                           "something else differs, and merging would throw that "
+                           "value away — " + " · ".join(_split))
+
         ui.section("Files", "07", "a separate set for every LOAD_ID")
         ids = E.load_ids(res)
         src_map = st.session_state.get("doc_bytes", {})

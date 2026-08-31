@@ -742,6 +742,35 @@ Re-comparing after applying was already safe on its own — the system quantity
 reads the corrected figure, the outcome comes back `AGREES` and nothing is
 written.
 
+## One order line per item
+
+The same item can reach the WMS detail more than once — the invoice lists it on
+three lines, or the pick comes off three pallets. Invoice `333262712673` exported
+18 detail lines for 13 items:
+
+```
+R004212-016123   lines 5, 7, 9   →  6 + 2 + 1  =  9
+R004213-016123   lines 6, 8, 10  → 16 + 2 + 1  = 19
+P500287-016-140  lines 1, 2      →  1 + 1      =  2
+```
+
+**18 lines → 13, 103 units either way.** The quantities are added, the lines are
+renumbered from 1 with no gaps, and the three quantity checks still have to agree
+— merging changes the shape of the file, never the total.
+
+Sidebar → **One order line per item**, on by default. Turn it off to keep one
+detail line per invoice line.
+
+### When it does not merge
+
+Two lines for the same item survive only when something else about them differs
+— a different lot, uom, plant, or one of the eleven `GEN_ATTRIBUTE` values.
+Merging those would throw a value away, so they stay apart and the screen names
+the field:
+
+> *The same item is on more than one line because something else differs, and
+> merging would throw that value away — AAA — lot*
+
 ## Two dtypes, one column
 
 `TypeError: Invalid value '[20]' for dtype 'float64'` — from the key-borrowing

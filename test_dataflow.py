@@ -1321,3 +1321,63 @@ def test_the_real_report_against_a_sheet_shaped_ledger():
     rec = TX.reconcile(act, led)
     assert rec["totals"]["agree"] == len(real)
     assert rec["totals"]["release_qty"] == 0 and rec["totals"]["consume_qty"] == 0
+
+
+def _multi_line_doc():
+    """One item on three invoice lines, another on two — invoice 333262712673."""
+    inv = pd.DataFrame(
+        [{"Item Number": "R004212-016123", "Lot Number": "L", "Pallet ID": f"P{i}",
+          "Location Id": "A", "Actual Qty": q, "Plant": "PL1", "Status": "Available",
+          "Pick Id": "0", "UOM": "EA", "Description": "d"}
+         for i, q in enumerate([6, 2, 1])]
+        + [{"Item Number": "P500287-016-140", "Lot Number": "L", "Pallet ID": "PX",
+            "Location Id": "A", "Actual Qty": 5, "Plant": "PL1", "Status": "Available",
+            "Pick Id": "0", "UOM": "EA", "Description": "d"}])
+    doc = _doc("INV1", [("R004212-016123", 6), ("P500287-016-140", 1),
+                        ("R004212-016123", 2), ("P500287-016-140", 1),
+                        ("R004212-016123", 1)])
+    return inv, doc
+
+
+def test_the_same_item_is_one_order_line_with_the_quantities_added():
+    inv, doc = _multi_line_doc()
+    d = PE.run_pick([doc], inv, PE.EngineConfig())["detail"]
+    assert len(d) == 2
+    qty = dict(zip(d["DISPLAY_ITEM_NUMBER"], d["QTY"].astype(float)))
+    assert qty["R004212-016123"] == 9        # 6 + 2 + 1, off three pallets
+    assert qty["P500287-016-140"] == 2       # 1 + 1, two invoice lines
+    assert list(d["LINE_NUMBER"]) == ["1", "2"]   # renumbered, no gaps
+
+
+def test_merging_never_changes_the_total():
+    inv, doc = _multi_line_doc()
+    on = PE.run_pick([doc], inv, PE.EngineConfig())
+    off = PE.run_pick([doc], inv, PE.EngineConfig(merge_same_item_lines=False))
+    assert on["detail"]["QTY"].astype(float).sum() == 11
+    assert off["detail"]["QTY"].astype(float).sum() == 11
+    assert len(off["detail"]) == 5 and len(on["detail"]) == 2
+    for r in (on, off):
+        assert (r["verify"]["STATUS"] == "✅ OK").all()
+
+
+def test_the_merge_reports_what_it_did():
+    inv, doc = _multi_line_doc()
+    info = PE.run_pick([doc], inv, PE.EngineConfig())["detail_merge"]["INV1"]
+    assert info["ALLOCATIONS"] == 7 and info["ORDER_LINES"] == 2
+    assert info["MERGED"] == 5 and info["NOT_MERGED"] == ""
+
+
+def test_a_different_lot_keeps_the_item_on_its_own_line_and_says_so():
+    """Merging across lots would throw a lot number away, so it does not."""
+    inv = pd.DataFrame([
+        {"Item Number": "AAA", "Lot Number": "LOT1", "Pallet ID": "P1",
+         "Location Id": "A", "Actual Qty": 5, "Plant": "PL1", "Status": "Available",
+         "Pick Id": "0", "UOM": "EA", "Description": "d"},
+        {"Item Number": "AAA", "Lot Number": "LOT2", "Pallet ID": "P2",
+         "Location Id": "A", "Actual Qty": 5, "Plant": "PL1", "Status": "Available",
+         "Pick Id": "0", "UOM": "EA", "Description": "d"}])
+    res = PE.run_pick([_doc("INV1", [("AAA", 8)])], inv, PE.EngineConfig())
+    d = res["detail"]
+    assert len(d) == 2                                    # one line per lot
+    assert d["QTY"].astype(float).sum() == 8
+    assert "lot" in res["detail_merge"]["INV1"]["NOT_MERGED"]

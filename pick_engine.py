@@ -25,7 +25,7 @@ from doc_parser import ParsedDoc, base_item, clean_item
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 8
+API = 9
 
 # --------------------------------------------------------------------------- #
 # WMS templates
@@ -351,7 +351,9 @@ class EngineConfig:
     blank_fill: str = "TBC"
     fill_item_number_col: bool = False
     fill_description: bool = False       # OutBound Detail එකේ ITEM_DESCRIPTION පුරවනවද
-    merge_same_item_lines: bool = False
+    # One order line per item. The same item on three invoice lines, or off
+    # three pallets, goes to the WMS as one line with the quantities added.
+    merge_same_item_lines: bool = True
     override_doc_check: bool = False    # ⚠️ manual verify කරලා විතරක් — stock check bypass වෙන්නේ නෑ
     pick_date: datetime = field(default_factory=datetime.now)
 
@@ -436,6 +438,7 @@ def run_pick(
     rejected: list[dict] = []
     shortages: list[dict] = []
     accepted: list[dict] = []
+    merge_info: dict[str, dict] = {}
     partials: list[str] = []
     offers: list[dict] = []
     detail_rows: list[dict] = []
@@ -645,6 +648,7 @@ def run_pick(
         is_partial = bool(doc_short)
 
         # ---------- WMS Detail (pallet allocations -> order lines) ----------
+        n_alloc = len(doc_alloc)
         groups: dict[tuple, dict] = {}
         order: list[tuple] = []
         for a in doc_alloc:
@@ -678,6 +682,25 @@ def run_pick(
                 val = a["_attrs"][i]
                 row[gcol] = val if str(val).strip() else cfg.blank_fill
             doc_detail.append(row)
+
+        # Two lines for the same item means something else kept them apart —
+        # a different lot, uom, plant or attribute. Merging them anyway would
+        # throw one of those values away, so they stay separate and the reason
+        # is reported rather than left as a puzzle.
+        split: list[str] = []
+        if cfg.merge_same_item_lines:
+            by_item: dict[str, list[tuple]] = {}
+            for k in order:
+                by_item.setdefault(k[0], []).append(k)
+            for item, ks in by_item.items():
+                if len(ks) < 2:
+                    continue
+                names = ("lot", "uom", "plant", "attributes")
+                why = [names[i] for i in range(4) if len({k[i + 1] for k in ks}) > 1]
+                split.append(f"{item} — {', '.join(why) or 'differing detail'}")
+        merge_info[num] = {"ALLOCATIONS": n_alloc, "ORDER_LINES": len(doc_detail),
+                           "MERGED": max(0, n_alloc - len(doc_detail)),
+                           "NOT_MERGED": "; ".join(split)}
 
         # ---------- PALLET CAP — pallet එකට වඩා වැඩියෙන් pick වෙන්න බෑ ----------
         per_key: dict[str, float] = {}
@@ -767,6 +790,7 @@ def run_pick(
                                                     "DETAIL", "SOURCE_FILE"]),
         "shortage": pd.DataFrame(shortages),
         "verify": pd.DataFrame(verify_rows, columns=VERIFY_COLS),
+        "detail_merge": merge_info,
         "basis": basis,
         "locked": _locked_view(locked, released),
         "accepted": pd.DataFrame(accepted),
