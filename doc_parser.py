@@ -3,7 +3,8 @@ doc_parser.py — Donaldson Invoice / Delivery Challan PDF -> structured lines
 ===========================================================================
 Supports
   * TAX INVOICE (Domestic)  -> coordinate (column-bucket) parser
-  * Delivery Challan        -> ruled-table parser (multi-copy safe)
+  * Delivery Challan (PDF)  -> ruled-table parser (multi-copy safe)
+  * Delivery Challan (Word) -> .docx table parser; LOAD_ID = DELIVERY CHALLAN NO.
 
 Every parsed document carries its own completeness check, because the rule is:
 "Invoice/DC complete නැත්නම් pick කරන්න එපා."
@@ -21,7 +22,7 @@ import pdfplumber
 
 # Bumped whenever this module's public surface changes; app.py refuses to run
 # against a stale copy instead of dying with a redacted TypeError.
-API = 8
+API = 9
 
 # --------------------------------------------------------------------------- #
 # Item-code helpers
@@ -620,8 +621,202 @@ def _parse_challan(pdf: pdfplumber.PDF, filename: str) -> ParsedDoc:
 
 
 # --------------------------------------------------------------------------- #
+# WORD (.docx) DELIVERY CHALLAN parser
+# --------------------------------------------------------------------------- #
+# The FOC / short-supply challans are typed in Word, not printed from the ERP,
+# so there is no PDF to run through pdfplumber. The layout is fixed:
+#
+#     DELIVERY CHALLAN NO. – 3332627/030      <- LOAD_ID
+#     Delivery Challan Date : 08-09-2026
+#     DIFS Reference No.: ... Invoice No. 333262712751 Dated ...
+#     [ Ship From | Ship To: ]                <- consignee block
+#     [ Sr No. | Part No. | Item Description | HSN Code | Qty | Unit Rate | Total ]
+#
+# Everything downstream keys off `doc_number`, so the DC number read here is
+# what becomes the LOAD_ID — exactly as the PDF challan parser behaves.
+_DOCX_DC_NO = re.compile(
+    r"DELIVERY\s+CHALLAN\s*(?:NO|NUMBER)?\.?\s*[\s:\u2013\u2014-]*"
+    r"([A-Za-z0-9][A-Za-z0-9\-/]*)",
+    re.I,
+)
+_DOCX_DC_DATE = re.compile(
+    r"Delivery\s+(?:Challan\s+)?Date\s*[:\-]?\s*([0-9]{1,2}[-/][0-9A-Za-z]{1,9}[-/][0-9]{2,4})",
+    re.I,
+)
+_DOCX_REF_INV = re.compile(r"Invoice\s+No\.?\s*[:\-]?\s*([A-Za-z0-9][A-Za-z0-9\-/]*)", re.I)
+_DOCX_VALUE = re.compile(
+    r"Approx\.?\s*Value\s*[:\-]?\s*(?:INR|Rs\.?)?\s*([\d,]+(?:\.\d{1,2})?)", re.I)
+
+
+def _dtext(cell: Any, sep: str = " ") -> str:
+    """One Word cell -> a single tidy line."""
+    return re.sub(r"\s+", " ", sep.join(str(getattr(cell, "text", cell) or "").split("\n"))).strip()
+
+
+def _docx_blocks(document: Any) -> list[str]:
+    """Every paragraph in the body plus the headers/footers, in reading order."""
+    out: list[str] = []
+    for sec in getattr(document, "sections", []):
+        for part in (getattr(sec, "header", None), getattr(sec, "footer", None)):
+            for p in getattr(part, "paragraphs", []) or []:
+                t = re.sub(r"\s+", " ", p.text).strip()
+                if t:
+                    out.append(t)
+    for p in document.paragraphs:
+        t = re.sub(r"\s+", " ", p.text).strip()
+        if t:
+            out.append(t)
+    return out
+
+
+def _docx_ship_to(document: Any) -> str:
+    """Consignee name — the first real line of the `Ship To` cell."""
+    for tbl in document.tables:
+        rows = list(tbl.rows)
+        if not rows:
+            continue
+        head = [_dtext(c) for c in rows[0].cells]
+        idx = None
+        for i, h in enumerate(head):
+            if re.sub(r"[^a-z]", "", h.lower()).startswith("shipto"):
+                idx = i
+                break
+        if idx is None:
+            continue
+        for r in rows[1:]:
+            cells = list(r.cells)
+            if idx >= len(cells):
+                continue
+            for ln in str(cells[idx].text or "").split("\n"):
+                t = re.sub(r"\s+", " ", ln).strip().strip(" ,:")
+                t = re.sub(r"^M/s\.?\s*", "", t, flags=re.I).strip()
+                if t and not re.fullmatch(r"[\d,\s.:/-]+", t):
+                    return t
+    return ""
+
+
+def _parse_challan_docx(document: Any, filename: str) -> ParsedDoc:
+    doc = ParsedDoc(doc_type="DELIVERY CHALLAN", source_file=filename)
+
+    blocks = _docx_blocks(document)
+    full_text = "\n".join(blocks)
+
+    for b in blocks:
+        if not doc.doc_number:
+            m = _DOCX_DC_NO.search(b)
+            if m:
+                doc.doc_number = m.group(1).strip().rstrip(".")
+        if not doc.doc_date:
+            m = _DOCX_DC_DATE.search(b)
+            if m:
+                doc.doc_date = m.group(1).strip()
+        if not doc.ref_number:
+            m = _DOCX_REF_INV.search(b)
+            if m:
+                doc.ref_number = m.group(1).strip().rstrip(".")
+
+    doc.customer = _docx_ship_to(document)
+
+    # ---------------- line items ---------------- #
+    grand: float | None = None
+    for tbl in document.tables:
+        rows = list(tbl.rows)
+        if len(rows) < 2:
+            continue
+        head = [_dtext(c) for c in rows[0].cells]
+        i_sno = _col(head, "Sr No", "S.No", "SNo", "Sr")
+        i_item = _col(head, "Part No", "Item Code", "Part Number")
+        i_desc = _col(head, "Item Description", "Description of Goods", "Description")
+        i_qty = _col(head, "Qty", "Quantity")
+        i_uom = _col(head, "UOM")
+        i_amt = _col(head, "Total Amount (INR)", "Total Amount", "Amount")
+        if i_item is None or i_qty is None:
+            continue
+
+        for r in rows[1:]:
+            cells = list(r.cells)
+
+            def cell(idx: int | None) -> str:
+                if idx is None or idx >= len(cells):
+                    return ""
+                return _dtext(cells[idx])
+
+            joined = " ".join(_dtext(c) for c in cells)
+            if re.search(r"Grand\s*Total", joined, re.I):
+                if i_amt is not None:
+                    grand = _num(cell(i_amt))
+                if grand is None:
+                    for j in range(len(cells) - 1, -1, -1):
+                        v = _num(_dtext(cells[j]))
+                        if v:
+                            grand = v
+                            break
+                continue
+
+            sno = cell(i_sno)
+            item = tidy_item(cell(i_item))
+            qty = _num(cell(i_qty))
+            if not (re.fullmatch(r"\d{1,3}", sno) and clean_item(item) and qty):
+                continue
+
+            doc.lines.append(
+                DocLine(
+                    line_no=int(sno),
+                    item_code=item,
+                    description=cell(i_desc),
+                    qty=float(qty),
+                    uom=cell(i_uom) or "EA",
+                    line_amount=_num(cell(i_amt)),
+                    line_total=_num(cell(i_amt)),
+                )
+            )
+
+    if grand is None:
+        m = _DOCX_VALUE.search(full_text)
+        if m:
+            grand = _num(m.group(1))
+    doc.declared_amount = grand
+    doc.total_incl_tax = grand
+
+    doc.lines.sort(key=lambda l: l.line_no)
+    return doc
+
+
+def parse_docx(data: bytes, filename: str = "") -> ParsedDoc:
+    """Word delivery challan -> the same ParsedDoc a PDF produces."""
+    try:
+        from docx import Document                       # python-docx
+    except ImportError as ex:                           # pragma: no cover
+        raise RuntimeError(
+            "Word (.docx) support needs python-docx — add `python-docx>=1.1` "
+            "to requirements.txt and redeploy."
+        ) from ex
+
+    doc = _parse_challan_docx(Document(io.BytesIO(data)), filename)
+    if not doc.doc_number:
+        doc.notes.append("Delivery Challan No could not be read - type it in the review table")
+    if not doc.lines:
+        doc.notes.append("Could not parse line items - add them in the review table")
+    return doc
+
+
+# --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
+def parse_document(data: bytes, filename: str = "") -> ParsedDoc:
+    """
+    One entry point for every uploaded document — PDF or Word.
+
+    Routing is by content first, extension second: a file renamed by hand still
+    lands in the right parser instead of failing halfway through the wrong one.
+    """
+    head = bytes(data[:4])
+    name = str(filename or "").lower()
+    if head == b"PK\x03\x04" or name.endswith((".docx", ".docm")):
+        return parse_docx(data, filename)
+    return parse_pdf(data, filename)
+
+
 def parse_pdf(data: bytes, filename: str = "") -> ParsedDoc:
     with pdfplumber.open(io.BytesIO(data)) as pdf:
         head = (pdf.pages[0].extract_text() or "")[:3000].upper()

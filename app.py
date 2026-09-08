@@ -54,7 +54,7 @@ _GS_API = getattr(_gs_mod, "API", 0)
 # Every file in the release, in one list. Checking them together matters:
 # reporting them one at a time sends the user round the loop again for the
 # next file, and the answer is always the same — replace the whole set.
-_NEEDS = {"pick_engine.py": (E, 9), "doc_parser.py": (P, 8), "pick_pdf.py": (PP, 6),
+_NEEDS = {"pick_engine.py": (E, 9), "doc_parser.py": (P, 9), "pick_pdf.py": (PP, 6),
           "sku_master.py": (SKU, 3), "ui.py": (ui, 3),
           "invoice_register.py": (R, 17), "transactions.py": (TX, 9),
           "gsheet.py": (_gs_mod, 14)}
@@ -472,16 +472,17 @@ def _backfill_ui() -> None:
                "a pick** — use it for documents the pick never saw, or to fill in "
                "the customer name on a rebuilt row. If the ledger shows the "
                "document was picked, it is filed as picked with its pallets.")
-    f_docs = st.file_uploader("Invoice / Delivery Challan (PDF)", type=["pdf"],
+    f_docs = st.file_uploader("Invoice / Delivery Challan (PDF / Word)",
+                              type=["pdf", "docx"],
                               accept_multiple_files=True, key="backfill_docs")
     if f_docs and st.button(f"Register {len(f_docs)} document(s)", width="stretch",
                             key="bf_docs_go"):
         try:
-            with st.spinner("Reading the PDFs..."):
+            with st.spinner("Reading the documents..."):
                 parsed = []
                 for f in f_docs:
                     try:
-                        parsed.append(P.parse_pdf(f.getvalue(), f.name))
+                        parsed.append(P.parse_document(f.getvalue(), f.name))
                     except Exception as ex:
                         st.error(f"{f.name} — parse error: {ex}")
             if not parsed:
@@ -1635,13 +1636,16 @@ with tab_actual:
 with tab_gen:
     SLOT_RAIL = st.empty()
     ui.section("Documents & inventory", "01",
-               "drop in as many PDFs as you like - invoices and DCs can be mixed")
+               "drop in as many files as you like - PDF invoices, PDF DCs and "
+               "Word DCs can be mixed")
     c1, c2 = st.columns(2)
     with c1:
-        f_docs = st.file_uploader("Invoice / Delivery Challan (PDF)",
-                                  type=["pdf"], accept_multiple_files=True,
-                                  help="Donaldson tax invoice or delivery challan. A DC "
-                                       "printed in triplicate is read only once.")
+        f_docs = st.file_uploader("Invoice / Delivery Challan (PDF / Word)",
+                                  type=["pdf", "docx"], accept_multiple_files=True,
+                                  help="Donaldson tax invoice or delivery challan - PDF or "
+                                       "Word (.docx). A DC printed in triplicate is read "
+                                       "only once; a Word DC takes its LOAD_ID from "
+                                       "DELIVERY CHALLAN NO.")
     with c2:
         f_inv = st.file_uploader("Inventory report (Excel)", type=["xlsx", "xls"],
                                  help="Körber One pallet-level inventory export.")
@@ -1653,12 +1657,12 @@ with tab_gen:
         if st.session_state.get("doc_sig") != sig:
             parsed = []
             raw: dict[str, bytes] = {}
-            with st.spinner("Reading the PDFs..."):
+            with st.spinner("Reading the documents..."):
                 for f in f_docs:
                     try:
                         data = f.getvalue()
                         raw[f.name] = data
-                        parsed.append(P.parse_pdf(data, f.name))
+                        parsed.append(P.parse_document(data, f.name))
                     except Exception as ex:
                         st.error(f"{f.name} — parse error: {ex}")
             st.session_state["doc_bytes"] = raw
