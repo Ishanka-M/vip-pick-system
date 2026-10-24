@@ -1897,7 +1897,10 @@ with tab_gen:
                 st.session_state["result"] = res
                 st.toast(f"Pick generated · RUN {res['run_id']}", icon="✅")
             except Exception as ex:
+                import traceback
                 st.error(f"Could not generate the pick - {ex}")
+                with st.expander("Technical detail (send this to the developer)", expanded=True):
+                    st.code(traceback.format_exc())
                 st.session_state.pop("result", None)
 
             res = st.session_state.get("result")

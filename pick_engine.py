@@ -446,6 +446,13 @@ def run_pick(
 
     seen_batch: set[str] = set()
 
+    # a quantity that arrived as text ("1,200", " ", "5 pcs") must not crash the run
+    for _d in docs:
+        for _l in _d.lines:
+            if not isinstance(_l.qty, (int, float)):
+                _m = re.search(r"-?\d+(?:\.\d+)?", str(_l.qty).replace(",", ""))
+                _l.qty = float(_m.group()) if _m else 0.0
+
     for doc in docs:
         num = str(doc.doc_number).strip()
 
