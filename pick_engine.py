@@ -222,6 +222,12 @@ def plant_summary(inv: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 QTY_TOL = 1e-6
 
+
+def _qty_col(s: pd.Series) -> pd.Series:
+    """Always a float column. An empty text-typed column sums to '' and
+    float('') kills the whole run, so every 'avail' goes through here."""
+    return pd.to_numeric(s, errors="coerce").fillna(0.0).astype(float)
+
 BASIS_COLS = ["PALLET", "LOCATION_ID", "ITEM_NUMBER", "BASE_ID", "LOT_NUMBER", "PLANT",
               "UOM", "PICK_ID", "PICK_STATUS", "INV_ACTUAL_QTY", "LEDGER_BEFORE",
               "LEDGER_PICKED", "LEDGER_BALANCE", "MODE", "AVAILABLE", "ROW_KEY"]
@@ -317,7 +323,7 @@ def stock_basis(inv: pd.DataFrame, ledger: pd.DataFrame | None = None,
     basis = pd.DataFrame(rows, columns=BASIS_COLS)
     avail_map = dict(zip(basis["ROW_KEY"], basis["AVAILABLE"]))
     one = one.copy()
-    one["avail"] = one["row_key"].map(avail_map).fillna(0.0)
+    one["avail"] = _qty_col(one["row_key"].map(avail_map))
     return one.reset_index(drop=True), basis
 
 
@@ -429,8 +435,9 @@ def run_pick(
 
     # ---- pallet level stock basis (QTY_BEFORE same ද කියලා බලලා) ----
     inv, basis = stock_basis(inv, ledger, use_ledger=cfg.use_ledger)
-    remaining: dict[str, float] = dict(zip(basis["ROW_KEY"], basis["AVAILABLE"].astype(float)))
+    remaining: dict[str, float] = dict(zip(basis["ROW_KEY"], _qty_col(basis["AVAILABLE"])))
     cap: dict[str, float] = dict(remaining)          # pallet එකට වඩා pick වෙන්න බෑ
+    inv["avail"] = _qty_col(inv["avail"])
     inv = inv[inv["avail"] > 0].reset_index(drop=True)
 
     allocations: list[dict] = []
@@ -532,15 +539,15 @@ def run_pick(
             key = clean_item(ln.item_code)
             base_pool = inv[(inv["base_id"] == ln.base)
                             | (inv["item_number"] == key)].copy()
-            base_pool["avail"] = base_pool["row_key"].map(trial).fillna(0.0)
+            base_pool["avail"] = _qty_col(base_pool["row_key"].map(trial))
             base_pool = base_pool[base_pool["avail"] > 0]
             open_mask = _open(base_pool)
             pool = base_pool[open_mask].copy()
             shut = base_pool[~open_mask]
-            have = float(pool["avail"].sum())
+            have = float(_qty_col(pool["avail"]).sum())
 
             if pool.empty or have + 1e-9 < need:
-                lock_q = float(shut["avail"].sum()) if len(shut) else 0.0
+                lock_q = float(_qty_col(shut["avail"]).sum()) if len(shut) else 0.0
                 lock_id = (", ".join(sorted({str(x) for x in shut["pick_id"]})[:4])
                            if len(shut) else "")
                 if pool.empty and not lock_q:
